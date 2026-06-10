@@ -22,9 +22,9 @@ See README.md for details. MIT licensed.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8
+from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, sdpa_flash_mps
 
-for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large):
+for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large, sdpa_flash_mps):
     try:
         _patch.install()
     except Exception as _e:  # never take ComfyUI down because of us
