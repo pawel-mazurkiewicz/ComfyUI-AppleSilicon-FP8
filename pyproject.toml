@@ -1,0 +1,15 @@
+[project]
+name = "comfyui-applesilicon-fp8"
+description = "Run FP8 models (FLUX, SD3.5, Ideogram 4) on Apple Silicon / MPS, plus a psutil fix for recent macOS betas."
+version = "1.0.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
+
+[tool.comfy]
+PublisherId = "pawel-mazurkiewicz"
+DisplayName = "ComfyUI-AppleSilicon-FP8"
+Icon = ""
