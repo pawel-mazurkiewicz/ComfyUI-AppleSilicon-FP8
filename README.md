@@ -6,6 +6,8 @@ If you're on a Mac and FLUX, SD3.5, or Ideogram 4 die with errors like
 `Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype`,
 `scaled_mm ... not implemented for MPS`, or your renders crash mid-way with a
 `psutil ... host_statistics64 ... array not large enough` traceback — this fixes all of it.
+It also fixes a couple of non-FP8 MPS bugs that hit the same machines, including
+**PiD (Pixel Diffusion Decoder) producing a fully black image at ≥2048px**.
 
 It's a single ComfyUI custom node that applies a few targeted runtime patches at
 startup. No model conversion, no Metal compilation, no extra dependencies. Each
@@ -20,6 +22,7 @@ patch is a no-op on machines that don't need it.
 | 1 | `RuntimeError: host_statistics64(HOST_VM_INFO64) ... array not large enough` — renders crash partway through | psutil's prebuilt C extension doesn't match the kernel on recent macOS betas; `virtual_memory()` fails ~99% of calls, and ComfyUI calls it every node | Replace `psutil.virtual_memory()` with a `vm_stat` + `sysctl`-based equivalent that doesn't use the broken syscall |
 | 2 | `TypeError: ... convert Float8_e4m3fn to the MPS backend ...` from `comfy_kitchen` (e.g. **Ideogram 4**) | comfy_kitchen's eager FP8 backend dequantizes with a plain `x.to(bfloat16)` cast, which MPS can't do from FP8 | Decode FP8 with a lookup-table + gather (bit-identical to the original, runs on GPU) |
 | 3 | `scaled_mm not implemented for MPS` / FP8 cast errors from **FLUX / SD3.5** | `torch._scaled_mm` has no FP8 kernel on MPS | Patch `torch._scaled_mm` to decode FP8 → float and run a native MPS matmul |
+| 4 | **PiD (Pixel Diffusion Decoder) outputs a fully black image at ≥2048px** (`RuntimeWarning: invalid value encountered in cast`) | `torch.nn.functional.rms_norm` silently returns garbage on MPS once the normalization row count exceeds ~2²² (~4.19M); PiD's pixel blocks cross that at 2048px+, producing NaN → black | Compute `rms_norm` with the exact manual fp32 formula on MPS for large row counts; the fused fast path is kept for normal sizes and all non-MPS devices |
 
 ### How the FP8 trick works
 
@@ -52,6 +55,7 @@ At startup you'll see (only the lines relevant to your machine):
 [AppleSilicon-FP8/psutil] psutil.virtual_memory() is broken on this OS — installed vm_stat fallback (...).
 [AppleSilicon-FP8/comfy_kitchen] patched comfy_kitchen eager FP8 dequantize/quantize for MPS.
 [AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 now runs on MPS via LUT decode + native matmul.
+[AppleSilicon-FP8/rmsnorm] F.rms_norm uses manual fp32 path on MPS for >2^21 rows (PiD black-image fix).
 ```
 
 ## Notes & caveats
@@ -76,6 +80,10 @@ At startup you'll see (only the lines relevant to your machine):
   Set it in your shell/launch environment, e.g. `APPLESILICON_FP8_PSUTIL=off`.
 - **comfy_kitchen / `_scaled_mm` patches** only touch the MPS + FP8 path; CUDA and
   CPU behavior is completely unchanged.
+- **The `rms_norm` fix is MPS-only and row-count gated.** It swaps in a manual
+  fp32 `rms_norm` only on MPS and only when the normalization row count exceeds
+  2²¹ (~2.1M) — the regime where the fused kernel is wrong. Everything else (all
+  non-MPS devices, all normal-sized tensors) keeps the fast fused path untouched.
 
 ## Scope
 

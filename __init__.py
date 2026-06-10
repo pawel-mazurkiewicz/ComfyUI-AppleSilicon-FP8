@@ -13,6 +13,7 @@ Patches applied:
   1. psutil.virtual_memory() vm_stat fallback   (macOS 26/27 beta crash)
   2. comfy_kitchen eager FP8 dequant/quant      (Ideogram 4 and other ck models)
   3. torch._scaled_mm FP8 on MPS                (FLUX, SD3.5, FP8 _scaled_mm path)
+  4. F.rms_norm manual fp32 path on MPS         (PiD >=2048px: black image / NaN)
 
 See README.md for details. MIT licensed.
 """
@@ -21,9 +22,9 @@ See README.md for details. MIT licensed.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-from ._patches import comfykitchen_fp8, psutil_vmstat, scaled_mm_fp8
+from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8
 
-for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8):
+for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large):
     try:
         _patch.install()
     except Exception as _e:  # never take ComfyUI down because of us
