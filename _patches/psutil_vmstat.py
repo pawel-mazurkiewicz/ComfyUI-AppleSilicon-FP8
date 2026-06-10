@@ -16,6 +16,7 @@ use the broken syscall. On healthy machines we detect nothing wrong and do nothi
 """
 
 import collections
+import os
 import re
 import subprocess
 import sys
@@ -65,31 +66,55 @@ def _virtual_memory_vmstat():
 
 
 def _is_broken(psutil, attempts=24):
+    """True only if psutil.virtual_memory() fails for a clear majority of calls.
+
+    The macOS-beta bug fails ~99% of the time, so a majority threshold cleanly
+    detects it while never triggering on a healthy OS that has one rare hiccup.
+    """
     fails = 0
     for _ in range(attempts):
         try:
             psutil.virtual_memory()
         except Exception:
             fails += 1
-    return fails > 0
+    return fails > attempts // 2
+
+
+def _mode():
+    """Read APPLESILICON_FP8_PSUTIL: 'auto' (default), 'on'/'force', or 'off'."""
+    v = os.environ.get("APPLESILICON_FP8_PSUTIL", "auto").strip().lower()
+    if v in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    if v in ("1", "on", "true", "yes", "force", "forced"):
+        return "on"
+    return "auto"
 
 
 def install():
     if sys.platform != "darwin":
         return
+    mode = _mode()
+    if mode == "off":
+        return  # explicitly disabled
     try:
         import psutil
     except Exception as e:
         print(f"{TAG} psutil not importable, skipping: {e}")
         return
     try:
-        if not _is_broken(psutil):
-            return  # healthy; leave psutil alone
+        # In 'auto', only act when psutil is actually broken on this machine.
+        if mode == "auto" and not _is_broken(psutil):
+            return  # healthy; leave psutil completely untouched
         sample = _virtual_memory_vmstat()  # sanity-check before swapping
         psutil.virtual_memory = _virtual_memory_vmstat
+        why = (
+            "forced via APPLESILICON_FP8_PSUTIL"
+            if mode == "on"
+            else "psutil.virtual_memory() is broken on this OS"
+        )
         print(
-            f"{TAG} psutil.virtual_memory() is broken on this OS — installed vm_stat "
-            f"fallback (total={sample.total // (1024 ** 3)} GiB, "
+            f"{TAG} {why} — installed vm_stat fallback "
+            f"(total={sample.total // (1024 ** 3)} GiB, "
             f"available={sample.available // (1024 ** 3)} GiB)."
         )
     except Exception as e:

@@ -61,9 +61,19 @@ At startup you'll see (only the lines relevant to your machine):
 - **Speed:** patches lean on MPS's native float matmul rather than a custom Metal
   kernel — correctness and zero-setup over peak throughput. It's plenty usable;
   it is not a hand-tuned fused FP8 kernel.
-- **The psutil fix is macOS-only and self-disabling.** On a machine where psutil
-  works, it detects that and does nothing. Remove it once psutil ships a build for
-  your macOS version (it'll simply stop activating before then anyway).
+- **The psutil fix is macOS-only and self-disabling.** It only activates if
+  `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
+  calls) on your machine — which only happens on the affected macOS betas. On any
+  healthy/older macOS it detects nothing wrong and leaves psutil completely
+  untouched, so it cannot break lower systems. You can override the auto-detection:
+
+  | `APPLESILICON_FP8_PSUTIL` | Behaviour |
+  |---|---|
+  | unset / `auto` (default) | Activate only if psutil is actually broken here |
+  | `off` / `0` | Never touch psutil |
+  | `on` / `force` / `1` | Always use the `vm_stat` fallback |
+
+  Set it in your shell/launch environment, e.g. `APPLESILICON_FP8_PSUTIL=off`.
 - **comfy_kitchen / `_scaled_mm` patches** only touch the MPS + FP8 path; CUDA and
   CPU behavior is completely unchanged.
 
