@@ -1,0 +1,4 @@
+# Memory-efficient Metal flash-attention for PyTorch MPS + a guarded flash_attn
+# drop-in shim. Backs patch #5 (flash_attn + fast SDPA on Apple Silicon).
+# Apple Silicon / macOS only; a no-op import elsewhere.
+mtlflashattn>=0.1.0; platform_system == "Darwin"

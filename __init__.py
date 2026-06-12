@@ -14,6 +14,8 @@ Patches applied:
   2. comfy_kitchen eager FP8 dequant/quant      (Ideogram 4 and other ck models)
   3. torch._scaled_mm FP8 on MPS                (FLUX, SD3.5, FP8 _scaled_mm path)
   4. F.rms_norm manual fp32 path on MPS         (PiD >=2048px: black image / NaN)
+  5. flash_attn drop-in + fast SDPA on MPS      (mtlflashattn: 3-4x over fused SDPA,
+                                                 fixes the large-attention OOM/cliff)
 
 See README.md for details. MIT licensed.
 """
@@ -22,9 +24,9 @@ See README.md for details. MIT licensed.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, sdpa_flash_mps
+from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl
 
-for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large, sdpa_flash_mps):
+for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large, flash_attn_mtl):
     try:
         _patch.install()
     except Exception as _e:  # never take ComfyUI down because of us
