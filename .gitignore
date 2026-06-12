@@ -3,3 +3,7 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .venv/
+
+# Tooling state (oh-my-claudecode, serena)
+.omc/
+.serena/

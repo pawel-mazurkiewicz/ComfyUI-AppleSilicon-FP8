@@ -16,6 +16,8 @@ Patches applied:
   4. F.rms_norm manual fp32 path on MPS         (PiD >=2048px: black image / NaN)
   5. flash_attn drop-in + fast SDPA on MPS      (mtlflashattn: 3-4x over fused SDPA,
                                                  fixes the large-attention OOM/cliff)
+  6. cast_bias_weight FP8 weight+bias decode    (FP8 UNETLoader dtype: weight/bias cast crash)
+  7. stochastic_rounding FP8 CPU reroute        (LoRA + FP8 base model: re-quant crash)
 
 See README.md for details. MIT licensed.
 """
@@ -24,9 +26,9 @@ See README.md for details. MIT licensed.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-from ._patches import comfykitchen_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl
+from ._patches import comfykitchen_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8
 
-for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, rmsnorm_mps_large, flash_attn_mtl):
+for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, rmsnorm_mps_large, flash_attn_mtl):
     try:
         _patch.install()
     except Exception as _e:  # never take ComfyUI down because of us
