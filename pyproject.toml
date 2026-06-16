@@ -9,6 +9,11 @@ requires-python = ">=3.10"
 [project.urls]
 Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "--import-mode=importlib"
+
 [tool.comfy]
 PublisherId = "pawel-mazurkiewicz"
 DisplayName = "ComfyUI-AppleSilicon-FP8"

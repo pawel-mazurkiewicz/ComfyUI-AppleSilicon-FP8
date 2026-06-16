@@ -7,15 +7,14 @@ kernel for it with FP8 operands, so FLUX / SD3.5 and similar FP8 models fail wit
     TypeError: ... convert Float8_e4m3fn to the MPS backend ...
 
 We monkey-patch torch._scaled_mm so that, for MPS + FP8 operands, it:
-  1. decodes both operands FP8 -> float32 via the LUT+gather (MPS-safe),
-  2. applies the per-tensor / per-row scales,
-  3. runs a native float32 matmul on MPS,
-  4. applies bias / result-scale / out_dtype.
+  1. decodes both operands FP8 -> bf16 (bit-exact; bf16 has fp32 exponent range so
+     no overflow) via the LUT+gather (MPS-safe),
+  2. runs a bf16 matmul on MPS — bf16@bf16 dispatches to the matrix units
+     (Neural Accelerators on M5+, simdgroup_matrix on M1–M4),
+  3. applies per-row/col scales and bias to the output (in fp32 to avoid rounding),
+  4. casts to out_dtype.
 
 Non-MPS or non-FP8 calls fall through to the original implementation untouched.
-This computes in float32 to avoid the FP16 overflow that raw FP8 dot products can
-hit; it leans on MPS's native matmul rather than a custom Metal kernel, so there's
-nothing to compile and no third-party code involved.
 """
 
 import torch
@@ -28,11 +27,18 @@ _original = None
 _installed = False
 
 
-def _to_f32(t):
-    """FP8 -> float32 via LUT (MPS-safe); anything else -> float32 normally."""
+def _compute_dtype(out_dtype):
+    """bf16 for bf16/fp16 results (rides the matrix units, bit-exact decode,
+    fp32-range so no overflow); float32 only when the caller explicitly wants f32."""
+    if out_dtype in (torch.bfloat16, torch.float16):
+        return torch.bfloat16
+    return torch.float32
+
+
+def _decode(t, compute_dtype):
     if t.dtype in FP8_DTYPES:
-        return decode_fp8(t)
-    return t.to(torch.float32)
+        return decode_fp8(t, compute_dtype)
+    return t.to(compute_dtype)
 
 
 def _mps_scaled_mm(
@@ -50,33 +56,38 @@ def _mps_scaled_mm(
     is_fp8 = input.dtype in FP8_DTYPES or other.dtype in FP8_DTYPES
     if not (is_mps and is_fp8):
         return _original(
-            input,
-            other,
-            out_dtype=out_dtype,
-            scale_a=scale_a,
-            scale_b=scale_b,
-            bias=bias,
-            scale_result=scale_result,
-            use_fast_accum=use_fast_accum,
+            input, other,
+            out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b,
+            bias=bias, scale_result=scale_result, use_fast_accum=use_fast_accum,
         )
 
-    # input: (M, K), other: (K, N) column-major — exactly torch._scaled_mm's layout.
-    a = _to_f32(input)
-    b = _to_f32(other)
+    compute_dtype = _compute_dtype(out_dtype)
 
-    # Apply scales to the operands. Per-tensor scalars and per-row/col vectors all
-    # broadcast over K: scale_a (M,1) over rows of a, scale_b (1,N) over cols of b.
-    if scale_a is not None:
-        a = a * scale_a.to(torch.float32)
-    if scale_b is not None:
-        b = b * scale_b.to(torch.float32)
+    # input: (M,K), other: (K,N) column-major — torch._scaled_mm's layout.
+    a = _decode(input, compute_dtype)
+    b = _decode(other, compute_dtype)
 
+    # bf16@bf16 -> bf16 (fp32 accumulate) on the matrix units; f32@f32 -> f32.
     out = a @ b
 
+    # Per-row/col and per-tensor scales factor out of the dot product, so apply
+    # them to the result (scale_a over rows, scale_b over cols). Compute in fp32
+    # then come back to the working dtype to avoid intermediate rounding.
+    if scale_a is not None or scale_b is not None or scale_result is not None:
+        acc = out.to(torch.float32)
+        if scale_a is not None:
+            acc = acc * scale_a.to(torch.float32)
+        if scale_b is not None:
+            acc = acc * scale_b.to(torch.float32)
+        if scale_result is not None:
+            acc = acc * scale_result.to(torch.float32)
+        out = acc.to(out.dtype)
+
     if bias is not None:
-        out = out + bias.to(torch.float32)
-    if scale_result is not None:
-        out = out * scale_result.to(torch.float32)
+        # Always add bias in f32 regardless of compute_dtype so that bf16
+        # compute does not lose precision in the bias term before the final
+        # widen (matches the old unconditional f32 bias behaviour).
+        out = out.to(torch.float32) + bias.to(torch.float32)
     if out_dtype is not None:
         out = out.to(out_dtype)
     return out
@@ -91,4 +102,4 @@ def install():
     _original = torch._scaled_mm
     torch._scaled_mm = _mps_scaled_mm
     _installed = True
-    print(f"{TAG} torch._scaled_mm FP8 now runs on MPS via LUT decode + native matmul.")
+    print(f"{TAG} torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul.")

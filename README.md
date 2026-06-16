@@ -19,7 +19,9 @@ overwhelmingly trained and tuned for NVIDIA — that doesn't mean you can't run 
 on Apple Silicon. This trades some peak throughput for "it actually runs."
 
 It's a single ComfyUI custom node that applies a few targeted runtime patches at
-startup. No model conversion and no Metal compilation; the only dependency is
+startup. No model conversion. FP8 matmuls decode (bit-exact) to bf16 and run on
+Apple's matrix units (Neural Accelerators on M5+, simdgroup_matrix on M1–M4).
+The only dependency is
 [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn) (the Metal
 flash-attention kernels — Apple Silicon only, installed automatically). Each
 patch is a no-op on machines that don't need it.
@@ -70,7 +72,7 @@ At startup you'll see (only the lines relevant to your machine):
 ```
 [AppleSilicon-FP8/psutil] psutil.virtual_memory() is broken on this OS — installed vm_stat fallback (...).
 [AppleSilicon-FP8/comfy_kitchen] patched comfy_kitchen eager FP8 dequantize/quantize for MPS.
-[AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 now runs on MPS via LUT decode + native matmul.
+[AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul.
 [AppleSilicon-FP8/ops_bias] cast_bias_weight FP8 weight+bias LUT-decoded to compute dtype on MPS.
 [AppleSilicon-FP8/stochastic_round] stochastic_rounding FP8 re-quant routed via CPU on MPS.
 [AppleSilicon-FP8/tensor_to] torch.Tensor.to FP8<->float routed via LUT/CPU on MPS.
@@ -83,9 +85,11 @@ At startup you'll see (only the lines relevant to your machine):
 
 - **Accuracy:** the FP8 decode is bit-exact; results match a CUDA/CPU FP8 run
   within normal quantization noise.
-- **Speed:** patches lean on MPS's native float matmul rather than a custom Metal
-  kernel — correctness and zero-setup over peak throughput. It's plenty usable;
-  it is not a hand-tuned fused FP8 kernel.
+- **Speed:** FP8 operands decode (bit-exact) to **bf16**, so the matmul runs on the
+  matrix units (M5+ Neural Accelerators / M1–M4 simdgroup_matrix) instead of the
+  scalar f32 path. FP8 itself is not matrix-accelerated on Metal (emulated), so
+  bf16 decode is the fast route — measured ~4× faster than f32 on M5 Max across
+  diffusion-shaped GEMMs.
 - **The psutil fix is macOS-only and self-disabling.** It only activates if
   `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
   calls) on your machine — which only happens on the affected macOS betas. On any
