@@ -20,11 +20,7 @@ on Apple Silicon. This trades some peak throughput for "it actually runs."
 
 It's a single ComfyUI custom node that applies a few targeted runtime patches at
 startup. No model conversion. FP8 matmuls decode (bit-exact) to bf16 and run on
-Apple's matrix units (Neural Accelerators on M5+, simdgroup_matrix on M1–M4). A
-vendored NA `matmul2d` kernel (`_patches/na_gemm.py`) is available for
-experimentation via `torch.mps.compile_shader` (no Xcode), but is **not** wired
-into the hot path — benchmarks on M5 Max showed it runs 0.60–0.72× MPS bf16 GEMM
-across FLUX-ish shapes, so the default path stays as plain `bf16 @ bf16` on MPS.
+Apple's matrix units (Neural Accelerators on M5+, simdgroup_matrix on M1–M4).
 The only dependency is
 [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn) (the Metal
 flash-attention kernels — Apple Silicon only, installed automatically). Each
@@ -92,10 +88,8 @@ At startup you'll see (only the lines relevant to your machine):
 - **Speed:** FP8 operands decode (bit-exact) to **bf16**, so the matmul runs on the
   matrix units (M5+ Neural Accelerators / M1–M4 simdgroup_matrix) instead of the
   scalar f32 path. FP8 itself is not matrix-accelerated on Metal (emulated), so
-  bf16 decode is the fast route. A vendored NA `matmul2d` kernel exists in
-  `_patches/na_gemm.py` but is not wired into the hot path: on M5 Max it measured
-  0.60–0.72× MPS bf16 GEMM — slower, not faster. MPS's own `bf16 @ bf16` is the
-  default and beats the explicit NA dispatch for diffusion-shaped GEMMs.
+  bf16 decode is the fast route — measured ~4× faster than f32 on M5 Max across
+  diffusion-shaped GEMMs.
 - **The psutil fix is macOS-only and self-disabling.** It only activates if
   `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
   calls) on your machine — which only happens on the affected macOS betas. On any
@@ -117,14 +111,6 @@ At startup you'll see (only the lines relevant to your machine):
   you keep FP8's *storage* savings but pay a per-use decode and run at
   bf16-equivalent speed. If you have the RAM, a bf16 checkpoint avoids the decode
   tax entirely and is usually faster.
-- **NA `matmul2d` kernel** (`_patches/na_gemm.py`) is available as a library but
-  is **not wired into the inference hot path**. Benchmarks on M5 Max showed it runs
-  at 0.60–0.72× MPS bf16 GEMM across diffusion-shaped matrices (4096², 1024×12288,
-  8192×3072), so the default path is plain `bf16 @ bf16` on MPS. The module remains
-  for the fused FP8→bf16 decode spike (Task 8 / `dev/spike_fused_fp8_gemm.py`) —
-  the only path that could recover the bandwidth gap. `ASFP8_METAL_MM` is not
-  currently read by the hot path (Task 6 was skipped per the benchmark decision gate).
-
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
