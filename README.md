@@ -39,8 +39,9 @@ patch is a no-op on machines that don't need it.
 | 5 | **Large attention SIGKILLs the render** (SeedVR2 4K DiT, long-context global attention), **or attention is slow / numerically wrong** on MPS past ~4k tokens | MPS fused `scaled_dot_product_attention` materializes the full `Lq×Lk` score matrix (memory grows `O(B·H·Lq·Lk)`) and is silently inaccurate at length; there is no flash-attention on MPS | Back `F.scaled_dot_product_attention` (and `import flash_attn`) with [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn): Metal flash kernels (simdgroup_matrix / M5 TensorOps) that never form the score matrix and run **3–4× faster than fused SDPA** at length. Gated so small attention stays on stock |
 | 6 | `TypeError: ... convert Float8_e4m3fn to the MPS backend ...` from an **FP8 `UNETLoader` checkpoint** (e.g. Lens, FLUX fp8) at sampling time | ComfyUI's `manual_cast` layers store weight **and bias** as raw FP8 and cast them up per forward; MPS can cast neither *to* nor *from* FP8 on-device (the bias crashes first, the weight would crash next) | Take over `comfy.ops.cast_bias_weight` on the plain MPS path and LUT-decode weight + bias to the compute dtype (QuantizedTensor params routed via `dequantize()`) |
 | 7 | `TypeError: ... convert Float8_e4m3fn ...` when applying a **LoRA on top of an FP8 base model** | After patching the float weight, ComfyUI re-quantizes it back to FP8 via `stochastic_rounding`, which does a float→FP8 cast that MPS can't | Route the FP8 re-quant through CPU (where the cast works), then move the FP8 result back to MPS |
-| 8 | `TypeError: ... convert Float8_e4m3fn ...` from a **custom node's own FP8 Linear** (e.g. WanVideoWrapper `custom_linear.py`, T5 encoder) | These bypass `comfy.ops` and cast FP8 weights/bias at runtime with a plain Python `.to(input)`; MPS can't cast to/from FP8 | Wrap `torch.Tensor.to` so FP8↔float conversions on MPS go through the LUT decode (FP8→float) or CPU (float→FP8); everything else takes a tight fast path. *(Catches Python-level `.to()`; FP8 promotion inside C++ ops like `F.linear` is out of scope — see Scope.)* |
+| 8 | `TypeError: ... convert Float8_e4m3fn ...` from a **custom node's own FP8 Linear** (e.g. WanVideoWrapper `custom_linear.py`) | These bypass `comfy.ops` and cast FP8 weights/bias at runtime with a plain Python `.to(input)`; MPS can't cast to/from FP8 | Wrap `torch.Tensor.to` so FP8↔float conversions on MPS go through the LUT decode (FP8→float) or CPU (float→FP8); everything else takes a tight fast path |
 | 9 | `RuntimeError: Expected all tensors to be on the same device, but found ... mps:0 and cpu!` in **WanVideoSampler** | WanVideo **block swap** offloads transformer blocks to CPU and streams them back per-step, syncing the async copy with CUDA events that don't hold on MPS — so a block's params (e.g. `self.modulation`) are still on CPU when it runs | On MPS, neutralize block swap: wrap `WanModel.forward` to clear the offload flags and make every block resident on the compute device first. Memory is unified on Apple Silicon, so block swap saves nothing here anyway |
+| 10 | `RuntimeError: MPS device does not support linear for non-float weights` from a **custom FP8 Linear that calls `F.linear` directly** (e.g. WanVideo T5 encoder) | `F.linear` is a C++ op; FP8 dtype-promotion happens inside C++ before any Python `.to()` is called, so patch #8 can't intercept it | Wrap `torch.nn.functional.linear` so FP8 input/weight/bias are decoded to the compute dtype before calling the original kernel |
 
 ### How the FP8 trick works
 
@@ -79,6 +80,7 @@ At startup you'll see (only the lines relevant to your machine):
 [AppleSilicon-FP8/wan_blockswap] armed; will neutralize WanVideo block swap on MPS when it loads.
 [AppleSilicon-FP8/rmsnorm] F.rms_norm uses manual fp32 path on MPS for >2^21 rows (PiD black-image fix).
 [AppleSilicon-FP8/flash] F.scaled_dot_product_attention -> mtlflashattn on MPS (correctness>=4096 tok, fast-tier>=1024 tok, oom>=12 GB).
+[AppleSilicon-FP8/linear_fp8] F.linear FP8 operands decoded to compute dtype on MPS.
 ```
 
 ## Notes & caveats
@@ -145,13 +147,6 @@ This is a "make it work on Mac" compatibility layer, not a performance library.
 It targets the specific gaps that block FP8 diffusion models on MPS today. If a
 model hits a *different* unsupported op (e.g. some `nvfp4` / `mxfp8` paths), it
 may surface a new error — open an issue with the traceback.
-
-**Known gap:** FP8 type-promotion that happens *inside* a C++ op (e.g. calling
-`F.linear` directly with a raw FP8 weight, as WanVideo's T5 text encoder does)
-isn't visible to the `Tensor.to` shim (patch #8), since no Python `.to()` is
-involved. For now, set such a node's quantization to a float dtype (e.g. the
-WanVideo T5 encoder → `disabled`) — on MPS that's the better choice anyway. An
-`F.linear` shim to close this is on the roadmap.
 
 ## License
 

@@ -20,6 +20,7 @@ Patches applied:
   7. stochastic_rounding FP8 CPU reroute        (LoRA + FP8 base model: re-quant crash)
   8. torch.Tensor.to FP8<->float on MPS         (3rd-party fp8 Linears: WanVideo custom_linear, etc.)
   9. WanVideo block-swap neutralizer on MPS      (block swap is CUDA-VRAM-only; breaks on MPS)
+ 10. F.linear FP8 operand decode on MPS         (T5 encoder + any FP8 Linear using F.linear directly)
 
 See README.md for details. MIT licensed.
 """
@@ -35,9 +36,9 @@ if __spec__ is not None and __spec__.parent:
     # string and relative imports would fail.  Checking __spec__.parent is CPython-
     # guaranteed behaviour (see importlib docs) and avoids inspecting ImportError
     # message strings that are implementation details liable to change.
-    from ._patches import comfykitchen_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps
+    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps
 
-    for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl):
+    for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl, linear_fp8):
         try:
             _patch.install()
         except Exception as _e:  # never take ComfyUI down because of us
