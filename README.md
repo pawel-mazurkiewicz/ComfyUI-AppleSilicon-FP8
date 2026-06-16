@@ -19,7 +19,11 @@ overwhelmingly trained and tuned for NVIDIA — that doesn't mean you can't run 
 on Apple Silicon. This trades some peak throughput for "it actually runs."
 
 It's a single ComfyUI custom node that applies a few targeted runtime patches at
-startup. No model conversion and no Metal compilation; the only dependency is
+startup. No model conversion. FP8 matmuls decode to bf16 and run on Apple's matrix units
+(Neural Accelerators on M5+, simdgroup_matrix on M1–M4); an optional NA matmul2d
+kernel compiles at runtime via torch.mps.compile_shader (no Xcode) and is gated
+behind ASFP8_METAL_MM (auto by default, self-disables if it doesn't compile/verify).
+The only dependency is
 [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn) (the Metal
 flash-attention kernels — Apple Silicon only, installed automatically). Each
 patch is a no-op on machines that don't need it.
@@ -70,7 +74,7 @@ At startup you'll see (only the lines relevant to your machine):
 ```
 [AppleSilicon-FP8/psutil] psutil.virtual_memory() is broken on this OS — installed vm_stat fallback (...).
 [AppleSilicon-FP8/comfy_kitchen] patched comfy_kitchen eager FP8 dequantize/quantize for MPS.
-[AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 now runs on MPS via LUT decode + native matmul.
+[AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul.
 [AppleSilicon-FP8/ops_bias] cast_bias_weight FP8 weight+bias LUT-decoded to compute dtype on MPS.
 [AppleSilicon-FP8/stochastic_round] stochastic_rounding FP8 re-quant routed via CPU on MPS.
 [AppleSilicon-FP8/tensor_to] torch.Tensor.to FP8<->float routed via LUT/CPU on MPS.
@@ -83,9 +87,11 @@ At startup you'll see (only the lines relevant to your machine):
 
 - **Accuracy:** the FP8 decode is bit-exact; results match a CUDA/CPU FP8 run
   within normal quantization noise.
-- **Speed:** patches lean on MPS's native float matmul rather than a custom Metal
-  kernel — correctness and zero-setup over peak throughput. It's plenty usable;
-  it is not a hand-tuned fused FP8 kernel.
+- **Speed:** FP8 operands decode (bit-exact) to **bf16**, so the matmul runs on the
+  matrix units (M5+ Neural Accelerators / M1–M4 simdgroup_matrix) instead of the
+  scalar f32 path. FP8 itself is not matrix-accelerated on Metal (emulated), so this
+  is the fast route. An optional fused NA `matmul2d` kernel (`ASFP8_METAL_MM`) is
+  available; it self-checks at first use and falls back silently on any error.
 - **The psutil fix is macOS-only and self-disabling.** It only activates if
   `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
   calls) on your machine — which only happens on the affected macOS betas. On any
@@ -107,6 +113,14 @@ At startup you'll see (only the lines relevant to your machine):
   you keep FP8's *storage* savings but pay a per-use decode and run at
   bf16-equivalent speed. If you have the RAM, a bf16 checkpoint avoids the decode
   tax entirely and is usually faster.
+- **NA `matmul2d` kernel (`ASFP8_METAL_MM`)** compiles at first use via
+  `torch.mps.compile_shader` (no Xcode required) and runs a numeric self-check before
+  being armed. If compilation or verification fails, the backend silently disables
+  itself and MPS bf16 GEMM is used instead.
+
+  | `ASFP8_METAL_MM` | `auto` (default): use the NA matmul2d kernel when it compiles and passes a numeric self-check; `off`: bf16 MPS GEMM only; `on`: force-attempt the NA kernel (still falls back if unavailable). |
+  |---|---|
+
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
