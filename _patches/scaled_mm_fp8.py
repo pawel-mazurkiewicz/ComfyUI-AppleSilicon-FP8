@@ -84,7 +84,10 @@ def _mps_scaled_mm(
         out = acc.to(out.dtype)
 
     if bias is not None:
-        out = out + bias.to(out.dtype)
+        # Always add bias in f32 regardless of compute_dtype so that bf16
+        # compute does not lose precision in the bias term before the final
+        # widen (matches the old unconditional f32 bias behaviour).
+        out = out.to(torch.float32) + bias.to(torch.float32)
     if out_dtype is not None:
         out = out.to(out_dtype)
     return out

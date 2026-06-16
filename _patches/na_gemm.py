@@ -102,10 +102,16 @@ def available():
 
 
 def na_matmul(a, b):
-    """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16, contiguous, row-major, on MPS."""
+    """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16, on MPS.
+
+    Inputs are made contiguous here so callers need not worry about strides
+    (e.g. a decoded-from-LUT tensor that inherited a transposed layout).
+    """
     lib = _get_lib()
     if lib is None:
         raise RuntimeError("NA matmul2d unavailable")
+    a = a.contiguous()
+    b = b.contiguous()
     M, K = a.shape
     K2, N = b.shape
     assert K == K2, f"inner dims disagree: {a.shape} @ {b.shape}"
@@ -113,6 +119,16 @@ def na_matmul(a, b):
     sh = torch.tensor([M, N, K], dtype=torch.int32, device="mps")
     ntg_x = -(-M // _BM)
     ntg_y = -(-N // _BN)
+    # compile_shader dispatch: `threads` is the TOTAL thread count in each
+    # dimension and `group_size` is the threadgroup size.  So threadgroups in
+    # each dimension = threads / group_size.
+    #
+    # X: ntg_x * 128 total threads / group_size 128  → ntg_x threadgroups  (M tiles)
+    # Y: ntg_y * 1   total threads / group_size  1   → ntg_y threadgroups  (N tiles)
+    # Z: 1           total threads / group_size  1   → 1  threadgroup
+    #
+    # tgid.x → M-tile index, tgid.y → N-tile index — consistent with the
+    # kernel's `m0 = tgid.x * BM`, `n0 = tgid.y * BN`.
     lib.gemm(a, b, c, sh, threads=(ntg_x * 128, ntg_y, 1), group_size=(128, 1, 1))
     return c
 

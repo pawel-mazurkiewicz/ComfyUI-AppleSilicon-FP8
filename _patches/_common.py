@@ -42,6 +42,12 @@ def decode_fp8(t, out_dtype=torch.float32):
     """
     device = t.device
     lut = fp8_to_float_lut(t.dtype, device, out_dtype)
-    # Make contiguous on CPU (MPS can't call .contiguous() on FP8), then view as uint8.
-    idx = t.cpu().contiguous().view(torch.uint8).to(torch.long).to(device)
+    # MPS cannot call .contiguous() on FP8 tensors, so we always make the
+    # tensor contiguous on CPU first before viewing as uint8.  When the tensor
+    # is already on CPU and already contiguous we skip the redundant .cpu()
+    # transfer to avoid an unnecessary synchronisation round-trip.
+    if device.type == "cpu" and t.is_contiguous():
+        idx = t.view(torch.uint8).to(torch.long)
+    else:
+        idx = t.cpu().contiguous().view(torch.uint8).to(torch.long).to(device)
     return lut[idx]

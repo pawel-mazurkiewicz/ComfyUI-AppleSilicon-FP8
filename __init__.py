@@ -30,9 +30,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 
 try:
     from ._patches import comfykitchen_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps
-except ImportError:
-    # When imported without a parent package (e.g. pytest test discovery),
-    # relative imports fail — bail out gracefully so tests can run.
+except ImportError as _ie:
+    # Relative imports fail when the module is imported without a parent package
+    # (e.g. direct pytest test discovery).  Re-raise anything else so that a
+    # broken patch dependency (missing library, typo, etc.) is not silently
+    # swallowed and stays invisible in the ComfyUI console.
+    _msg = str(_ie)
+    if "attempted relative import" not in _msg and "no known parent package" not in _msg:
+        raise
+    # Genuine relative-import-without-parent — bail out gracefully.
     pass
 else:
     for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl):
