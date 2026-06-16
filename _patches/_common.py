@@ -19,16 +19,23 @@ FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _lut_cache = {}
 
 
-def fp8_to_float_lut(dtype, device):
-    """Return a cached 256-entry float32 LUT for `dtype`, living on `device`."""
-    key = (dtype, device.type, getattr(device, "index", None))
+def fp8_to_float_lut(dtype, device, out_dtype=torch.float32):
+    """Return a cached 256-entry LUT (`out_dtype`) for FP8 `dtype`, on `device`."""
+    key = (dtype, out_dtype, device.type, getattr(device, "index", None))
     lut = _lut_cache.get(key)
     if lut is None:
-        lut = torch.arange(256, dtype=torch.uint8).view(dtype).to(torch.float32).to(device)
+        # Decode every FP8 byte on CPU (where the cast works), then move to device.
+        lut = torch.arange(256, dtype=torch.uint8).view(dtype).to(out_dtype).to(device)
         _lut_cache[key] = lut
     return lut
 
 
-def decode_fp8(t):
-    """Decode an FP8 tensor to float32 on its own device (MPS-safe)."""
-    return fp8_to_float_lut(t.dtype, t.device)[t.view(torch.uint8).to(torch.long)]
+def decode_fp8(t, out_dtype=torch.float32):
+    """Decode an FP8 tensor to `out_dtype` on its own device (MPS-safe).
+
+    bf16 and float32 both represent every FP8 value exactly, so either target is
+    bit-exact with a real FP8->float cast.
+    """
+    lut = fp8_to_float_lut(t.dtype, t.device, out_dtype)
+    idx = t.contiguous().view(torch.uint8).to(torch.long)
+    return lut[idx]

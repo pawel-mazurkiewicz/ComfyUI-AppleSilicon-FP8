@@ -28,12 +28,17 @@ See README.md for details. MIT licensed.
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 
-from ._patches import comfykitchen_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps
-
-for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl):
-    try:
-        _patch.install()
-    except Exception as _e:  # never take ComfyUI down because of us
-        import traceback
-        print(f"[AppleSilicon-FP8] patch {_patch.__name__} failed: {_e}")
-        traceback.print_exc()
+try:
+    from ._patches import comfykitchen_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps
+except ImportError:
+    # When imported without a parent package (e.g. pytest test discovery),
+    # relative imports fail — bail out gracefully so tests can run.
+    pass
+else:
+    for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl):
+        try:
+            _patch.install()
+        except Exception as _e:  # never take ComfyUI down because of us
+            import traceback
+            print(f"[AppleSilicon-FP8] patch {_patch.__name__} failed: {_e}")
+            traceback.print_exc()
