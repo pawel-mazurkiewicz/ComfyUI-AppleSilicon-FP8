@@ -11,7 +11,7 @@ Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "tests"]
 addopts = "--import-mode=importlib"
 
 [tool.comfy]

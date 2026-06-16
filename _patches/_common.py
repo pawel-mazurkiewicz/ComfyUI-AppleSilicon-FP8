@@ -35,7 +35,13 @@ def decode_fp8(t, out_dtype=torch.float32):
 
     bf16 and float32 both represent every FP8 value exactly, so either target is
     bit-exact with a real FP8->float cast.
+
+    MPS does not support FP8 ops (including .contiguous()) directly, so we make the
+    tensor contiguous on CPU then view as uint8, move the indices to the target device,
+    and gather from the LUT (which lives on the target device).
     """
-    lut = fp8_to_float_lut(t.dtype, t.device, out_dtype)
-    idx = t.contiguous().view(torch.uint8).to(torch.long)
+    device = t.device
+    lut = fp8_to_float_lut(t.dtype, device, out_dtype)
+    # Make contiguous on CPU (MPS can't call .contiguous() on FP8), then view as uint8.
+    idx = t.cpu().contiguous().view(torch.uint8).to(torch.long).to(device)
     return lut[idx]
