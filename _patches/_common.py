@@ -36,18 +36,16 @@ def decode_fp8(t, out_dtype=torch.float32):
     bf16 and float32 both represent every FP8 value exactly, so either target is
     bit-exact with a real FP8->float cast.
 
-    MPS does not support FP8 ops (including .contiguous()) directly, so we make the
-    tensor contiguous on CPU then view as uint8, move the indices to the target device,
-    and gather from the LUT (which lives on the target device).
+    A *contiguous* FP8 tensor can be bit-viewed as uint8 and gathered entirely on
+    its own device (verified on MPS) — no host round-trip. Only the non-contiguous
+    case needs CPU, because MPS cannot run .contiguous() on an FP8 dtype.
     """
     device = t.device
     lut = fp8_to_float_lut(t.dtype, device, out_dtype)
-    # MPS cannot call .contiguous() on FP8 tensors, so we always make the
-    # tensor contiguous on CPU first before viewing as uint8.  When the tensor
-    # is already on CPU and already contiguous we skip the redundant .cpu()
-    # transfer to avoid an unnecessary synchronisation round-trip.
-    if device.type == "cpu" and t.is_contiguous():
+    if t.is_contiguous():
         idx = t.view(torch.uint8).to(torch.long)
     else:
+        # MPS can't .contiguous() an FP8 tensor; make it contiguous on CPU, then
+        # bring the integer indices back to the target device for the gather.
         idx = t.cpu().contiguous().view(torch.uint8).to(torch.long).to(device)
     return lut[idx]
