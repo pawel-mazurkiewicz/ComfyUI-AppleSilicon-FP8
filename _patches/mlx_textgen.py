@@ -37,6 +37,10 @@ _orig = None
 _installed = False
 
 
+class _Fallback(Exception):
+    """Internal: signal 'not our case, use the eager path' without logging."""
+
+
 def _extract_text_ids(tokens):
     """From ComfyUI's tokenize() output {key: [[(id, weight), ...]]} return
     (list[int] ids of batch 0, has_media). A media entry has a dict in slot [0]."""
@@ -66,6 +70,40 @@ def _qwen3vl_hf_tokenizer(cond_stage_model, sd1_tokenizer):
             sub_tok = getattr(sd1_tokenizer, key, None)
             return getattr(sub_tok, "tokenizer", None)
     return None
+
+
+def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0,
+                   top_k=50, top_p=0.95, min_p=0.0, repetition_penalty=1.0,
+                   seed=None, presence_penalty=0.0):
+    if os.environ.get("ASFP8_DISABLE_MLX_TEXTGEN") == "1":
+        return _orig(self, tokens, do_sample=do_sample, max_length=max_length,
+                     temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                     repetition_penalty=repetition_penalty, seed=seed,
+                     presence_penalty=presence_penalty)
+    try:
+        hf_tok = _qwen3vl_hf_tokenizer(self.cond_stage_model, self.tokenizer)
+        if hf_tok is None:
+            raise _Fallback
+        ids, has_media = _extract_text_ids(tokens)
+        if has_media or not ids:
+            raise _Fallback
+
+        prompt_text = hf_tok.decode(ids, skip_special_tokens=False)
+        out_text = _mlx_qwen3vl.generate_text(
+            prompt_text, max_tokens=max_length, do_sample=do_sample,
+            temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+            repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
+            seed=seed,
+        )
+        return list(hf_tok.encode(out_text))
+    except _Fallback:
+        pass
+    except Exception as e:  # never break a render: fall back to the eager path
+        print(f"{TAG} MLX generation failed ({e!r}); falling back to eager.")
+    return _orig(self, tokens, do_sample=do_sample, max_length=max_length,
+                 temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+                 repetition_penalty=repetition_penalty, seed=seed,
+                 presence_penalty=presence_penalty)
 
 
 def install():
