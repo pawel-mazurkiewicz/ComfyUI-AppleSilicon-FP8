@@ -44,22 +44,19 @@ kernel void gemm_fp8(
     matmul2d<desc, execution_simdgroups<NSG>> op;
 
     using fp8_t = metal::metal_fp8_e4m3_format;
-    auto mA0 = tensor(A + ulong(m0)*K, dextents<int,2>{BK, min(BM, M - m0)}, array<int,2>{1, K});
-    auto mB0 = tensor<device fp8_t, dextents<int,2>, tensor_inline>(
-                   B + n0, dextents<int,2>{min(BN, N - n0), BK}, array<int,2>{1, N});
-    using AT = __tensor_ops_detail::__remove_addrspace_t<decltype(mA0)>;
-    using BT = __tensor_ops_detail::__remove_addrspace_t<decltype(mB0)>;
+    // Full-K operands + a single op.run: let matmul2d choose its internal tileK.
+    // (The manual BK-chunked accumulate loop forced tileK=BK and paid per-chunk
+    // cooperative-op overhead, which dominated the compute-bound large-M regime.)
+    auto mA = tensor(A + ulong(m0)*K, dextents<int,2>{K, min(BM, M - m0)}, array<int,2>{1, K});
+    auto mB = tensor<device fp8_t, dextents<int,2>, tensor_inline>(
+                  B + n0, dextents<int,2>{min(BN, N - n0), K}, array<int,2>{1, N});
+    using AT = __tensor_ops_detail::__remove_addrspace_t<decltype(mA)>;
+    using BT = __tensor_ops_detail::__remove_addrspace_t<decltype(mB)>;
     auto cC = op.get_destination_cooperative_tensor<AT, BT, float>();
     for (uint16_t i = 0; i < cC.get_capacity(); ++i)
         if (cC.is_valid_element(i)) cC[i] = 0.0f;
 
-    for (int k0 = 0; k0 < K; k0 += BK) {
-        const int kk = min(BK, K - k0);
-        auto mA = tensor(A + ulong(m0)*K + k0, dextents<int,2>{kk, min(BM, M - m0)}, array<int,2>{1, K});
-        auto mB = tensor<device fp8_t, dextents<int,2>, tensor_inline>(
-                      B + ulong(k0)*N + n0, dextents<int,2>{min(BN, N - n0), kk}, array<int,2>{1, N});
-        op.run(mA, mB, cC);
-    }
+    op.run(mA, mB, cC);
 
     device float* Cb = C + ulong(m0)*N + n0;
     for (uint16_t i = 0; i < cC.get_capacity(); ++i) {
