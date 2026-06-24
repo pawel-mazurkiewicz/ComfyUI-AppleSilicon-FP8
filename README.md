@@ -46,6 +46,7 @@ patch is a no-op on machines that don't need it.
 | 12 | **INT8-quantized models hang at 0/N with the GPU idle** (e.g. **Krea2 `int8_mixed`** via the `int8-fast` node) — looks frozen, never crashes | INT8 Linears do their matmul with `torch._int_mm` (int8×int8→int32), which has **no Metal kernel**; with `PYTORCH_ENABLE_MPS_FALLBACK` on (ComfyUI sets it) the op silently bounces both operands to the CPU and back, per Linear per layer per step | On MPS, route `torch._int_mm` through a GPU float32 matmul instead of the CPU fallback (int8→float32 casts natively; sums stay well under int32 range and are rescaled to bf16 downstream, so it's bit-exact in practice). Non-MPS keeps the native integer kernel |
 | 13 | **INT8 models run, but ~3-5× too slow** on MPS (e.g. Krea2 `int8_mixed` at ~140 s/step) | The `int8-fast` node's wide-batch path (image diffusion = thousands of tokens) quantizes activations to int8 and matmuls via `torch._int_mm` — which on MPS is float32 (patch #12), losing bf16 throughput and doubling the working set on top of a multi-GB model | On MPS, route int8-fast's `int8_forward_dynamic[_per_row]` through its own small-batch path: dequantize the int8 weight to bf16 and use MPS's native (double-buffered) bf16 GEMM. ~3.5-4.7× faster on FLUX-shaped Linears, equal-or-better accuracy (weight-only int8). Patched via a post-import hook since int8-fast loads after this node |
 | 14 | **MLX-backed Qwen3-VL `TextGenerate`** — Krea2 prompt-expansion runs an eager autoregressive Qwen3-VL-4B loop (~50 s on MPS) | The generation loop runs token-by-token inside a Python `for` loop using PyTorch MPS ops; there is no batched Metal kernel for autoregressive decoding, so each forward pass pays per-token dispatch overhead (~1 s/token) | On MPS, with `mlx-vlm` installed, route the generation loop through MLX (`mlx-community/Qwen3-VL-4B-Instruct-4bit`): MLX's native autoregressive engine amortises dispatch cost with a fused Metal decode loop and KV-cache on the GPU. Text-only; conditioning encode is untouched. Eager fallback if MLX is absent or errors. |
+| 15 | **fp8-native Linear** (EXPERIMENTAL, opt-in) — large fp8 MLP Linears decode fp8→bf16 then MPS-GEMM on every call (2 B/elem weight + a decode pass) | The default path materialises a bf16 copy of each fp8 weight per call; for the big MLP projections that is bandwidth-bound, and `torch.mps.compile_shader` can't reach the Metal 4.1 `matmul2d` that consumes fp8 operands directly | On MPS with `ASFP8_FP8_EXT=1` and the Xcode/Metal toolchain present, route large fp8 Linears (`max(in,out) ≥ ASFP8_FP8_EXT_MIN_DIM`, default 8192) through a JIT-built Metal 4.1 ObjC++ extension whose `matmul2d` reads fp8 weights natively (1 B/elem, fp32 accumulate). Bit-exact vs the decode path; ~2–5× on small batches, ~10–18% on the big MLP projections at typical diffusion token counts. **Default OFF**; any build/parity failure falls back automatically. fp16 activation range assumed; Metal 4.1 is dev-beta. |
 
 ### How the FP8 trick works
 
@@ -123,6 +124,19 @@ At startup you'll see (only the lines relevant to your machine):
   you keep FP8's *storage* savings but pay a per-use decode and run at
   bf16-equivalent speed. If you have the RAM, a bf16 checkpoint avoids the decode
   tax entirely and is usually faster.
+- **fp8-native Linear (patch #15) is EXPERIMENTAL and opt-in (default OFF).** With
+  `ASFP8_FP8_EXT=1` and the Xcode/Metal toolchain installed, large fp8 MLP Linears
+  are routed through a JIT-built Metal 4.1 `matmul2d` that reads fp8 weights directly
+  (no bf16 materialization, fp32 accumulate) — bit-exact, ~2–5× on small batches and
+  ~10–18% on the big MLP projections at typical diffusion token counts. It builds an
+  ObjC++ extension on first use (needs the toolchain); any build/parity failure falls
+  back automatically to the decode path, so the node still works without it. Metal 4.1
+  is a dev-beta language version, so treat this as experimental.
+
+  | Env var | Behaviour |
+  |---|---|
+  | `ASFP8_FP8_EXT` = `1` | Enable fp8-native Linear (builds the Metal 4.1 extension on first eligible Linear). Default OFF. |
+  | `ASFP8_FP8_EXT_MIN_DIM` (8192) | Route a Linear to the fp8 kernel only if `max(in_features, out_features)` ≥ this. |
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
