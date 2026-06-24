@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from _patches import _mlx_qwen3vl
 
 
@@ -169,3 +173,22 @@ def test_clip_generate_disabled_by_env(monkeypatch):
                                      do_sample=True, max_length=8, temperature=1.0,
                                      top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0)
     assert out is sentinel
+
+
+_run_integration = os.environ.get("ASFP8_RUN_MLX_INTEGRATION") == "1"
+requires_mlx_integration = pytest.mark.skipif(
+    not _run_integration,
+    reason="set ASFP8_RUN_MLX_INTEGRATION=1 to run (downloads ~2.2 GB and uses MPS)",
+)
+
+
+@requires_mlx_integration
+def test_mlx_generate_text_real():
+    from _patches import _mlx_qwen3vl
+    assert _mlx_qwen3vl.available()
+    pre = "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n"
+    out = _mlx_qwen3vl.generate_text(
+        pre, max_tokens=40, do_sample=False, temperature=0.0, top_k=0,
+        top_p=1.0, min_p=0.0, repetition_penalty=1.0, seed=0,
+    )
+    assert isinstance(out, str) and len(out.strip()) > 0
