@@ -1,4 +1,4 @@
-"""GEMM bench harness: TF/s, GB/s, and parity for candidates vs MPS a@b.
+r"""GEMM bench harness: TF/s, GB/s, and parity for candidates vs MPS a@b.
 
 Run: /Volumes/IMPERIAL\ SPACE/AI/ComfyUI/.venv/bin/python dev/bench_gemm.py
 Not a pytest test — a dev measurement script. Shapes cover both regimes:
