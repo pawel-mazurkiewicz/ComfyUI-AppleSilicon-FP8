@@ -104,6 +104,11 @@ def install():
     global _orig, _installed
     if _installed:
         return
+    # Opt-in only: when disabled, do NOT wrap F.linear at all, so opt-out users pay
+    # zero per-call overhead and their F.linear is byte-for-byte untouched by #15.
+    # (ASFP8_FP8_EXT is a launch-time flag; enabling it requires a restart.)
+    if os.environ.get("ASFP8_FP8_EXT") != "1":
+        return
     if sys.platform != "darwin":
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
@@ -112,5 +117,4 @@ def install():
     _orig = F.linear
     F.linear = _linear
     _installed = True
-    if os.environ.get("ASFP8_FP8_EXT") == "1":
-        print(f"{TAG} installed (opt-in active; builds on first eligible Linear).")
+    print(f"{TAG} installed (opt-in active; builds on first eligible Linear).")
