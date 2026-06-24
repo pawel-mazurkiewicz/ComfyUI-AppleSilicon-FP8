@@ -45,6 +45,7 @@ patch is a no-op on machines that don't need it.
 | 11 | **Text/LLM encoders run on CPU** on Apple Silicon (`CLIP/text encoder model load device: cpu`), painfully slow for autoregressive encoders like **Krea2** that *generate* hundreds of tokens (~1.7s/token on CPU) | ComfyUI hardcodes `vram_state = SHARED` on MPS (unified memory), and `text_encoder_device()` only returns the GPU for `--gpu-only` or HIGH/NORMAL_VRAM — `SHARED` falls through to `return cpu`, so every text encoder lands on CPU | On MPS only, wrap `text_encoder_device()` so its CPU default is redirected to the Metal device (the same load device `--gpu-only` picks, but scoped to the encoder — offload/VAE/intermediate are left untouched). No-op on CUDA/CPU and under `--cpu`/`--gpu-only` |
 | 12 | **INT8-quantized models hang at 0/N with the GPU idle** (e.g. **Krea2 `int8_mixed`** via the `int8-fast` node) — looks frozen, never crashes | INT8 Linears do their matmul with `torch._int_mm` (int8×int8→int32), which has **no Metal kernel**; with `PYTORCH_ENABLE_MPS_FALLBACK` on (ComfyUI sets it) the op silently bounces both operands to the CPU and back, per Linear per layer per step | On MPS, route `torch._int_mm` through a GPU float32 matmul instead of the CPU fallback (int8→float32 casts natively; sums stay well under int32 range and are rescaled to bf16 downstream, so it's bit-exact in practice). Non-MPS keeps the native integer kernel |
 | 13 | **INT8 models run, but ~3-5× too slow** on MPS (e.g. Krea2 `int8_mixed` at ~140 s/step) | The `int8-fast` node's wide-batch path (image diffusion = thousands of tokens) quantizes activations to int8 and matmuls via `torch._int_mm` — which on MPS is float32 (patch #12), losing bf16 throughput and doubling the working set on top of a multi-GB model | On MPS, route int8-fast's `int8_forward_dynamic[_per_row]` through its own small-batch path: dequantize the int8 weight to bf16 and use MPS's native (double-buffered) bf16 GEMM. ~3.5-4.7× faster on FLUX-shaped Linears, equal-or-better accuracy (weight-only int8). Patched via a post-import hook since int8-fast loads after this node |
+| 14 | **MLX-backed Qwen3-VL `TextGenerate`** — Krea2 prompt-expansion runs an eager autoregressive Qwen3-VL-4B loop (~50 s on MPS) | The generation loop runs token-by-token inside a Python `for` loop using PyTorch MPS ops; there is no batched Metal kernel for autoregressive decoding, so each forward pass pays per-token dispatch overhead (~1 s/token) | On MPS, with `mlx-vlm` installed, route the generation loop through MLX (`mlx-community/Qwen3-VL-4B-Instruct-4bit`): MLX's native autoregressive engine amortises dispatch cost and uses the ANE/AMX units directly. Text-only; conditioning encode is untouched. Eager fallback if MLX is absent or errors. |
 
 ### How the FP8 trick works
 
@@ -87,7 +88,10 @@ At startup you'll see (only the lines relevant to your machine):
 [AppleSilicon-FP8/te_device] text_encoder_device redirected CPU->MPS on Apple Silicon (LLM/CLIP encoders run on GPU).
 [AppleSilicon-FP8/int_mm] torch._int_mm runs on GPU (float32) on MPS instead of falling back to CPU (INT8 models).
 [AppleSilicon-FP8/int8_linear] int8-fast wide-batch matmul routed via MPS native bf16 GEMM (was fp32 _int_mm).
+[AppleSilicon-FP8/mlx_textgen] Qwen3-VL TextGenerate routed through MLX on Apple Silicon (repo: mlx-community/Qwen3-VL-4B-Instruct-4bit).
 ```
+
+> **Note:** The `mlx_textgen` line appears only when `mlx-vlm` is installed (`pip install 'comfyui-applesilicon-fp8[mlx]'` or `pip install mlx-vlm`); otherwise patch #14 silently no-ops.
 
 ## Notes & caveats
 
