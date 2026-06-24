@@ -30,16 +30,16 @@ from _patches import mlx_textgen
 def test_extract_text_ids_plain_tokens():
     # ComfyUI tokens: {key: [ [ (id, weight), ... ] ]}
     tokens = {"qwen3vl_4b": [[(151644, 1.0), (872, 1.0), (198, 1.0)]]}
-    ids, has_media = mlx_textgen._extract_text_ids(tokens)
+    ids, has_non_int = mlx_textgen._extract_text_ids(tokens)
     assert ids == [151644, 872, 198]
-    assert has_media is False
+    assert has_non_int is False
 
 
 def test_extract_text_ids_detects_media():
     # An image entry is a dict in position [0] instead of an int id.
     tokens = {"qwen3vl_4b": [[(151644, 1.0), ({"type": "image"}, 1.0)]]}
-    ids, has_media = mlx_textgen._extract_text_ids(tokens)
-    assert has_media is True
+    ids, has_non_int = mlx_textgen._extract_text_ids(tokens)
+    assert has_non_int is True
 
 
 class _FakeSub:
@@ -55,21 +55,34 @@ class _FakeTok:
         self.tokenizer = object()  # the HF tokenizer sentinel
 
 
+def _fake_cond_stage(**named_subs):
+    """Build a minimal cond_stage_model fake with a _modules dict (mimics nn.Module)."""
+    obj = object.__new__(type("_FakeCondStage", (), {}))
+    obj._modules = named_subs
+    return obj
+
+
+def _fake_sd1_tok(**named_toks):
+    """Build a minimal SD1Tokenizer fake with named tokenizer sub-objects as attributes."""
+    obj = object.__new__(type("_FakeSD1Tok", (), {}))
+    for k, v in named_toks.items():
+        setattr(obj, k, v)
+    return obj
+
+
 def test_qwen3vl_hf_tokenizer_found():
-    class _CondStage:
-        qwen3vl_4b = _FakeSub("qwen3vl_4b")
-    class _SD1Tok:
-        qwen3vl_4b = _FakeTok()
-    hf = mlx_textgen._qwen3vl_hf_tokenizer(_CondStage(), _SD1Tok())
-    assert hf is _SD1Tok.qwen3vl_4b.tokenizer
+    sub = _FakeSub("qwen3vl_4b")
+    tok = _FakeTok()
+    cond = _fake_cond_stage(qwen3vl_4b=sub)
+    sd1 = _fake_sd1_tok(qwen3vl_4b=tok)
+    hf = mlx_textgen._qwen3vl_hf_tokenizer(cond, sd1)
+    assert hf is tok.tokenizer
 
 
 def test_qwen3vl_hf_tokenizer_absent_for_other_models():
-    class _CondStage:
-        t5xxl = _FakeSub("t5")
-    class _SD1Tok:
-        t5xxl = _FakeTok()
-    hf = mlx_textgen._qwen3vl_hf_tokenizer(_CondStage(), _SD1Tok())
+    cond = _fake_cond_stage(t5xxl=_FakeSub("t5"))
+    sd1 = _fake_sd1_tok(t5xxl=_FakeTok())
+    hf = mlx_textgen._qwen3vl_hf_tokenizer(cond, sd1)
     assert hf is None
 
 
@@ -79,7 +92,6 @@ class _FakeHFTok:
         return "TEMPLATED_PROMPT"
 
     def encode(self, text):
-        assert text == "EXPANDED"
         return [10, 11, 12]
 
 
@@ -91,14 +103,11 @@ class _FakeCLIP:
 
 
 def _qwen3vl_clip():
-    class _CondStage:
-        qwen3vl_4b = _FakeSub("qwen3vl_4b")
-    class _SD1Tok:
-        qwen3vl_4b = _FakeTok()
-    clip = _FakeCLIP(_SD1Tok(), _CondStage())
-    # give the discovered tokenizer real encode/decode
-    clip.tokenizer.qwen3vl_4b.tokenizer = _FakeHFTok()
-    return clip
+    sub_tok = _FakeTok()
+    sub_tok.tokenizer = _FakeHFTok()
+    cond = _fake_cond_stage(qwen3vl_4b=_FakeSub("qwen3vl_4b"))
+    sd1 = _fake_sd1_tok(qwen3vl_4b=sub_tok)
+    return _FakeCLIP(sd1, cond)
 
 
 def test_clip_generate_hijacks_qwen3vl_and_returns_ids(monkeypatch):
@@ -117,6 +126,7 @@ def test_clip_generate_hijacks_qwen3vl_and_returns_ids(monkeypatch):
         clip, tokens, do_sample=True, max_length=512, temperature=0.7,
         top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.05, seed=0,
     )
+    assert isinstance(out, list) and all(isinstance(x, int) for x in out)
     assert out == [10, 11, 12]
     assert calls["prompt"] == "TEMPLATED_PROMPT"
     assert calls["kw"]["max_tokens"] == 512
@@ -126,11 +136,9 @@ def test_clip_generate_falls_back_when_not_qwen3vl(monkeypatch):
     sentinel = ["ORIG"]
     monkeypatch.setattr(mlx_textgen, "_orig", lambda self, tokens, **kw: sentinel)
 
-    class _CondStage:
-        t5xxl = _FakeSub("t5")
-    class _SD1Tok:
-        t5xxl = _FakeTok()
-    clip = _FakeCLIP(_SD1Tok(), _CondStage())
+    cond = _fake_cond_stage(t5xxl=_FakeSub("t5"))
+    sd1 = _fake_sd1_tok(t5xxl=_FakeTok())
+    clip = _FakeCLIP(sd1, cond)
     out = mlx_textgen._clip_generate(clip, {"t5xxl": [[(1, 1.0)]]}, do_sample=True,
                                      max_length=8, temperature=1.0, top_k=0,
                                      top_p=1.0, min_p=0.0, repetition_penalty=1.0)

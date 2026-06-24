@@ -9,7 +9,7 @@ diffusion conditioning encode is untouched.
 import importlib.util
 import os
 
-TAG = "[AppleSilicon-FP8/mlx_textgen]"
+TAG = "[AppleSilicon-FP8/mlx_qwen3vl]"
 
 DEFAULT_REPO = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 

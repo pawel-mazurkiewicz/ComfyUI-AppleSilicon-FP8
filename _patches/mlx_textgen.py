@@ -29,7 +29,7 @@ import sys
 
 import torch
 
-from _patches import _mlx_qwen3vl
+from . import _mlx_qwen3vl
 
 TAG = "[AppleSilicon-FP8/mlx_textgen]"
 
@@ -43,28 +43,31 @@ class _Fallback(Exception):
 
 def _extract_text_ids(tokens):
     """From ComfyUI's tokenize() output {key: [[(id, weight), ...]]} return
-    (list[int] ids of batch 0, has_media). A media entry has a dict in slot [0]."""
+    (list[int] ids of batch 0, has_non_int). A media/image entry has a dict in
+    slot [0] (placed by Qwen3VLTokenizer.tokenize_with_weights); any other
+    non-int entry is also treated as non-text and triggers fallback."""
     batch0 = next(iter(tokens.values()))[0]
     ids = []
-    has_media = False
+    has_non_int = False
     for entry in batch0:
         elem = entry[0]
         if isinstance(elem, int):
             ids.append(elem)
         else:
-            has_media = True
-    return ids, has_media
+            has_non_int = True
+    return ids, has_non_int
 
 
 def _qwen3vl_hf_tokenizer(cond_stage_model, sd1_tokenizer):
     """If cond_stage_model carries a sub-clip whose transformer.model_type is
     'qwen3vl_4b', return the matching HF tokenizer (<sub_tokenizer>.tokenizer);
     else None. The sub-clip and sub-tokenizer share the same attribute key
-    (SD1ClipModel/SD1Tokenizer both setattr under `name`)."""
-    for key in dir(cond_stage_model):
-        if key.startswith("_"):
-            continue
-        sub = getattr(cond_stage_model, key, None)
+    (SD1ClipModel/SD1Tokenizer both setattr under `name`).
+
+    Iterates _modules (nn.Module's registered submodule ordered dict) to avoid
+    triggering property descriptors and to stay O(submodules) rather than O(dir())."""
+    modules = getattr(cond_stage_model, "_modules", {})
+    for key, sub in modules.items():
         transformer = getattr(sub, "transformer", None)
         if getattr(transformer, "model_type", None) == "qwen3vl_4b":
             sub_tok = getattr(sd1_tokenizer, key, None)
@@ -84,8 +87,8 @@ def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0
         hf_tok = _qwen3vl_hf_tokenizer(self.cond_stage_model, self.tokenizer)
         if hf_tok is None:
             raise _Fallback
-        ids, has_media = _extract_text_ids(tokens)
-        if has_media or not ids:
+        ids, has_non_int = _extract_text_ids(tokens)
+        if has_non_int or not ids:
             raise _Fallback
 
         prompt_text = hf_tok.decode(ids, skip_special_tokens=False)
