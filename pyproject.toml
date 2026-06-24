@@ -9,6 +9,9 @@ requires-python = ">=3.10"
 [project.urls]
 Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
 
+[project.optional-dependencies]
+mlx = ["mlx-vlm"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "tests"]
