@@ -18,8 +18,10 @@ __all__ = [
     "int_mm_mps",           # patch #12 — torch._int_mm on GPU on MPS (INT8 models, no CPU fallback)
     "int8_linear_mps",      # patch #13 — int8-fast wide-batch Linear via MPS native bf16 GEMM
     "mlx_textgen",          # patch #14 — MLX-backed Qwen3-VL TextGenerate (prompt expansion)
+    "fp8_linear_mps",       # patch #15 — EXPERIMENTAL opt-in fp8-native Linear (Metal 4.1)
     # Internal helpers (not patches):
     # "_common"             — decode_fp8, fp8_to_float_lut, FP8_DTYPES
     # "na_gemm"             — optional NA matmul2d backend (not wired into hot path)
     # "_mlx_qwen3vl"        — MLX Qwen3-VL load/generate backend for patch #14
+    # "fp8_ext"             — Metal 4.1 fp8 matmul2d ObjC++ extension (patch #15 backend)
 ]
