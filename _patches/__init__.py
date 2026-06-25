@@ -18,10 +18,13 @@ __all__ = [
     "int_mm_mps",           # patch #12 — torch._int_mm on GPU on MPS (INT8 models, no CPU fallback)
     "int8_linear_mps",      # patch #13 — int8-fast wide-batch Linear via MPS native bf16 GEMM
     "mlx_textgen",          # patch #14 — MLX-backed Qwen3-VL TextGenerate (prompt expansion)
-    "fp8_linear_mps",       # patch #15 — EXPERIMENTAL opt-in fp8-native Linear (Metal 4.1)
+    # patch #15 (fp8_linear_mps, opt-in fp8-native F.linear) RETIRED — wrong seam:
+    #   real ComfyUI fp8 routes through torch._scaled_mm (QuantizedTensor hides the fp8
+    #   dtype so the F.linear gate never fired), and weight-only fp8 only won at tiny M.
+    #   The fp8-native win lives in patch #3's _scaled_mm fast path (ASFP8_FP8_EXT=1).
     # Internal helpers (not patches):
     # "_common"             — decode_fp8, fp8_to_float_lut, FP8_DTYPES
     # "na_gemm"             — optional NA matmul2d backend (not wired into hot path)
     # "_mlx_qwen3vl"        — MLX Qwen3-VL load/generate backend for patch #14
-    # "fp8_ext"             — Metal 4.1 fp8 matmul2d ObjC++ extension (patch #15 backend)
+    # "fp8_ext"             — Metal 4.1 fp8 matmul2d ObjC++ extension (patch #3 fp8-native scaled_mm backend)
 ]
