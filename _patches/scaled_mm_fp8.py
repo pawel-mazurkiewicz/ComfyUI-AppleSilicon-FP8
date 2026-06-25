@@ -15,7 +15,14 @@ We monkey-patch torch._scaled_mm so that, for MPS + FP8 operands, it:
   4. casts to out_dtype.
 
 Non-MPS or non-FP8 calls fall through to the original implementation untouched.
+
+EXPERIMENTAL (opt-in, ASFP8_FP8_EXT=1): for large fp8(e4m3) x fp8(e4m3) matmuls
+this seam routes both operands through a Metal 4.1 fp8-native kernel (no bf16
+decode), then applies scales/bias in fp32 — bit-exact vs the decode path, faster.
+When the flag is unset/0 the fast path is inert and numerics are unchanged.
 """
+
+import os
 
 import torch
 
@@ -25,6 +32,12 @@ TAG = "[AppleSilicon-FP8/scaled_mm]"
 
 _original = None
 _installed = False
+
+# fp8-native fast path (EXPERIMENTAL, opt-in via ASFP8_FP8_EXT=1). When the flag is
+# unset/0 this whole path is inert and torch._scaled_mm behaves exactly as the decode
+# implementation below — same numerics, zero extra work, no extension build.
+_backend = None          # the cpp module, or False once known-unavailable
+_self_checked = False
 
 
 def _compute_dtype(out_dtype):
@@ -39,6 +52,94 @@ def _decode(t, compute_dtype):
     if t.dtype in FP8_DTYPES:
         return decode_fp8(t, compute_dtype)
     return t.to(compute_dtype)
+
+
+def _min_dim():
+    """Weight-size threshold below which the fp8-native kernel is not worth its
+    dispatch overhead; matches patch #15's knob so both share one tuning point."""
+    try:
+        return int(os.environ.get("ASFP8_FP8_EXT_MIN_DIM", "8192"))
+    except ValueError:
+        return 8192
+
+
+def _fast_eligible(input, other):
+    """Pure shape/dtype/env predicate (no device work, no import). Returns False
+    instantly when ASFP8_FP8_EXT is unset/0 so the default decode path is untouched."""
+    if os.environ.get("ASFP8_FP8_EXT") != "1":
+        return False
+    # The kernel decodes both operands as e4m3; only route when that's exact.
+    if input.dtype != torch.float8_e4m3fn or other.dtype != torch.float8_e4m3fn:
+        return False
+    if input.device.type != "mps" or other.device.type != "mps":
+        return False
+    if input.dim() != 2 or other.dim() != 2:
+        return False
+    # input [M,K] @ other [K,N]; weight recovered as other.t() = [N,K].
+    K = int(input.shape[1])
+    N = int(other.shape[1])
+    return max(N, K) >= _min_dim()
+
+
+def _get_backend():
+    """Lazily build + parity-self-check the fp8 extension. Returns the module or None
+    (permanently, after a failure) so the caller falls back to the decode path."""
+    global _backend, _self_checked
+    if _backend is not None:
+        return _backend or None
+    from .fp8_ext.loader import module
+    mod = module()
+    if mod is None:
+        _backend = False
+        return None
+    if not _self_checked:
+        _self_checked = True
+        try:
+            torch.manual_seed(0)
+            a = (torch.randn(64, 8192) * 0.3).to(torch.float8_e4m3fn)
+            w = (torch.randn(8192, 8192) * 0.3).to(torch.float8_e4m3fn)   # [N,K]
+            a_u8 = a.view(torch.uint8).to("mps").contiguous()
+            w_u8 = w.view(torch.uint8).to("mps").contiguous()
+            ref = decode_fp8(a.to("mps"), torch.float32) @ decode_fp8(w.to("mps"), torch.float32).t()
+            raw = mod.fp8fp8_matmul2d_nt(a_u8, w_u8, 8192, 8192)
+            rel = ((raw - ref).abs().max() / (ref.abs().max() + 1e-9)).item()
+            if rel >= 5e-2:
+                print(f"{TAG} fp8-native self-check failed (rel={rel:.4f}); using decode path.")
+                _backend = False
+                return None
+        except Exception as e:
+            print(f"{TAG} fp8-native self-check raised; using decode path: {e!r}")
+            _backend = False
+            return None
+    _backend = mod
+    print(f"{TAG} fp8-native scaled_mm enabled (Metal 4.1 ext; min_dim={_min_dim()}).")
+    return _backend
+
+
+def _fast_route(input, other, scale_a, scale_b, scale_result, bias, out_dtype):
+    """fp8xfp8 -> f32 via the Metal 4.1 kernel, then scales/bias in f32. Equivalent to
+    the decode path (bench: bit-exact) but skips two fp8->bf16 decodes. Raises on any
+    failure so the caller delegates to the decode implementation."""
+    mod = _get_backend()
+    if mod is None:
+        raise RuntimeError("fp8 extension unavailable")
+    K = int(input.shape[1])
+    N = int(other.shape[1])
+    a_u8 = input.contiguous().view(torch.uint8)
+    # other is [K,N] (typically W.t()); the kernel wants W=[N,K] contiguous fp8 bytes.
+    w_u8 = other.t().contiguous().view(torch.uint8)
+    out = mod.fp8fp8_matmul2d_nt(a_u8, w_u8, K, N)   # [M,N] f32, unscaled
+    if scale_a is not None:
+        out = out * scale_a.to(torch.float32)
+    if scale_b is not None:
+        out = out * scale_b.to(torch.float32)
+    if scale_result is not None:
+        out = out * scale_result.to(torch.float32)
+    if bias is not None:
+        out = out + bias.to(torch.float32)
+    if out_dtype is not None:
+        out = out.to(out_dtype)
+    return out
 
 
 def _mps_scaled_mm(
@@ -60,6 +161,15 @@ def _mps_scaled_mm(
             out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b,
             bias=bias, scale_result=scale_result, use_fast_accum=use_fast_accum,
         )
+
+    # EXPERIMENTAL opt-in fast path: fp8xfp8 -> f32 via the Metal 4.1 kernel. Any
+    # failure (build/parity/runtime) falls through to the decode path below, so a
+    # render never breaks. Inert unless ASFP8_FP8_EXT=1.
+    if _fast_eligible(input, other):
+        try:
+            return _fast_route(input, other, scale_a, scale_b, scale_result, bias, out_dtype)
+        except Exception as e:
+            print(f"{TAG} fp8-native path failed ({e!r}); delegating to decode path.")
 
     compute_dtype = _compute_dtype(out_dtype)
 
