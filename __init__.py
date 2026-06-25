@@ -11,7 +11,7 @@ for the whole session. Each patch is a no-op on machines that don't need it
 
 Patches applied:
   1. psutil.virtual_memory() vm_stat fallback   (macOS 26/27 beta crash)
-  2. comfy_kitchen eager FP8 dequant/quant      (Ideogram 4 and other ck models)
+  2. comfy_kitchen eager FP8 + NVFP4/MXFP8 decode (Ideogram 4, LTX, other ck/mixed-precision models)
   3. torch._scaled_mm FP8 on MPS                (FLUX, SD3.5, FP8 _scaled_mm path)
   4. F.rms_norm manual fp32 path on MPS         (PiD >=2048px: black image / NaN)
   5. flash_attn drop-in + fast SDPA on MPS      (mtlflashattn: 3-4x over fused SDPA,
@@ -24,8 +24,9 @@ Patches applied:
  11. text_encoder_device CPU->MPS on MPS         (text/LLM encoders default to CPU on Apple Silicon)
  12. torch._int_mm GPU path on MPS               (INT8 models: _int_mm has no Metal kernel -> CPU-fallback freeze)
  13. int8-fast Linear via MPS bf16 GEMM           (INT8 wide-batch matmul was 3-5x too slow in fp32 _int_mm)
- 14. MLX-backed Qwen3-VL TextGenerate on MPS       (Krea2 prompt-expansion: ~50s eager generate -> MLX)
+ 14. MLX-backed TextGenerate on MPS (Qwen3-VL + Gemma3)  (Krea2 ~50s & LTX2 ~13h eager generate -> MLX)
  15. fp8-native Linear via Metal 4.1 matmul2d      (EXPERIMENTAL, opt-in ASFP8_FP8_EXT=1; large fp8 MLP Linears)
+ 16. strided FP8 ops -> CPU on MPS (global)        (NVFP4/MXFP8 quant+dequant: reshape/contiguous of fp8 crashes MPS)
 
 See README.md for details. MIT licensed.
 """
@@ -41,9 +42,23 @@ if __spec__ is not None and __spec__.parent:
     # string and relative imports would fail.  Checking __spec__.parent is CPython-
     # guaranteed behaviour (see importlib docs) and avoids inspecting ImportError
     # message strings that are implementation details liable to change.
-    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, mlx_textgen, fp8_linear_mps
+    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, mlx_textgen, fp8_linear_mps, fp8_mps_strided, optrace, mps_profile
 
-    for _patch in (psutil_vmstat, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, mlx_textgen, fp8_linear_mps):
+    # Bisection switches (for debugging a regression to a single patch):
+    #   ASFP8_ENABLE_ONLY=psutil_vmstat,comfykitchen_fp8   install ONLY these (by module name)
+    #   ASFP8_DISABLE=flash_attn_mtl,rmsnorm_mps_large     install everything EXCEPT these
+    # ENABLE_ONLY wins if both are set. Names are the patch module names (last path segment).
+    import os as _os
+    _only = {n.strip() for n in _os.environ.get("ASFP8_ENABLE_ONLY", "").split(",") if n.strip()}
+    _disabled = {n.strip() for n in _os.environ.get("ASFP8_DISABLE", "").split(",") if n.strip()}
+
+    # optrace installs LAST (opt-in ASFP8_TRACE_OPS=1) so it sees every matmul the
+    # model dispatches, on top of all the seams the other patches wrapped.
+    for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, mlx_textgen, fp8_linear_mps, optrace, mps_profile):
+        _short = _patch.__name__.rsplit(".", 1)[-1]
+        if (_only and _short not in _only) or _short in _disabled:
+            print(f"[AppleSilicon-FP8] skipping {_short} (ASFP8_ENABLE_ONLY/ASFP8_DISABLE)")
+            continue
         try:
             _patch.install()
         except Exception as _e:  # never take ComfyUI down because of us
