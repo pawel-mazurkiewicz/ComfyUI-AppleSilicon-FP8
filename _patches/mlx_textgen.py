@@ -18,10 +18,15 @@ Qwen3-VL-4B model, we:
      clip.decode(ids) is unchanged.
 
 MLX only ever sees text and ids are produced/consumed by ComfyUI's tokenizer, so
-correctness does not depend on cross-tokenizer vocab alignment. Strictly scoped:
-non-MPS, non-qwen3vl_4b, multimodal calls, or a missing mlx-vlm all fall through
-to the original eager generate. The conditioning encode path (CLIPTextEncode's
-12-layer hidden-state tap) is untouched. Disable with ASFP8_DISABLE_MLX_TEXTGEN=1.
+correctness does not depend on cross-tokenizer vocab alignment.
+
+Two generatable encoders are routed (see `_ROUTES`): Krea2's Qwen3-VL-4B (via mlx-vlm)
+and LTX2's Gemma3-12B prompt encoder (via mlx-lm; the "Generate Text" node, otherwise
+~20 s/token eager). Each maps to an MLX repo (`ASFP8_MLX_QWEN3VL_REPO` /
+`ASFP8_MLX_GEMMA3_REPO`). Strictly scoped: non-MPS, an unrecognised encoder, multimodal
+calls, or a missing MLX package all fall through to the original eager generate. The
+conditioning encode path (CLIPTextEncode's hidden-state tap) is untouched. Disable with
+ASFP8_DISABLE_MLX_TEXTGEN=1.
 """
 
 import os
@@ -29,12 +34,31 @@ import sys
 
 import torch
 
-from . import _mlx_qwen3vl
+from . import _mlx_gemma3, _mlx_qwen3vl
 
 TAG = "[AppleSilicon-FP8/mlx_textgen]"
 
 _orig = None
 _installed = False
+
+_logged_miss = False
+
+
+def _backend_for(key, sub):
+    """Identify the MLX backend for a sub-clip, robust to comfy internals: match on the
+    `_modules` key (the model's attribute name), the transformer instance's class name,
+    or a type attribute if present. Gemma3's transformer exposes none of model_type/
+    transformer_type on the instance (they live on the config class), so key/class name
+    are the reliable signals."""
+    tr = getattr(sub, "transformer", None)
+    cls = type(tr).__name__ if tr is not None else ""
+    mt = getattr(tr, "model_type", None)
+    tt = getattr(tr, "transformer_type", None)
+    if key == "qwen3vl_4b" or mt == "qwen3vl_4b" or "Qwen3VL" in cls:
+        return _mlx_qwen3vl
+    if key == "gemma3_12b" or tt == "gemma3" or cls.startswith("Gemma3"):
+        return _mlx_gemma3
+    return None
 
 
 class _Fallback(Exception):
@@ -75,6 +99,43 @@ def _qwen3vl_hf_tokenizer(cond_stage_model, sd1_tokenizer):
     return None
 
 
+def _route(cond_stage_model, sd1_tokenizer):
+    """Find the first sub-clip whose transformer matches a known generatable model and
+    return (mlx_backend, tokenizer) for it, else (None, None). The sub-clip and its
+    tokenizer share the same attribute key. No availability check here — install()
+    already gated on a usable backend, and _clip_generate falls back on any error."""
+    global _logged_miss
+    modules = getattr(cond_stage_model, "_modules", {})
+    for key, sub in modules.items():
+        backend = _backend_for(key, sub)
+        if backend is None:
+            continue
+        sub_tok = getattr(sd1_tokenizer, key, None)
+        tok = getattr(sub_tok, "tokenizer", None)
+        if tok is not None:
+            return backend, tok
+    if not _logged_miss:
+        _logged_miss = True
+        seen = {k: type(getattr(s, "transformer", None)).__name__ for k, s in modules.items()}
+        print(f"{TAG} no MLX route matched (eager fallback); sub-models seen: {seen}")
+    return None, None
+
+
+def _decode_ids(tok, ids):
+    """ids -> templated text. HF and comfy's SentencePiece tokenizer both expose
+    decode(ids, skip_special_tokens=...)."""
+    return tok.decode(ids, skip_special_tokens=False)
+
+
+def _encode_text(tok, text):
+    """text -> ids. HF tokenizers use .encode(); comfy's SPieceTokenizer has no encode
+    and is called as tok(text) -> {'input_ids': [...]}."""
+    enc = getattr(tok, "encode", None)
+    if callable(enc):
+        return list(enc(text))
+    return list(tok(text)["input_ids"])
+
+
 def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0,
                    top_k=50, top_p=0.95, min_p=0.0, repetition_penalty=1.0,
                    seed=None, presence_penalty=0.0):
@@ -84,21 +145,21 @@ def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0
                      repetition_penalty=repetition_penalty, seed=seed,
                      presence_penalty=presence_penalty)
     try:
-        hf_tok = _qwen3vl_hf_tokenizer(self.cond_stage_model, self.tokenizer)
-        if hf_tok is None:
+        backend, tok = _route(self.cond_stage_model, self.tokenizer)
+        if backend is None:
             raise _Fallback
         ids, has_non_int = _extract_text_ids(tokens)
         if has_non_int or not ids:
             raise _Fallback
 
-        prompt_text = hf_tok.decode(ids, skip_special_tokens=False)
-        out_text = _mlx_qwen3vl.generate_text(
+        prompt_text = _decode_ids(tok, ids)
+        out_text = backend.generate_text(
             prompt_text, max_tokens=max_length, do_sample=do_sample,
             temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
             repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
             seed=seed,
         )
-        return list(hf_tok.encode(out_text))
+        return _encode_text(tok, out_text)
     except _Fallback:
         pass
     except Exception as e:  # never break a render: fall back to the eager path
@@ -117,7 +178,7 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-    if not _mlx_qwen3vl.available():
+    if not (_mlx_qwen3vl.available() or _mlx_gemma3.available()):
         return
     try:
         import comfy.sd as sd
@@ -129,5 +190,9 @@ def install():
     _orig = sd.CLIP.generate
     sd.CLIP.generate = _clip_generate
     _installed = True
-    print(f"{TAG} Qwen3-VL TextGenerate routed through MLX on Apple Silicon "
-          f"(repo: {_mlx_qwen3vl.repo_id()}).")
+    routes = []
+    if _mlx_qwen3vl.available():
+        routes.append(f"qwen3vl_4b -> {_mlx_qwen3vl.repo_id()}")
+    if _mlx_gemma3.available():
+        routes.append(f"gemma3_12b -> {_mlx_gemma3.repo_id()}")
+    print(f"{TAG} TextGenerate routed through MLX on Apple Silicon ({'; '.join(routes)}).")

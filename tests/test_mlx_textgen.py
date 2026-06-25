@@ -24,7 +24,7 @@ def test_sampler_kwargs_maps_all_params_when_sampling():
     }
 
 
-from _patches import mlx_textgen
+from _patches import mlx_textgen  # noqa: E402
 
 
 def test_extract_text_ids_plain_tokens():
@@ -181,6 +181,72 @@ def test_clip_generate_disabled_by_env(monkeypatch):
                                      do_sample=True, max_length=8, temperature=1.0,
                                      top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0)
     assert out is sentinel
+
+
+# --- gemma3 (LTX2) routing + SentencePiece tokenizer adapter ---
+
+
+class _FakeGemmaSub:
+    def __init__(self):
+        class _T:
+            transformer_type = "gemma3"   # gemma3 reports transformer_type, not model_type
+        self.transformer = _T()
+
+
+class _FakeSPieceTok:
+    """comfy SentencePiece tokenizer: decode(ids, skip_special_tokens=), no .encode,
+    encode via __call__ -> {'input_ids': [...]}."""
+    def decode(self, ids, skip_special_tokens=False):
+        return "GEMMA_TEMPLATED"
+    def __call__(self, text):
+        return {"input_ids": [7, 8, 9]}
+
+
+def test_route_gemma3():
+    sub_tok = _FakeTok()
+    sub_tok.tokenizer = _FakeSPieceTok()
+    cond = _fake_cond_stage(gemma3_12b=_FakeGemmaSub())
+    sd1 = _fake_sd1_tok(gemma3_12b=sub_tok)
+    backend, tok = mlx_textgen._route(cond, sd1)
+    assert backend is mlx_textgen._mlx_gemma3
+    assert isinstance(tok, _FakeSPieceTok)
+
+
+def test_route_none_for_unknown():
+    cond = _fake_cond_stage(t5xxl=_FakeSub("t5"))
+    sd1 = _fake_sd1_tok(t5xxl=_FakeTok())
+    backend, tok = mlx_textgen._route(cond, sd1)
+    assert backend is None and tok is None
+
+
+def test_encode_text_hf_uses_encode():
+    assert mlx_textgen._encode_text(_FakeHFTok(), "x") == [10, 11, 12]
+
+
+def test_encode_text_spiece_uses_call():
+    assert mlx_textgen._encode_text(_FakeSPieceTok(), "x") == [7, 8, 9]
+
+
+def test_clip_generate_routes_gemma3_via_mlx_lm(monkeypatch):
+    calls = {}
+
+    def fake_gemma_gen(prompt_text, **kw):
+        calls["prompt"] = prompt_text
+        return "ENHANCED PROMPT"
+
+    monkeypatch.setattr(mlx_textgen._mlx_gemma3, "generate_text", fake_gemma_gen)
+
+    sub_tok = _FakeTok()
+    sub_tok.tokenizer = _FakeSPieceTok()
+    cond = _fake_cond_stage(gemma3_12b=_FakeGemmaSub())
+    sd1 = _fake_sd1_tok(gemma3_12b=sub_tok)
+    clip = _FakeCLIP(sd1, cond)
+    out = mlx_textgen._clip_generate(
+        clip, {"gemma3_12b": [[(2, 1.0), (105, 1.0)]]}, do_sample=True, max_length=512,
+        temperature=0.7, top_k=64, top_p=0.95, min_p=0.05, repetition_penalty=1.05, seed=0,
+    )
+    assert out == [7, 8, 9]                 # encoded via SPiece __call__
+    assert calls["prompt"] == "GEMMA_TEMPLATED"
 
 
 _run_integration = os.environ.get("ASFP8_RUN_MLX_INTEGRATION") == "1"
