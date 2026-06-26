@@ -15,27 +15,40 @@
 - **Install:** ComfyUI Manager → search *AppleSilicon-FP8*; or `git clone` into
   `ComfyUI/custom_nodes/` and `pip install -r requirements.txt`. The one required
   dependency (`mtlflashattn`) installs automatically. Restart ComfyUI.
-- **Extra speed (opt-in, M5+):** install `ninja`, then set `ASFP8_INT8_EXT=1`
-  (int8 models) and/or `ASFP8_FP8_EXT=1` (fp8 models) before launching. The native
-  kernels JIT-build on first use and **fall back automatically** if anything fails.
+- **Extra speed (opt-in, needs a recent macOS + M5):** the native matmul kernels
+  compile against **Metal 4.1** (a current-macOS language version — developed and
+  tested on the **macOS 27 dev beta**), and int8 additionally needs an **M5** GPU
+  for its cooperative TensorOps. Where supported, install `ninja` and set
+  `ASFP8_INT8_EXT=1` (int8) and/or `ASFP8_FP8_EXT=1` (fp8) before launching. They
+  JIT-build on first use and **fall back automatically** if the OS/GPU/toolchain
+  can't build them.
 
 ## Quick start — by machine
 
-**Any Apple Silicon (M1 → M5):** install the node and restart ComfyUI. That's it —
-everything in the [What it fixes](#what-it-fixes) table is automatic: FP8/INT8
-models load and render, flash-attention accelerates long-context attention, and
-the psutil / PiD-black-image / WanVideo-blockswap crashes are gone. No environment
-variables needed. This is all most people want.
+**Any Apple Silicon, any macOS that runs current ComfyUI + PyTorch 2.11 (M1 →
+M5):** install the node and restart ComfyUI. That's it — everything in the
+[What it fixes](#what-it-fixes) table is automatic: FP8/INT8 models load and
+render, flash-attention accelerates long-context attention, and the psutil /
+PiD-black-image / WanVideo-blockswap crashes are gone. No environment variables,
+no Metal 4.1, no specific GPU generation needed. This is all most people want.
 
-**M1 / M2 / M3 / M4 — stay on the defaults above.** The opt-in *native* matmul
-kernels (`ASFP8_*_EXT`) target M5's Neural Accelerators (Metal 4 cooperative
-TensorOps): the **int8 kernel is M5-only**, and the fp8 kernel falls back if your
-GPU/toolchain can't run it — so leave them off. You still get the full
-compatibility layer: FP8 matmuls run accelerated via bf16 decode on
-`simdgroup_matrix`, and int8 runs comfy's (fixed) weight-only path.
+The opt-in *native* matmul kernels (`ASFP8_*_EXT`) below are the only thing with
+extra requirements, on **two axes**:
 
-**M5 / M5 Pro / M5 Max — turn on the kernels for the real speedups.** You need
-Xcode command-line tools (Metal compiler) and `ninja`:
+- **OS / Metal:** they compile against **Metal 4.1** (current-macOS language
+  version; developed on the **macOS 27 dev beta**). Older macOS → the build fails
+  and the kernel falls back. Needs Xcode command-line tools (the Metal compiler).
+- **GPU:** the **int8** kernel needs an **M5** (Metal 4 cooperative TensorOps);
+  the **fp8** kernel needs Metal 4.1's fp8 format type. Anything unsupported falls
+  back automatically.
+
+**M1 / M2 / M3 / M4 — stay on the defaults.** The int8 kernel is M5-only and won't
+engage; leave `ASFP8_*_EXT` off. You still get the full compatibility layer: FP8
+matmuls run accelerated via bf16 decode on `simdgroup_matrix`, and int8 runs
+comfy's (fixed) weight-only path.
+
+**M5 / M5 Pro / M5 Max on a recent macOS — turn on the kernels for the real
+speedups:**
 
 ```bash
 xcode-select --install                 # if not already installed (Metal toolchain)
@@ -46,9 +59,9 @@ export ASFP8_INT8_EXT=1   # int8 models  (e.g. Krea2 convrot int8mixed) → ~24%
 export ASFP8_FP8_EXT=1    # fp8 models   (e.g. FLUX / SD3.5 fp8_scaled) → ~1.2–2.1× on the matmul
 ```
 
-Each kernel builds on the first eligible matmul (watch the startup log) and
-silently falls back to the compatible path on any failure, so it's safe to leave
-enabled.
+Each kernel builds on the first eligible matmul (watch the startup log for the
+`int8_kernel` / fp8 lines) and silently falls back to the compatible path on any
+failure — including too-old macOS — so it's safe to leave enabled.
 
 It started as an FP8 compatibility layer and has grown into a broader Apple
 Silicon quantization layer: it keeps FP8 **and INT8** diffusion models running on
