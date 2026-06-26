@@ -2,3 +2,9 @@
 # drop-in shim. Backs patch #5 (flash_attn + fast SDPA on Apple Silicon).
 # Apple Silicon / macOS only; a no-op import elsewhere.
 mtlflashattn>=0.1.0; platform_system == "Darwin"
+
+# Build tool for the opt-in Metal matmul kernels (fp8-native patch #3 via
+# ASFP8_FP8_EXT=1; int8 W8A8 patch #17 via ASFP8_INT8_EXT=1). torch's
+# cpp_extension shells out to `ninja`; without it those opt-in kernels can't
+# build and silently fall back to the slower decode path. Tiny, Darwin-only.
+ninja>=1.11; platform_system == "Darwin"

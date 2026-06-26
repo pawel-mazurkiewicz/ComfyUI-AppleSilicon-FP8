@@ -1,6 +1,12 @@
 # ComfyUI-AppleSilicon-FP8
 
-**Run FP8-quantized models on Apple Silicon (Metal / MPS) without crashes.**
+**Run FP8- and INT8-quantized models on Apple Silicon (Metal / MPS) — without crashes, and faster.**
+
+It started as an FP8 compatibility layer and has grown into a broader Apple
+Silicon quantization layer: it keeps FP8 **and INT8** diffusion models running on
+MPS, and ships opt-in **bit-exact Metal matmul kernels** that beat the default
+path (fp8-native `_scaled_mm` ~1.2–2.1×; int8 W8A8 ~1.9× on the matmul, ~24%
+faster end-to-end on Krea2 convrot int8mixed).
 
 If you're on a Mac and FP8 models die with
 `Trying to convert Float8_e4m3fn to the MPS backend but it does not have support for that dtype`,
@@ -18,12 +24,21 @@ The goal is plain: the world of LoRAs, models and workflows on Civitai/etc. is
 overwhelmingly trained and tuned for NVIDIA — that doesn't mean you can't run it
 on Apple Silicon. This trades some peak throughput for "it actually runs."
 
+It also handles **INT8** checkpoints (e.g. **Krea2 convrot int8mixed**): comfy's
+int8 path runs weight-only on MPS (dequantize the int8 weight to bf16, and for
+convrot models un-rotate the whole weight in fp32, every step), so the opt-in
+int8 kernel switches it to the W8A8 path the format was designed for — rotate the
+*activation* online, then a real int8×int8 matmul — which is both correct and
+faster.
+
 It's a single ComfyUI custom node that applies a few targeted runtime patches at
 startup. No model conversion. FP8 matmuls decode (bit-exact) to bf16 and run on
-Apple's matrix units (Neural Accelerators on M5+, simdgroup_matrix on M1–M4).
-The only dependency is
+Apple's matrix units (Neural Accelerators on M5+, simdgroup_matrix on M1–M4); the
+opt-in kernels go further and run fp8/int8 matmuls natively on those units. The
+only required dependency is
 [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn) (the Metal
-flash-attention kernels — Apple Silicon only, installed automatically). Each
+flash-attention kernels — Apple Silicon only, installed automatically); the
+opt-in matmul kernels additionally need `ninja` (the `[kernels]` extra). Each
 patch is a no-op on machines that don't need it.
 
 > Tested on: Apple M-series, macOS 27 dev beta, PyTorch 2.11, Python 3.12, ComfyUI Desktop.
@@ -47,6 +62,7 @@ patch is a no-op on machines that don't need it.
 | 13 | **INT8 models run, but ~3-5× too slow** on MPS (e.g. Krea2 `int8_mixed` at ~140 s/step) | The `int8-fast` node's wide-batch path (image diffusion = thousands of tokens) quantizes activations to int8 and matmuls via `torch._int_mm` — which on MPS is float32 (patch #12), losing bf16 throughput and doubling the working set on top of a multi-GB model | On MPS, route int8-fast's `int8_forward_dynamic[_per_row]` through its own small-batch path: dequantize the int8 weight to bf16 and use MPS's native (double-buffered) bf16 GEMM. ~3.5-4.7× faster on FLUX-shaped Linears, equal-or-better accuracy (weight-only int8). Patched via a post-import hook since int8-fast loads after this node |
 | 14 | **MLX-backed Qwen3-VL `TextGenerate`** — Krea2 prompt-expansion runs an eager autoregressive Qwen3-VL-4B loop (~50 s on MPS) | The generation loop runs token-by-token inside a Python `for` loop using PyTorch MPS ops; there is no batched Metal kernel for autoregressive decoding, so each forward pass pays per-token dispatch overhead (~1 s/token) | On MPS, with `mlx-vlm` installed, route the generation loop through MLX (`mlx-community/Qwen3-VL-4B-Instruct-4bit`): MLX's native autoregressive engine amortises dispatch cost with a fused Metal decode loop and KV-cache on the GPU. Text-only; conditioning encode is untouched. Eager fallback if MLX is absent or errors. |
 | 16 | `RuntimeError: Undefined type Float8_e4m3fn` from **NVFP4/MXFP8 mixed-precision quant or dequant** (e.g. on-the-fly nvfp4 re-quant of an LTX text encoder, or loading such a checkpoint) | MPS has no copy kernel for FP8 with non-trivial strides: materialising a *non-contiguous* fp8 tensor (`reshape` after `transpose`, `.contiguous()`/`clone()` of a strided fp8 view) crashes. comfy's block-scale swizzles (`comfy.float.to_blocked`/`from_blocked`, comfy_kitchen's NVFP4/MXFP8 dequant) hit this in many places | Fix the primitive once: wrap the materialising Tensor methods (`reshape`/`contiguous`/`clone`) so that, only for FP8 tensors on MPS, the op falls back to CPU and the result returns to the device. Bit-exact (pure data rearrangement); no-op for every non-FP8 tensor. Covers all current and future call sites. Disable with `ASFP8_DISABLE=fp8_mps_strided` |
+| 17 | **INT8 models run correctly but leave performance on the table** on MPS (e.g. **Krea2 convrot int8mixed**): comfy's int8 path is weight-only (W8A16), so every step dequantizes the int8 weight to bf16 — and for convrot checkpoints un-rotates the *entire* weight in fp32 — which dominates GPU time | comfy disables the real int8 matmul on non-CUDA (no `torch._int_mm` Metal kernel), so int8 only buys storage; the per-step fp32 weight dequant + Hadamard un-rotation is pure overhead, and naively enabling comfy's W8A8 forward pre-quantizes activations *tensorwise before* convrot (≈16% error → garbage) | **Opt-in (`ASFP8_INT8_EXT=1`):** route int8 convrot Linears through the W8A8 path the format intends — rotate the *activation* online, per-row quantize it, then a **bit-exact INT8×INT8→INT32 Metal kernel** (Metal 4 cooperative TensorOps, M5+) — and skip comfy's weight dequant/un-rotation entirely. The kernel runs ~1.85× over bf16 / ~7× over the fp32 `_int_mm` fallback; ~24% faster Krea2 renders at matching quality. Kernel ported from [Cider](https://github.com/Mininglamp-AI/cider) (MIT). Falls back to comfy's path if the kernel can't build |
 
 ### How the FP8 trick works
 
@@ -89,10 +105,11 @@ At startup you'll see (only the lines relevant to your machine):
 [AppleSilicon-FP8/te_device] text_encoder_device redirected CPU->MPS on Apple Silicon (LLM/CLIP encoders run on GPU).
 [AppleSilicon-FP8/int_mm] torch._int_mm runs on GPU (float32) on MPS instead of falling back to CPU (INT8 models).
 [AppleSilicon-FP8/int8_linear] int8-fast wide-batch matmul routed via MPS native bf16 GEMM (was fp32 _int_mm).
-[AppleSilicon-FP8/mlx_textgen] Qwen3-VL TextGenerate routed through MLX on Apple Silicon (repo: mlx-community/Qwen3-VL-4B-Instruct-4bit).
+[AppleSilicon-FP8/int8_kernel] INT8 convrot Linear routed through bit-exact Metal kernel on MPS (clean W8A8; weight-only fp32 dequant/un-rotation bypassed).
+[AppleSilicon-FP8/mlx_textgen] TextGenerate routed through MLX on Apple Silicon (qwen3vl_4b -> mlx-community/Qwen3-VL-4B-Instruct-4bit; gemma3_12b -> mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit).
 ```
 
-> **Note:** The `mlx_textgen` line appears only when `mlx-vlm` is installed (`pip install 'comfyui-applesilicon-fp8[mlx]'` or `pip install mlx-vlm`); otherwise patch #14 silently no-ops.
+> **Note:** The `mlx_textgen` line appears only when `mlx-vlm` is installed (`pip install 'comfyui-applesilicon-fp8[mlx]'` or `pip install mlx-vlm`); otherwise patch #14 silently no-ops. The `int8_kernel` line appears only with `ASFP8_INT8_EXT=1` and a working Metal toolchain + `ninja`; otherwise patch #17 silently no-ops and int8 stays on comfy's weight-only path.
 
 ## Notes & caveats
 
@@ -119,11 +136,13 @@ At startup you'll see (only the lines relevant to your machine):
 - **comfy_kitchen / `_scaled_mm` / `cast_bias_weight` / `Tensor.to` FP8 patches**
   only act when FP8 is genuinely involved and MPS is in play; CUDA, CPU, and all
   non-FP8 tensors take an unchanged fast path. The decode is bit-exact.
-- **FP8 on Apple Silicon is a compatibility, not a speed, feature.** MPS has no
-  real FP8 compute, so every FP8 path decodes to bf16 before the matmul anyway —
-  you keep FP8's *storage* savings but pay a per-use decode and run at
+- **The default FP8 path is compatibility, not speed.** Out of the box (no opt-in
+  kernels), MPS has no real FP8 compute, so every FP8 path decodes to bf16 before
+  the matmul — you keep FP8's *storage* savings but pay a per-use decode and run at
   bf16-equivalent speed. If you have the RAM, a bf16 checkpoint avoids the decode
-  tax entirely and is usually faster.
+  tax and is usually faster. **The opt-in kernels change this** for fp8 and int8
+  specifically (see `ASFP8_FP8_EXT` / `ASFP8_INT8_EXT` below): they run the
+  quantized matmul natively on the matrix units and beat the bf16 baseline.
 - **fp8-native matmul is EXPERIMENTAL and opt-in (default OFF).** With
   `ASFP8_FP8_EXT=1` and the Xcode/Metal toolchain installed, large fp8×fp8 matmuls on
   the **`torch._scaled_mm` seam (patch #3)** — the path FLUX / SD3.5 / Krea2 `fp8_scaled`
@@ -141,6 +160,24 @@ At startup you'll see (only the lines relevant to your machine):
   |---|---|
   | `ASFP8_FP8_EXT` = `1` | Enable the fp8-native kernel at the `_scaled_mm` seam (builds the Metal 4.1 extension on first eligible matmul). Default OFF. |
   | `ASFP8_FP8_EXT_MIN_DIM` (8192) | Route to the fp8 kernel only if `max(K, N)` (weight dims) ≥ this. |
+- **int8 W8A8 native matmul is EXPERIMENTAL and opt-in (default OFF), patch #17.**
+  With `ASFP8_INT8_EXT=1` (needs the Metal toolchain + `ninja`), int8 convrot
+  Linears (e.g. **Krea2 convrot int8mixed**) run the W8A8 path the format intends:
+  rotate the activation online, per-row quantize it, then a **bit-exact
+  INT8×INT8→INT32 Metal kernel** (Metal 4 cooperative TensorOps, **M5+ only**),
+  bypassing comfy's per-step fp32 weight dequant + Hadamard un-rotation. Measured
+  ~1.85× over the bf16 GEMM and ~7× over the fp32 `_int_mm` fallback; ~24% faster
+  Krea2 renders at matching quality (clean W8A8 ≈ 1.3% rel-err, on par with the
+  weight-only path). The kernel is **ported from
+  [Cider](https://github.com/Mininglamp-AI/cider)** (Mininglamp, MIT) — its
+  CUTLASS-style register-tiled `matmul2d` is what gets int8 past the fp16-class
+  throughput ceiling a naive cooperative-tensor kernel hits. Builds an ObjC++
+  extension on first use; any build/parity failure (incl. pre-M5, no toolchain,
+  no `ninja`) falls back to comfy's weight-only int8 path automatically.
+
+  | Env var | Behaviour |
+  |---|---|
+  | `ASFP8_INT8_EXT` = `1` | Enable the int8 W8A8 Metal kernel for int8 convrot Linears (builds on first model load). Default OFF. |
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
@@ -171,10 +208,21 @@ At startup you'll see (only the lines relevant to your machine):
 
 ## Scope
 
-This is a "make it work on Mac" compatibility layer, not a performance library.
-It targets the specific gaps that block FP8 diffusion models on MPS today. If a
-model hits a *different* unsupported op (e.g. some `nvfp4` / `mxfp8` paths), it
-may surface a new error — open an issue with the traceback.
+First and foremost a "make it work on Mac" compatibility layer: it targets the
+specific gaps that block FP8 / INT8 diffusion models on MPS today. On top of that
+it adds a few **opt-in, bit-exact acceleration kernels** (fp8-native and int8
+W8A8) for the hot matmul seams — off by default, enabled per env var. It is not a
+general performance library. If a model hits a *different* unsupported op (e.g.
+some `nvfp4` / `mxfp8` compute paths), it may surface a new error — open an issue
+with the traceback.
+
+## Credits
+
+- [`mtlflashattn`](https://github.com/pawel-mazurkiewicz/mtlflashattn) — Metal
+  flash-attention kernels (patch #5).
+- [Cider](https://github.com/Mininglamp-AI/cider) (Mininglamp, MIT) — the int8
+  cooperative-TensorOps `matmul2d` kernel that patch #17's bit-exact
+  INT8×INT8→INT32 GEMM is ported from.
 
 ## License
 

@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-applesilicon-fp8"
-description = "Run FP8 models (FLUX, SD3.5, Ideogram 4) on Apple Silicon / MPS, plus a psutil fix for recent macOS betas."
-version = "1.0.0"
+description = "Run FP8 and INT8 quantized models (FLUX, SD3.5, Ideogram 4, Krea2) on Apple Silicon / MPS — compatibility fixes plus bit-exact fp8/int8 Metal matmul kernels, plus a psutil fix for recent macOS betas."
+version = "1.1.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,6 +11,10 @@ Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
 
 [project.optional-dependencies]
 mlx = ["mlx-vlm"]
+# Build toolchain for the opt-in Metal matmul kernels (fp8-native patch #3 via
+# ASFP8_FP8_EXT=1, int8 W8A8 patch #17 via ASFP8_INT8_EXT=1). torch's
+# cpp_extension needs the ninja build tool; install with the [kernels] extra.
+kernels = ["ninja"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
