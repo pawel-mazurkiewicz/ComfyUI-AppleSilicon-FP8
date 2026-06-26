@@ -60,13 +60,30 @@ def test_kernel_matches_original_bit_exact():
     mod = loader.module()
     assert mod is not None, "int8 kernel failed to build"
     mod.warmup()
+    assert hasattr(mod, "i8_matmul2d_nt_fused"), "fused entry point missing"
 
     # Install so the wrapper picks up the freshly built kernel + original.
     patch._kernel = mod
     patch._orig_int8_linear = orig_int8_linear
 
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
     dev = "mps"
     g = torch.Generator().manual_seed(7)
+
+    def unfused(x, w, ws, b, convrot):
+        """Chunked epilogue (int32 store + Python rescale) for cross-checking."""
+        if convrot:
+            h = _build_hadamard(256, device=x.device, dtype=x.dtype)
+            x = _rotate_activation(x, h, 256)
+        shp = x.shape
+        x8, xs = quantize_int8_rowwise(x.reshape(-1, x.shape[-1]))
+        C = mod.i8_matmul2d_nt(x8.contiguous(), w.contiguous()).float()
+        out = (C * (ws.view(-1) * xs)).to(torch.bfloat16)
+        if b is not None:
+            out = out + b.to(out.dtype)
+        return out.reshape(*shp[:-1], w.shape[0])
 
     def run(M, K, N, convrot, bias, three_d):
         shape = (2, M, K) if three_d else (M, K)
@@ -75,8 +92,12 @@ def test_kernel_matches_original_bit_exact():
         ws = (torch.rand(1, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
         b = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
         ref = orig_int8_linear(x, w, ws, b, torch.bfloat16, convrot, 256)
+        # _int8_linear_kernel auto-selects the fused bf16 epilogue.
         out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, convrot, 256)
-        assert torch.equal(ref, out), f"mismatch M={M} K={K} N={N} convrot={convrot}"
+        assert torch.equal(ref, out), f"fused mismatch M={M} K={K} N={N} convrot={convrot}"
+        # The fused epilogue must also be bit-identical to the chunked one.
+        unf = unfused(x, w, ws, b, convrot)
+        assert torch.equal(out, unf), f"fused!=unfused M={M} K={K} N={N} convrot={convrot}"
 
     run(256, 2560, 1024, convrot=False, bias=False, three_d=False)
     run(256, 2560, 1024, convrot=False, bias=True, three_d=False)

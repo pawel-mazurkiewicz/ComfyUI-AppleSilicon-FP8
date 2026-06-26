@@ -24,9 +24,13 @@ So this patch wraps the ``mixed_precision_ops`` factory and replaces the int8
 ``Linear.forward`` so that, on MPS, eligible int8 layers compute via our
 kernel-backed ``int8_linear`` on the raw bf16 input -- skipping both comfy's lossy
 pre-quant and the per-step fp32 weight dequant/un-rotation. The matmul runs on our
-bit-exact INT8xINT8->INT32 Metal kernel (~102 TF/s, ~1.75x over bf16). Everything
-else (other quant formats, transposed weights, LoRA weight/bias functions,
-non-MPS) falls back to comfy's original forward unchanged.
+bit-exact INT8xINT8->INT32 Metal kernel (~102 TF/s, ~1.75x over bf16). For the
+tensorwise-scale bf16 case (Krea2's int8mixed), the rescale ``float(C)*row_scale[m]``
+and bias add are **fused into the kernel's store epilogue** (Cider's
+``w8a8_matmul_fused_dequant``), so the int32 product never round-trips through
+global memory -- bit-identical to the chunked path, ~1.2-1.65x faster per call.
+Everything else (other quant formats, transposed weights, LoRA weight/bias
+functions, non-MPS) falls back to comfy's original forward unchanged.
 
 Opt-in: only active when ``ASFP8_INT8_EXT=1`` (the kernel build flag).
 """
@@ -89,13 +93,30 @@ def _int8_linear_kernel(
     x_2d = x.reshape(-1, x.shape[-1])
 
     x_8, x_scale = quantize_int8_rowwise(x_2d)
+    weight_scale = weight_scale.view(-1)
+
+    # Fused fast path: when the rescale is purely per-row (tensorwise weight
+    # scale, the int8_tensorwise case) and the output is bf16, fold
+    # float(C)*row_scale[m] (+bias) straight into the kernel's store epilogue so
+    # the int32 product never round-trips through global memory. Bit-identical to
+    # the chunked path below (verified equal across convrot/bias/3D/M=1).
+    if (
+        out_dtype == torch.bfloat16
+        and weight_scale.numel() == 1
+        and hasattr(_kernel, "i8_matmul2d_nt_fused")
+    ):
+        row_scale = (weight_scale.float() * x_scale.reshape(-1).float()).contiguous()
+        bias_arg = bias.to(torch.bfloat16) if bias is not None else None
+        result = _kernel.i8_matmul2d_nt_fused(
+            x_8.contiguous(), weight.contiguous(), row_scale, bias_arg
+        )
+        return result.reshape(*orig_shape[:-1], weight.shape[0])
 
     # C[M,N] int32 = x_8[M,K] @ weight[N,K]^T  (NT: weight in stored layout).
     result = _kernel.i8_matmul2d_nt(x_8.contiguous(), weight.contiguous())
 
     m, n = result.shape
     chunk_size = max(1, min(m, 256 * 1024 * 1024 // (n * 4)))
-    weight_scale = weight_scale.view(-1)
     scaled_parts = []
     for i in range(0, m, chunk_size):
         end_i = min(i + chunk_size, m)
