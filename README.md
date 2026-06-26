@@ -1,3 +1,6 @@
+<img width="2560" height="1280" alt="ComfyUI_00004_" src="https://github.com/user-attachments/assets/b2c78072-5f28-4f65-8ee5-72dc55b5db0b" />
+
+
 # ComfyUI-AppleSilicon-FP8
 
 **Run FP8- and INT8-quantized models on Apple Silicon (Metal / MPS) — without crashes, and faster.**
