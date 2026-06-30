@@ -19,3 +19,48 @@ def test_im2col_2d_matches_unfold(H, W, Cin, kh, kw, s, p):
     torch.mps.synchronize()
     assert A.shape == ref.shape, (A.shape, ref.shape)
     assert (A - ref).abs().max().item() < 1e-2
+
+
+@requires_mps
+@pytest.mark.parametrize("M,K,N,bias", [(130, 96, 72, False), (64, 256, 64, True),
+                                        (300, 1152, 128, True)])
+def test_gemm_nt_bias_matches_reference(M, K, N, bias, monkeypatch):
+    import _patches.conv_im2col_mps as cm
+    from _patches.conv_im2col_mps import _gemm_nt_bias
+    torch.manual_seed(0)
+    # SPY: wrap the compiled lib so the test proves the real Metal entry point ran.
+    # NOTE: torch.mps compiled-shader objects route attribute access to kernel-function
+    # lookup (you cannot set/get arbitrary attrs on them), so we wrap the lib in a thin
+    # delegating proxy that counts gemm_nt_bias invocations and forwards everything else.
+    calls = {"gemm_nt_bias": 0}
+    real_lib = cm._lib
+
+    class _SpyLib:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def gemm_nt_bias(self, *a, **k):
+            calls["gemm_nt_bias"] += 1
+            return self._inner.gemm_nt_bias(*a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def spy_lib(dtype):
+        return _SpyLib(real_lib(dtype))
+    monkeypatch.setattr(cm, "_lib", spy_lib)
+
+    A = torch.randn(M, K, device="mps", dtype=torch.float16)
+    Bw = torch.randn(N, K, device="mps", dtype=torch.float16)
+    b = torch.randn(N, device="mps", dtype=torch.float32) if bias else None
+    out = torch.empty(M, N, device="mps", dtype=torch.float16)
+    ref = A.float() @ Bw.float().t()
+    if bias:
+        ref = ref + b
+    _gemm_nt_bias(A, Bw, b, out)          # writes directly into `out` (no per-call alloc)
+    torch.mps.synchronize()
+    out = out.float()
+    assert calls["gemm_nt_bias"] == 1, "Metal gemm_nt_bias kernel did not run"
+    assert out.shape == (M, N)
+    # fp16 operands, fp32 accumulate: error is operand rounding only
+    assert (out - ref).abs().max().item() < 2e-1

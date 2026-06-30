@@ -56,9 +56,52 @@ kernel void im2col_2d(
 }
 """
 
-# combined per-dtype source is assembled in _lib(); im2col_3d + gemm are appended in
-# later tasks. Keep _ALL_SRC as the list of source fragments.
-_ALL_SRC = [_IM2COL_2D_SRC]
+_GEMM_SRC = r"""
+#include <metal_stdlib>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+using namespace mpp::tensor_ops;
+constant constexpr int BM = 64, BN = 64, NSG = 4;
+kernel void gemm_nt_bias(
+    device @T@*       A    [[buffer(0)]],
+    device @T@*       Bw   [[buffer(1)]],
+    device float*     BIAS [[buffer(2)]],
+    device @T@*       OUT  [[buffer(3)]],
+    device const int* PRM  [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+    const int M=PRM[0], N=PRM[1], K=PRM[2], has_bias=PRM[3];
+    const int m0=int(tgid.x)*BM, n0=int(tgid.y)*BN;
+    if (m0>=M || n0>=N) return;
+    constexpr auto desc = matmul2d_descriptor(
+        BM, BN, static_cast<int>(dynamic_extent), false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mA = tensor<device @T@, dextents<int,2>, tensor_inline>(
+                  A  + ulong(m0)*K, dextents<int,2>{K, min(BM, M-m0)}, array<int,2>{1, K});
+    auto mB = tensor<device @T@, dextents<int,2>, tensor_inline>(
+                  Bw + ulong(n0)*K, dextents<int,2>{K, min(BN, N-n0)}, array<int,2>{1, K});
+    using AT = __tensor_ops_detail::__remove_addrspace_t<decltype(mA)>;
+    using BT = __tensor_ops_detail::__remove_addrspace_t<decltype(mB)>;
+    auto cC = op.get_destination_cooperative_tensor<AT, BT, float>();
+    for (uint16_t i=0;i<cC.get_capacity();++i) if (cC.is_valid_element(i)) cC[i]=0.0f;
+    op.run(mA, mB, cC);
+    device @T@* Cb = OUT + ulong(m0)*N + n0;
+    for (uint16_t i=0;i<cC.get_capacity();++i){
+        if(!cC.is_valid_element(i)) continue;
+        auto idx=cC.get_multidimensional_index(i);
+        const int r=int(idx[1]), c=int(idx[0]);
+        if(m0+r>=M || n0+c>=N) continue;
+        float y=cC[i];
+        if(has_bias) y += BIAS[n0+c];
+        Cb[ulong(r)*N + c] = @T@(y);
+    }
+}
+"""
+
+# combined per-dtype source is assembled in _lib(); im2col_3d is appended in B.6.
+# Keep _ALL_SRC as the list of source fragments.
+_ALL_SRC = [_IM2COL_2D_SRC, _GEMM_SRC]
 
 
 def _src(dtype_key):
@@ -106,3 +149,24 @@ def _im2col_2d_full(x, kh, kw, s, p):
     A = torch.empty(P, K, device=x.device, dtype=x.dtype)
     _im2col_2d_tile(x, A, kh, kw, s, p, Hout, Wout, 0, P)
     return A
+
+
+def _gemm_nt_bias(A, Bw, bias, out=None):
+    """OUT[M,N] = A[M,K] @ Bw[N,K]^T + bias. Writes into `out` if given (a view into
+    out_flat[p0:p0+rows]); allocates only when out is None. No per-tile alloc/copy."""
+    M, K = A.shape
+    N = Bw.shape[0]
+    if out is None:
+        out = torch.empty(M, N, device=A.device, dtype=A.dtype)
+    has_bias = 1 if bias is not None else 0
+    bias_buf = bias.float().contiguous() if bias is not None else torch.zeros(1, device=A.device)
+    prm = torch.tensor([M, N, K, has_bias], dtype=torch.int32, device=A.device)
+    BM = BN = 64
+    NSG = 4
+    gx = (M + BM - 1) // BM
+    gy = (N + BN - 1) // BN
+    _lib(A.dtype).gemm_nt_bias(
+        A.contiguous(), Bw.contiguous(), bias_buf, out, prm,
+        threads=(gx * NSG * 32, gy, 1), group_size=(NSG * 32, 1, 1),
+    )
+    return out
