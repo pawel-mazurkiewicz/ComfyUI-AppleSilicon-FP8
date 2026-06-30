@@ -104,6 +104,12 @@ def _int8_linear_kernel(
         or weight.device.type != "mps"
         or weight.dtype != torch.int8
     ):
+        if _orig_int8_linear is None:
+            raise RuntimeError(
+                f"{TAG} _int8_linear_kernel fallback needs the original int8_linear, "
+                "but it is None (install() never ran / kernel not built). Call install() "
+                "first or route through the comfy forward, which catches this."
+            )
         return _apply_act(
             _orig_int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
@@ -173,9 +179,9 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
     through the per-branch _int8_linear_kernel path (which handles per-channel scales
     and applies the activation itself). act in {"silu","gelu_tanh"} (no "none").
     """
-    _act_code(act)  # validate (raises on typo)
     if act == "none":
         raise ValueError("_int8_swiglu_kernel requires a real gate activation, not 'none'")
+    _act_code(act)  # validate (raises on typo)
     if w_gate.shape != w_up.shape:
         raise ValueError(
             f"gate/up weights must match: {tuple(w_gate.shape)} vs {tuple(w_up.shape)}"

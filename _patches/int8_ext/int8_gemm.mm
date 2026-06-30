@@ -678,6 +678,10 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
   TORCH_CHECK(row_scale.scalar_type() == torch::kFloat && row_scale.is_contiguous(),
               "row_scale must be contiguous float32");
   TORCH_CHECK(row_scale.numel() == a_i8.size(0), "row_scale must have M elements");
+  // Defense-in-depth: the store epilogue only branches on act 1 (silu) / 2 (gelu-tanh);
+  // act 0 means "none". Any other value would silently emit un-activated output, so reject
+  // it here (act=3 gelu-erf was dropped — Metal `erf` does not compile under 4.1).
+  TORCH_CHECK(act >= 0 && act <= 2, "fused: act must be 0(none)/1(silu)/2(gelu-tanh)");
 
   const int M = (int)a_i8.size(0);
   const int K = (int)a_i8.size(1);
@@ -771,6 +775,9 @@ torch::Tensor i8_matmul2d_nt_swiglu(torch::Tensor a_i8, torch::Tensor bg_i8,
                           : torch::zeros({1}, a_i8.options().dtype(torch::kBFloat16));
   if (hb_g) TORCH_CHECK(bg.is_mps() && bg.numel() == N, "swiglu: bias_gate must be N MPS elements");
   if (hb_u) TORCH_CHECK(bu.is_mps() && bu.numel() == N, "swiglu: bias_up must be N MPS elements");
+  // Defense-in-depth: the gated store only branches on act 1 (SwiGLU) / 2 (GEGLU-tanh);
+  // act 0 / anything else would gate by the raw linear value (un-activated), so reject it.
+  TORCH_CHECK(act == 1 || act == 2, "swiglu: act must be 1(silu) or 2(gelu-tanh)");
 
   Geom g = geom_for(M, N);
   id<MTLComputePipelineState> pso = pso_for_swiglu(g.small);

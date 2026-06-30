@@ -48,6 +48,18 @@ def test_wrapper_falls_back_off_mps(monkeypatch):
     assert out is sentinel and called.get("hit") is True
 
 
+def test_fallback_without_install_raises_clean_error(monkeypatch):
+    """Direct call before install() (both _kernel and _orig are None) must raise a
+    clear RuntimeError, not an opaque AttributeError from calling None(...)."""
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_orig_int8_linear", None, raising=False)
+    x = torch.zeros(4, 8)
+    w = torch.zeros(8, 8, dtype=torch.int8)
+    ws = torch.ones(1)
+    with pytest.raises(RuntimeError):
+        patch._int8_linear_kernel(x, w, ws)
+
+
 @requires_int8_ext
 def test_kernel_matches_original_bit_exact():
     """Kernel-backed int8_linear == comfy_kitchen original (bit-identical bf16)."""
@@ -112,9 +124,15 @@ def test_kernel_matches_original_bit_exact():
 @requires_int8_ext
 @pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("convrot", [False, True])  # rotation shifts the activation magnitude dist
 @pytest.mark.parametrize("M", [1, 256])
-def test_int8_linear_fused_activation_matches_reference(M, bias, act):
-    """Fused-epilogue activation == torch activation of the unfused kernel output."""
+def test_int8_linear_fused_activation_matches_reference(M, convrot, bias, act):
+    """Fused-epilogue activation == torch activation of the unfused kernel output.
+
+    convrot=True exercises the Hadamard-rotate -> requant path feeding the fused
+    activation epilogue: rotation reshapes the magnitude distribution (GELU x^3,
+    SiLU saturation, quant edges), so the activation must stay correct there too.
+    """
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     from _patches.int8_ext import loader
     from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
@@ -132,7 +150,7 @@ def test_int8_linear_fused_activation_matches_reference(M, bias, act):
     ws = (torch.rand(1, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
     b = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
 
-    lin = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, False, 256, act="none")
+    lin = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, convrot, 256, act="none")
     if act == "silu":
         ref = torch.nn.functional.silu(lin)
     else:
@@ -144,7 +162,7 @@ def test_int8_linear_fused_activation_matches_reference(M, bias, act):
     saved = patch._orig_int8_linear
     patch._orig_int8_linear = _boom
     try:
-        out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, False, 256, act=act)
+        out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, convrot, 256, act=act)
     finally:
         patch._orig_int8_linear = saved
     torch.mps.synchronize()
@@ -160,7 +178,7 @@ def test_int8_linear_fused_activation_matches_reference(M, bias, act):
     # See docs/superpowers/results/D-results.md.
     d = (out.float() - ref.float()).abs()
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
-        f"M={M} bias={bias} {act}: max|d|={d.max().item():.4g}"
+        f"M={M} convrot={convrot} bias={bias} {act}: max|d|={d.max().item():.4g}"
 
 
 def test_wrapper_fallback_applies_activation(monkeypatch):
@@ -189,13 +207,39 @@ def test_wrapper_rejects_unknown_act():
                                   torch.float32, False, 256, act="sillu")
 
 
+def test_swiglu_rejects_unknown_act():
+    """Mirror of test_wrapper_rejects_unknown_act for the gated kernel: a typo'd
+    activation must raise before any dispatch (CPU tensors, no kernel needed)."""
+    w = torch.randint(-1, 2, (3, 4), dtype=torch.int8)
+    s = torch.tensor([0.01])
+    with pytest.raises(ValueError):
+        patch._int8_swiglu_kernel(torch.randn(2, 4), w, w, s, s,
+                                  None, None, False, 256, act="sillu")
+
+
+def test_swiglu_rejects_none_act():
+    """'none' is a *valid* activation name but meaningless for a gate — it must be
+    rejected (the gate would degenerate to a plain elementwise product)."""
+    w = torch.randint(-1, 2, (3, 4), dtype=torch.int8)
+    s = torch.tensor([0.01])
+    with pytest.raises(ValueError):
+        patch._int8_swiglu_kernel(torch.randn(2, 4), w, w, s, s,
+                                  None, None, False, 256, act="none")
+
+
 # tolerance: one bf16 ulp (rtol=8e-3) + atol=2e-3 near zero — see the point-activation
 # test rationale above and docs/superpowers/results/D-results.md. act=3 (gelu-erf) dropped.
+# 2576 = remainder-K; the (256,2560,convrot=True) case exercises the Hadamard-rotate ->
+# requant path through the fused gate kernel (rotation reshapes the gate magnitude dist,
+# which is where SwiGLU/GEGLU saturation + quant edges live) and keeps its spy guard.
 @requires_int8_ext
 @pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
-@pytest.mark.parametrize("M,K", [(1, 2560), (512, 2560), (512, 2576)])  # 2576 = remainder-K
-def test_int8_swiglu_matches_reference(M, K, bias, act):
+@pytest.mark.parametrize(
+    "M,K,convrot",
+    [(1, 2560, False), (512, 2560, False), (512, 2576, False), (256, 2560, True)],
+)
+def test_int8_swiglu_matches_reference(M, K, convrot, bias, act):
     """Fused gate == act(int8_linear(x,Wg)) * int8_linear(x,Wu)."""
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     from _patches.int8_ext import loader
@@ -217,8 +261,8 @@ def test_int8_swiglu_matches_reference(M, K, bias, act):
     bg = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
     bu = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
 
-    lin_g = patch._int8_linear_kernel(x, wg, sg, bg, torch.bfloat16, False, 256, act="none")
-    lin_u = patch._int8_linear_kernel(x, wu, su, bu, torch.bfloat16, False, 256, act="none")
+    lin_g = patch._int8_linear_kernel(x, wg, sg, bg, torch.bfloat16, convrot, 256, act="none")
+    lin_u = patch._int8_linear_kernel(x, wu, su, bu, torch.bfloat16, convrot, 256, act="none")
     # The fused gate keeps act(gate) in fp32 registers and multiplies by up in fp32,
     # rounding to bf16 ONCE (that single-rounding is the whole point of fusion). The
     # reference must do the same: torch's INDEPENDENT fp32 activation (not the kernel's
@@ -237,13 +281,13 @@ def test_int8_swiglu_matches_reference(M, K, bias, act):
     saved = patch._orig_int8_linear
     patch._orig_int8_linear = _boom
     try:
-        out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, bg, bu, False, 256, act=act)
+        out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, bg, bu, convrot, 256, act=act)
     finally:
         patch._orig_int8_linear = saved
     torch.mps.synchronize()
     assert out.shape == ref.shape
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
-        f"M={M} K={K} {act} bias={bias}: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
+        f"M={M} K={K} convrot={convrot} {act} bias={bias}: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
 
 
 @requires_int8_ext
