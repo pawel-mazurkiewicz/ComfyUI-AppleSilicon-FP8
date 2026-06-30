@@ -17,8 +17,8 @@ Shape: (2, 4096, 1536) fp16 (production DiT hidden dim)
 | production (2,4096,1536) | 1 | none | OK | OK |
 
 **extern_kernel actual calls in output_code.py:**
-- bw_tail (small): NO output_code.py generated — 0 extern_kernel calls (pure MPS Metal, fully fused)
-- bw_tail (production): NO output_code.py generated — 0 extern_kernel calls (pure MPS Metal, fully fused)
+- bw_tail (small): output_code.py IS generated (at `torch_compile_debug/run_*/torchinductor/model__0_inference_0.0/output_code.py`) — 0 `extern_kernels.` method calls; 1 `compile_mps_shader` Metal kernel (rms_norm+silu+residual fully fused). The `extern_kernels` import is always present in the template but is never called.
+- bw_tail (production): output_code.py IS generated — 0 `extern_kernels.` method calls; 1 `compile_mps_shader` Metal kernel (rms_norm+silu+residual fully fused)
 - full_block (small): 1 actual `extern_kernels.mm` call (GEMM only)
 - full_block (production): 1 actual `extern_kernels.mm` call (GEMM only)
 
@@ -93,21 +93,34 @@ Configuration: (2,4096,1536) fp16, warmup=5, iters=50, M5 Max MPS
 
 | Config | Eager (ms) | Compiled (ms) | Speedup | Correctness |
 |---|---|---|---|---|
-| bw_tail (no linear) | 0.429 | 0.143 | **2.99x** | PASS (max_abs=0.0156) |
+| bw_tail (no linear) | 0.429 | 0.143 | **2.42x–2.99x** (best run: 2.99x; independent verification: 2.42x) | PASS (max_abs=0.0156) |
 | full_block (with linear) | 0.991 | 0.946 | 1.05x | PASS (atol=0.1) |
+
+**M1 note — run-to-run variance**: The eager baseline varies ~18% across runs on the same machine (thermal
+state, background load, GPU clock gating). Compiled time is stable (~0.143–0.145 ms). The speedup
+therefore ranges from 2.42x (independent verification run) to 2.99x (original measurement). The 1.5x
+gate is cleared by a wide margin in all observed runs.
 
 Cold compile latency (in-process): bw_tail=257ms, full_block=34ms
 
-### Roofline Analysis (M5 Max @400 GB/s)
+### Roofline Analysis (M5 Max)
 
-| | Bytes (MB) | Min time (ms) |
-|---|---|---|
-| Eager 3-kernel (optimistic) | 176 | 0.440 |
-| Eager 3-kernel (conservative) | 201 | 0.503 |
-| Fused 1-kernel | 75 | 0.189 |
+**M2 note — bandwidth assumption**: The original roofline used 400 GB/s (conservative). M5 Max
+measured bandwidth is ~530–550 GB/s (Apple spec: 546 GB/s). At 530 GB/s the fused-kernel
+floor is 75 MB / 530 GB/s ≈ 0.142 ms, matching the observed compiled time exactly. The
+independently verified 2.42x speedup falls within the corrected theoretical range of 2.33x–2.67x.
+The original "exceeds upper bound" observation was an artifact of the conservative bandwidth
+assumption, not evidence of launch-overhead elimination beyond DRAM-traffic reduction.
 
-- Theoretical speedup range: 2.33x – 2.67x
-- **Achieved: 2.99x** — exceeds roofline upper bound, confirming true DRAM-traffic reduction plus launch-overhead elimination
+| | Bytes (MB) | Min time @400 GB/s (ms) | Min time @530 GB/s (ms) |
+|---|---|---|---|
+| Eager 3-kernel (optimistic) | 176 | 0.440 | 0.332 |
+| Eager 3-kernel (conservative) | 201 | 0.503 | 0.379 |
+| Fused 1-kernel | 75 | 0.188 | 0.142 |
+
+- Theoretical speedup range (400 GB/s): 2.33x – 2.67x
+- Theoretical speedup range (530 GB/s): 2.33x – 2.67x (same ratio, bandwidth cancels)
+- **Observed range: 2.42x–2.99x** — consistent with pure DRAM-traffic reduction at realistic bandwidth
 
 ---
 
@@ -120,9 +133,13 @@ Scheduler nodes (post-fusion):
 2. `op2` — **ExternKernelSchedulerNode**: `extern_kernels.mm` (the GEMM — expected, compute-bound)
 3. `op3` — **SchedulerNode**: silu + residual add (one MPS pointwise kernel)
 
-For **bw_tail**: no output_code.py generated at all — Inductor uses pure MPS Metal path with
-zero extern_kernel dispatches. The rms_norm (with fp32 accumulation upcast confirmed in op0) +
-silu + residual are fused into a single pass.
+For **bw_tail**: output_code.py IS generated at
+`torch_compile_debug/run_*/torchinductor/model__0_inference_0.0/output_code.py` and
+contains 0 `extern_kernels.` method calls (the `extern_kernels` import is always emitted by the
+template but is never invoked). Inductor lowers all ops into a single `compile_mps_shader`
+Metal kernel (`mps_lib_0` in the file). The rms_norm fp32 accumulation is confirmed by the
+`threadgroup float tmp_acc_0` reduction in that shader; silu and residual are fused into the
+same pass.
 
 ### Dispatch counts summary
 
@@ -141,21 +158,26 @@ silu + residual are fused into a single pass.
 
 - [x] Probe 0a: bw_tail production extern_kernels = 0 (fully fused, 0 actual calls)
 - [x] Probe 0b: fullgraph=True PASS for both bw_tail and full_block
-- [x] bw_tail speedup = 2.99x >= 1.5x threshold
+- [x] bw_tail speedup = 2.42x–2.99x (best: 2.99x; independent run: 2.42x) >= 1.5x threshold
 - [x] bw_tail correctness: PASS (max_abs=0.0156 vs eager; max_abs < 5e-2 vs fp32 ref)
 
 ### DECISION: ADOPT_COMPILE
 
 All four gate conditions are met. Inductor MPS on PyTorch 2.11 genuinely fuses
 rms_norm + silu + residual into a single Metal kernel for the DiT-block bandwidth-bound
-tail, eliminating 2 DRAM round-trips and achieving 2.99x speedup at production shape.
+tail, eliminating 2 DRAM round-trips and achieving 2.42x–2.99x speedup at production shape
+(variance driven by eager-baseline thermal/load variation; see M1 note in benchmark section).
 
 ### Impact on Issues D and E
 
-- **Issue D** (activation epilogue fusion into GEMM): **SHRINKS** — the post-GEMM
-  silu+residual is already fused by Inductor (op3 in full_block). Only GEMM-internal
-  epilogue fusion (e.g., bias folding, rescale into GEMM kernel) remains out of Inductor's
-  reach and may warrant a hand-kernel.
+- **Issue D** (activation epilogue fusion into GEMM): **REMAINS FULLY RELEVANT** — the
+  full_block lowers to THREE dispatches: (1) rms_norm Metal shader, (2) `extern_kernels.mm`
+  GEMM, (3) silu+residual Metal shader. The silu and residual ARE fused with each other
+  (op3 / mps_lib_1), but are NOT fused into the GEMM. The GEMM writes its output (`buf2`)
+  to DRAM; mps_lib_1 reads it back. This GEMM→DRAM→silu round-trip is exactly what
+  Issue D targets. Hand-kernels that fold the GEMM epilogue (bias, rescale, silu, residual)
+  into the GEMM itself — eliminating the DRAM round-trip — remain fully warranted and are
+  NOT made redundant by compile.
 
 - **Issue E** (fused norm+modulation+residual): **SHRINKS significantly** — the basic
   rms_norm+silu+residual chain is handled by compile. Modulation (AdaLN scale/shift)

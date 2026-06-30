@@ -86,7 +86,11 @@ def main():
     print(f"PyTorch {torch.__version__}")
     print("Full output written to /tmp/inductor_inspect_A.txt via tee.")
     print("Key things to count in Inductor debug output:")
-    print("  - 'extern_kernels': each = one separate MPS dispatch")
+    print("  - 'extern_kernels.' (with dot — actual method calls, e.g. extern_kernels.mm):")
+    print("    each call = one separate extern MPS dispatch.")
+    print("    NOTE: output_code.py always imports extern_kernels at the top — count only")
+    print("    'extern_kernels.' (dot) occurrences, not the bare 'extern_kernels' import line.")
+    print("  - 'compile_mps_shader': each = one fused Metal kernel (good)")
     print("  - 'ComputedBuffer' with multiple ops: fused into 1 kernel")
     print("  - rms_norm decomposition: 'aten.native_group_norm' or manual ops?")
     print()
@@ -95,8 +99,9 @@ def main():
         for fn_name, fn in [("bw_tail", bw_tail), ("full_block", full_block)]:
             report(f"{fn_name}", fn, b, s, d)
 
-    print("\nDone. Paste extern_kernels count for each shape into docs/superpowers/results/A-results.md.")
-    print("PASS threshold: bw_tail production shape extern_kernels (actual calls) == 0 (all fused).")
+    print("\nDone. Paste extern_kernels. (dot) call count for each shape into docs/superpowers/results/A-results.md.")
+    print("PASS threshold: bw_tail production shape extern_kernels. actual calls == 0 (all fused into Metal shader).")
+    print("NOTE: output_code.py always has 'from ... import extern_kernels' — that import line does NOT count.")
 
 
 if __name__ == "__main__":
