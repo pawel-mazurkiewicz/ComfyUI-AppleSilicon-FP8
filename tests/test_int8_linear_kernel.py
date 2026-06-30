@@ -105,3 +105,85 @@ def test_kernel_matches_original_bit_exact():
     run(512, 6144, 6144, convrot=True, bias=True, three_d=False)
     run(188, 4096, 2560, convrot=True, bias=True, three_d=True)
     run(1, 6144, 6144, convrot=True, bias=False, three_d=False)
+
+
+# P0 verdict: Metal `erf` is unavailable under MTLLanguageVersion4_1, so act=3
+# ("gelu", erf) is dropped entirely; only {silu, gelu_tanh} are supported.
+@requires_int8_ext
+@pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("M", [1, 256])
+def test_int8_linear_fused_activation_matches_reference(M, bias, act):
+    """Fused-epilogue activation == torch activation of the unfused kernel output."""
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    from _patches.int8_ext import loader
+    from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
+    mod = loader.module()
+    assert mod is not None and hasattr(mod, "i8_matmul2d_nt_fused")
+    mod.warmup()
+    patch._kernel = mod
+    patch._orig_int8_linear = orig_int8_linear
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(11)
+    K, N = 2560, 1024
+    x = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+    w = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    ws = (torch.rand(1, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
+    b = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+
+    lin = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, False, 256, act="none")
+    if act == "silu":
+        ref = torch.nn.functional.silu(lin)
+    else:
+        ref = torch.nn.functional.gelu(lin, approximate="tanh")
+
+    # Spy guard: the fused activation path must be the real kernel, not the torch fallback.
+    def _boom(*a, **k):
+        raise AssertionError("fell back to _orig_int8_linear; fused kernel did not run")
+    saved = patch._orig_int8_linear
+    patch._orig_int8_linear = _boom
+    try:
+        out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, False, 256, act=act)
+    finally:
+        patch._orig_int8_linear = saved
+    torch.mps.synchronize()
+    assert out.shape == ref.shape
+    # The fused epilogue rounds the activation to bf16; torch rounds its own bf16
+    # activation too, so the honest correctness bound is ONE bf16 ulp (relative
+    # 2**-7 ~= 7.8e-3). The plan's rtol=2e-3 sits *below* bf16 precision and is
+    # unsatisfiable for these magnitude-~15 outputs even by a perfect kernel
+    # (the plan's rationale assumed outputs ~1.0; this data reaches ~15). rtol=8e-3
+    # admits a 1-ulp-correct kernel; atol=2e-3 bounds the near-zero regime. This
+    # still rejects real bugs: the original precise::tanh GELU (~160 ulp) had an
+    # absolute diff of 0.0156 at small ref, which exceeds atol and fails here.
+    # See docs/superpowers/results/D-results.md.
+    d = (out.float() - ref.float()).abs()
+    assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
+        f"M={M} bias={bias} {act}: max|d|={d.max().item():.4g}"
+
+
+def test_wrapper_fallback_applies_activation(monkeypatch):
+    """Off-MPS / no-kernel fallback must still apply the requested activation, not drop it."""
+    monkeypatch.setattr(patch, "_kernel", None)  # force the early fallback branch
+
+    captured = {}
+    def fake_orig(x, w, ws, bias, out_dtype, convrot, gs):
+        captured["called"] = True
+        return torch.full((x.shape[0], w.shape[0]), 2.0, dtype=torch.float32)
+    monkeypatch.setattr(patch, "_orig_int8_linear", fake_orig)
+
+    x = torch.randn(4, 8)
+    w = torch.randint(-128, 128, (3, 8), dtype=torch.int8)
+    ws = torch.tensor([0.01])
+    out = patch._int8_linear_kernel(x, w, ws, None, torch.float32, False, 256, act="silu")
+    assert captured.get("called"), "fallback path was not taken"
+    # silu(2.0) ≈ 1.7616, not the raw 2.0 — proves the activation was applied post-fallback.
+    assert torch.allclose(out, torch.nn.functional.silu(torch.full_like(out, 2.0)))
+
+
+def test_wrapper_rejects_unknown_act():
+    with pytest.raises(ValueError):
+        patch._int8_linear_kernel(torch.randn(2, 4), torch.randint(-1, 2, (3, 4),
+                                  dtype=torch.int8), torch.tensor([0.01]), None,
+                                  torch.float32, False, 256, act="sillu")

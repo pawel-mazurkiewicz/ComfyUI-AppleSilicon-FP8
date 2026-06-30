@@ -108,6 +108,43 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device OutT *dst,
   }
 }
 
+// ── Fragment store: fused dequant + optional bias + activation ──
+// P0 verdict (M5 Max / macOS 27 / Metal 4.1): precise::exp/precise::tanh compile;
+// `erf`/`metal::erf` do NOT -> act=3 (gelu-erf) is removed. Supported act enum:
+//   0=none, 1=silu (x*sigmoid(x)), 2=gelu-tanh (F.gelu approximate='tanh').
+// Activation is applied AFTER rescale+bias (FFN convention), in fp32 on the
+// bf16-rounded post-bias value, then rounded back to OutT.
+template <typename OutT>
+inline void nax_frag_store_dequant_act(const thread int32_t *src, device OutT *dst,
+                                       int ld, short2 sc, short off_m, short off_n,
+                                       uint M, uint N, uint m_base, uint n_base,
+                                       const device float *row_scale,
+                                       const device OutT *bias, bool has_bias, uint act) {
+  for (short i = 0; i < 2; i++) {
+    for (short j = 0; j < kElemCols; j++) {
+      uint mi = m_base + sc.y + off_m + i * kElemRowsJump;
+      uint ni = n_base + sc.x + off_n + j;
+      if (mi < M && ni < N) {
+        float acc = float(src[i * kElemCols + j]) * row_scale[mi];
+        OutT r = OutT(acc);
+        if (has_bias) { r = r + bias[ni]; }
+        float y = float(r);                 // promote the bf16 linear output to fp32
+        if (act == 1u) {                    // SiLU: x * sigmoid(x)
+          y = y / (1.0f + precise::exp(-y));
+        } else if (act == 2u) {             // GELU tanh-approx (F.gelu approximate='tanh')
+          // tanh(z)=2*sigmoid(2z)-1 => 0.5*x*(1+tanh(z)) == x*sigmoid(2z)
+          //  = x / (1 + exp(-2z)).  Metal precise::tanh is low-accuracy (~160 ulp
+          // off torch), but precise::exp matches torch (silu is bit-exact to 1 ulp),
+          // so route GELU-tanh through exp.  z = sqrt(2/pi)*(x + 0.044715 x^3).
+          float c2 = 1.5957691216057308f;   // 2*sqrt(2/pi)
+          y = y / (1.0f + precise::exp(-c2 * (y + 0.044715f * y * y * y)));
+        }
+        dst[(sc.y + off_m + i * kElemRowsJump) * ld + (sc.x + off_n + j)] = OutT(y);
+      }
+    }
+  }
+}
+
 // ── Raw INT32 GEMM compute (B is [N, K], transpose_b=true) ──────
 // Fills c_frags (int32 register accumulators) for this simdgroup's tile
 // of C[M,N] = A[M,K] × B[N,K]^T, and reports the tile origin (m_base,
@@ -323,6 +360,7 @@ kernel void int8_matmul_fused(
     const device float *row_scale [[buffer(9)]],
     const device bfloat *bias [[buffer(10)]],
     constant uint &has_bias [[buffer(11)]],
+    constant uint &act [[buffer(12)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
@@ -337,10 +375,16 @@ kernel void int8_matmul_fused(
   device bfloat *Dp = D + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
-                                     short(mm * 16), short(nn * 16), M, N,
-                                     m_base, n_base, row_scale, bias,
-                                     has_bias != 0u);
+      if (act == 0u)
+        nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                       short(mm * 16), short(nn * 16), M, N,
+                                       m_base, n_base, row_scale, bias,
+                                       has_bias != 0u);
+      else
+        nax_frag_store_dequant_act<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                           short(mm * 16), short(nn * 16), M, N,
+                                           m_base, n_base, row_scale, bias,
+                                           has_bias != 0u, act);
 }
 
 kernel void int8_matmul_fused_small(
@@ -352,6 +396,7 @@ kernel void int8_matmul_fused_small(
     const device float *row_scale [[buffer(9)]],
     const device bfloat *bias [[buffer(10)]],
     constant uint &has_bias [[buffer(11)]],
+    constant uint &act [[buffer(12)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
@@ -366,10 +411,16 @@ kernel void int8_matmul_fused_small(
   device bfloat *Dp = D + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
-                                     short(mm * 16), short(nn * 16), M, N,
-                                     m_base, n_base, row_scale, bias,
-                                     has_bias != 0u);
+      if (act == 0u)
+        nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                       short(mm * 16), short(nn * 16), M, N,
+                                       m_base, n_base, row_scale, bias,
+                                       has_bias != 0u);
+      else
+        nax_frag_store_dequant_act<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                           short(mm * 16), short(nn * 16), M, N,
+                                           m_base, n_base, row_scale, bias,
+                                           has_bias != 0u, act);
 }
 )MTL";
 
@@ -509,7 +560,8 @@ torch::Tensor i8_matmul2d_nt(torch::Tensor a_i8, torch::Tensor b_i8) {
 // written to global memory — this is the per-call epilogue we skip.
 torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
                                    torch::Tensor row_scale,
-                                   c10::optional<torch::Tensor> bias_opt) {
+                                   c10::optional<torch::Tensor> bias_opt,
+                                   int64_t act) {
   TORCH_CHECK(a_i8.is_mps() && b_i8.is_mps() && row_scale.is_mps(),
               "inputs must be on mps");
   TORCH_CHECK(a_i8.scalar_type() == torch::kChar && b_i8.scalar_type() == torch::kChar,
@@ -550,6 +602,7 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
   uint Mu = (uint)M, Nu = (uint)N, Ku = (uint)K;
   uint swizzle_log = g.swizzle_log, tiles_m = g.tiles_m, tiles_n = g.tiles_n;
   uint has_bias_u = has_bias ? 1u : 0u;
+  uint act_u = (uint)act;
 
   dispatch_sync(stream->queue(), ^(){
     @autoreleasepool {
@@ -567,6 +620,7 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
       [enc setBuffer:sBuf offset:sOff atIndex:9];
       [enc setBuffer:biasBuf offset:biasOff atIndex:10];
       [enc setBytes:&has_bias_u length:sizeof(uint) atIndex:11];
+      [enc setBytes:&act_u length:sizeof(uint) atIndex:12];
       [enc dispatchThreadgroups:MTLSizeMake(g.grid_x, g.grid_y, 1)
           threadsPerThreadgroup:MTLSizeMake(g.THREADS, 1, 1)];
     }
@@ -578,9 +632,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("i8_matmul2d_nt", &i8_matmul2d_nt,
         "Bit-exact NT int8 matmul: C[M,N] int32 = A[M,K] @ B[N,K]^T on MPS");
   m.def("i8_matmul2d_nt_fused", &i8_matmul2d_nt_fused,
-        "Fused NT int8 matmul: D[M,N] bf16 = (A@B^T)*row_scale[M] + bias[N]",
+        "Fused NT int8 matmul: D[M,N] bf16 = act((A@B^T)*row_scale[M] + bias[N]); "
+        "act 0=none,1=silu,2=gelu-tanh",
         pybind11::arg("a_i8"), pybind11::arg("b_i8"), pybind11::arg("row_scale"),
-        pybind11::arg("bias") = c10::optional<torch::Tensor>());
+        pybind11::arg("bias") = c10::optional<torch::Tensor>(),
+        pybind11::arg("act") = 0);
   m.def("warmup", []() {
         pso_for(false); pso_for(true);
         pso_for_fused(false); pso_for_fused(true);

@@ -46,6 +46,29 @@ _installed = False
 _orig_int8_linear = None
 _kernel = None
 
+# Supported fused activations. P0 verdict (M5 Max / macOS 27 / Metal 4.1):
+# Metal `erf` is unavailable, so act=3 (gelu-erf) is dropped entirely; only
+# {none, silu, gelu_tanh} are kept everywhere (kernel store, pybind, this map).
+_ACT = {"none": 0, "silu": 1, "gelu_tanh": 2}
+
+
+def _act_code(act):
+    if act not in _ACT:
+        raise ValueError(f"unknown act {act!r}; expected one of {sorted(_ACT)}")
+    return _ACT[act]
+
+
+def _apply_act(result, act):
+    """Apply the named activation to an already-computed linear output. Single source
+    of truth so no return path can silently drop the activation."""
+    if act == "none":
+        return result
+    if act == "silu":
+        return torch.nn.functional.silu(result)
+    if act == "gelu_tanh":
+        return torch.nn.functional.gelu(result, approximate="tanh")
+    raise ValueError(f"unknown act {act!r}; expected one of {sorted(_ACT)}")
+
 
 def _load_kernel():
     try:
@@ -64,6 +87,7 @@ def _int8_linear_kernel(
     out_dtype=torch.bfloat16,
     convrot=False,
     convrot_groupsize=256,
+    act="none",
 ):
     """Kernel-backed drop-in for comfy_kitchen eager int8_linear.
 
@@ -72,14 +96,19 @@ def _int8_linear_kernel(
     weight_scale*row_scale, optional bias). Only the matmul backend differs (our
     NT kernel vs torch._int_mm) and the weight is used in its stored [N,K] layout.
     """
+    code = _act_code(act)  # validate up front (raises on typo) before any dispatch
+
     if (
         _kernel is None
         or x.device.type != "mps"
         or weight.device.type != "mps"
         or weight.dtype != torch.int8
     ):
-        return _orig_int8_linear(
-            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
+        return _apply_act(
+            _orig_int8_linear(
+                x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize
+            ),
+            act,
         )
 
     from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
@@ -107,8 +136,9 @@ def _int8_linear_kernel(
     ):
         row_scale = (weight_scale.float() * x_scale.reshape(-1).float()).contiguous()
         bias_arg = bias.to(torch.bfloat16) if bias is not None else None
+        # Activation is fused IN-KERNEL here; do NOT also call _apply_act.
         result = _kernel.i8_matmul2d_nt_fused(
-            x_8.contiguous(), weight.contiguous(), row_scale, bias_arg
+            x_8.contiguous(), weight.contiguous(), row_scale, bias_arg, code
         )
         return result.reshape(*orig_shape[:-1], weight.shape[0])
 
@@ -127,6 +157,9 @@ def _int8_linear_kernel(
 
     if bias is not None:
         result = result + bias.to(device=result.device, dtype=result.dtype)
+
+    # Chunked fallback path: activation is applied here (never fused in-kernel).
+    result = _apply_act(result, act)
 
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
