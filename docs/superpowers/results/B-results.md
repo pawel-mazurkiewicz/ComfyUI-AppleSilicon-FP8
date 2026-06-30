@@ -123,3 +123,24 @@ the fallback path (grouped conv NOT routed to the kernel).
 
 Registered patch #18 in __init__.py (import list + install loop, after int8_linear_kernel_mps;
 docstring line 18). ruff clean on _patches/conv_im2col_mps.py + tests/test_conv_im2col.py.
+
+## Task B.9 — fused channel-major scatter (removes out_flat + permute copy)
+
+gemm_nt_bias_scatter: store epilogue decodes pix=p0+(m0+r) -> (n,od,oh,ow) and writes
+directly into channel-major OUT[N,Cout,(Dout,)Hout,Wout]; unified 2D/3D (Dout=1 for 2D).
+Drivers route through it when ASFP8_CONV_SCATTER (default "1") is on, allocating the final
+output ONCE (no out_flat staging, no permute().contiguous() copy).
+
+Tests:
+- test_scatter_matches_nonscatter: scatter output is torch.equal (BYTE-IDENTICAL) to the
+  out_flat+permute path (conv3d 1x16x5x24x24, w 12x16x3x3x3, bias). PASS.
+- test_scatter_drops_extra_buffer: DETERMINISTIC torch.empty spy (current_allocated is NOT
+  a high-watermark, so it cannot see the transient out_flat/copy -- earlier attempt showed
+  identical 16 MB current-alloc for both paths). Asserts the non-scatter path allocates the
+  [P,Cout] out_flat while the scatter path NEVER does and instead allocates [N,Cout,H,W]
+  directly. PASS.
+- B.4/B.6 correctness reused with scatter ON (default) and OFF: 5 passed each.
+
+conv3d bench with scatter default-on: im2col=41.320ms stock=69.689ms speedup=1.69x,
+correctness max|diff|=0.1247 OK -> no regression from the scatter epilogue (slightly faster
+than the 1.60-1.68x out_flat path). Full suite 20 passed, ruff clean.

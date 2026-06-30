@@ -100,6 +100,53 @@ kernel void gemm_nt_bias(
         Cb[ulong(r)*N + c] = @T@(y);
     }
 }
+
+// gemm_nt_bias_scatter: like gemm_nt_bias but the store epilogue writes the result
+// DIRECTLY into channel-major OUT[N,Cout,(Dout,)Hout,Wout], removing the out_flat[P,Cout]
+// staging buffer + the .permute().contiguous() copy. Unifies 2D/3D: for 2D pass Dout=1.
+// PRM: [M, N, K, has_bias, p0, Cout, Dout, Hout, Wout]
+kernel void gemm_nt_bias_scatter(
+    device @T@*       A    [[buffer(0)]],
+    device @T@*       Bw   [[buffer(1)]],
+    device float*     BIAS [[buffer(2)]],
+    device @T@*       OUT  [[buffer(3)]],
+    device const int* PRM  [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+    const int M=PRM[0], N=PRM[1], K=PRM[2], has_bias=PRM[3];
+    const int p0=PRM[4], Cout=PRM[5], Dout=PRM[6], Hout=PRM[7], Wout=PRM[8];
+    const int m0=int(tgid.x)*BM, n0=int(tgid.y)*BN;
+    if (m0>=M || n0>=N) return;
+    constexpr auto desc = matmul2d_descriptor(
+        BM, BN, static_cast<int>(dynamic_extent), false, true, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<NSG>> op;
+    auto mA = tensor<device @T@, dextents<int,2>, tensor_inline>(
+                  A  + ulong(m0)*K, dextents<int,2>{K, min(BM, M-m0)}, array<int,2>{1, K});
+    auto mB = tensor<device @T@, dextents<int,2>, tensor_inline>(
+                  Bw + ulong(n0)*K, dextents<int,2>{K, min(BN, N-n0)}, array<int,2>{1, K});
+    using AT = __tensor_ops_detail::__remove_addrspace_t<decltype(mA)>;
+    using BT = __tensor_ops_detail::__remove_addrspace_t<decltype(mB)>;
+    auto cC = op.get_destination_cooperative_tensor<AT, BT, float>();
+    for (uint16_t i=0;i<cC.get_capacity();++i) if (cC.is_valid_element(i)) cC[i]=0.0f;
+    op.run(mA, mB, cC);
+    const int HW = Hout*Wout, DHW = Dout*HW;
+    for (uint16_t i=0;i<cC.get_capacity();++i){
+        if(!cC.is_valid_element(i)) continue;
+        auto idx=cC.get_multidimensional_index(i);
+        const int r=int(idx[1]), col=int(idx[0]);
+        if(m0+r>=M || n0+col>=N) continue;
+        const int pix = p0 + (m0 + r);
+        const int ow = pix % Wout;
+        const int oh = (pix / Wout) % Hout;
+        const int od = (pix / HW) % Dout;
+        const int n  = pix / DHW;
+        const int c  = n0 + col;
+        float y=cC[i];
+        if(has_bias) y += BIAS[c];
+        OUT[ ((((ulong(n)*Cout + c)*Dout + od)*Hout + oh)*Wout + ow) ] = @T@(y);
+    }
+}
 """
 
 _IM2COL_3D_SRC = r"""
@@ -221,6 +268,32 @@ def _gemm_nt_bias(A, Bw, bias, out=None):
     return out
 
 
+def _scatter_on():
+    # Fused channel-major scatter epilogue (drops out_flat + permute copy). Default on.
+    return os.environ.get("ASFP8_CONV_SCATTER", "1").lower() in ("1", "on", "true")
+
+
+def _gemm_nt_bias_scatter(A, Bw, bias, out, p0, Cout, Dout, Hout, Wout):
+    """OUT[N,Cout,(Dout,)Hout,Wout] += A[rows,K] @ Bw[Cout,K]^T + bias, scattered to the
+    channel-major destination by decoding pix=p0+(m0+r) -> (n,od,oh,ow). `out` is the final
+    channel-major tensor (no out_flat staging, no permute copy). For 2D pass Dout=1."""
+    M, K = A.shape
+    N = Bw.shape[0]
+    has_bias = 1 if bias is not None else 0
+    bias_buf = bias.float().contiguous() if bias is not None else torch.zeros(1, device=A.device)
+    prm = torch.tensor([M, N, K, has_bias, p0, Cout, Dout, Hout, Wout],
+                       dtype=torch.int32, device=A.device)
+    BM = BN = 64
+    NSG = 4
+    gx = (M + BM - 1) // BM
+    gy = (N + BN - 1) // BN
+    _lib(A.dtype).gemm_nt_bias_scatter(
+        A.contiguous(), Bw.contiguous(), bias_buf, out, prm,
+        threads=(gx * NSG * 32, gy, 1), group_size=(NSG * 32, 1, 1),
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Public conv driver (tiled) + fallback contract
 # ---------------------------------------------------------------------------
@@ -264,9 +337,18 @@ def _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
     Hout, Wout = _out_hw(H, W, kh, kw, s, p)   # dilation==1 guaranteed -> formula needs no dilation
     P, K = N * Hout * Wout, Cin * kh * kw
     Wmat = weight.reshape(Cout, K).contiguous()
-    out_flat = torch.empty(P, Cout, device=x.device, dtype=x.dtype)
     tile_p = max(1, min(P, _TILE_BYTES // (K * x.element_size())))
     A_tile = torch.empty(tile_p, K, device=x.device, dtype=x.dtype)
+    if _scatter_on():
+        # Fused channel-major scatter: allocate the final output ONCE, no out_flat / copy.
+        out = torch.empty(N, Cout, Hout, Wout, device=x.device, dtype=x.dtype)
+        for p0 in range(0, P, tile_p):
+            rows = min(tile_p, P - p0)
+            view = A_tile[:rows]
+            _im2col_2d_tile(x, view, kh, kw, s, p, Hout, Wout, p0, rows)
+            _gemm_nt_bias_scatter(view, Wmat, bias, out, p0, Cout, 1, Hout, Wout)
+        return out
+    out_flat = torch.empty(P, Cout, device=x.device, dtype=x.dtype)
     for p0 in range(0, P, tile_p):
         rows = min(tile_p, P - p0)
         view = A_tile[:rows]
@@ -288,9 +370,18 @@ def _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
     Dout, Hout, Wout = _out_dhw(D, H, W, kd, kh, kw, s, p)
     P, K = N * Dout * Hout * Wout, Cin * kd * kh * kw
     Wmat = weight.reshape(Cout, K).contiguous()
-    out_flat = torch.empty(P, Cout, device=x.device, dtype=x.dtype)
     tile_p = max(1, min(P, _TILE_BYTES // (K * x.element_size())))
     A_tile = torch.empty(tile_p, K, device=x.device, dtype=x.dtype)
+    if _scatter_on():
+        # Fused channel-major scatter: allocate the final output ONCE, no out_flat / copy.
+        out = torch.empty(N, Cout, Dout, Hout, Wout, device=x.device, dtype=x.dtype)
+        for p0 in range(0, P, tile_p):
+            rows = min(tile_p, P - p0)
+            view = A_tile[:rows]
+            _im2col_3d_tile(x, view, kd, kh, kw, s, p, Dout, Hout, Wout, p0, rows)
+            _gemm_nt_bias_scatter(view, Wmat, bias, out, p0, Cout, Dout, Hout, Wout)
+        return out
+    out_flat = torch.empty(P, Cout, device=x.device, dtype=x.dtype)
     for p0 in range(0, P, tile_p):
         rows = min(tile_p, P - p0)
         view = A_tile[:rows]

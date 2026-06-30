@@ -213,3 +213,63 @@ def test_wrapper_falls_back_on_kernel_exception(monkeypatch):
     conv2 = cm._make_wrap(fake_orig, 2)
     out = conv2(torch.zeros(1, 4, 8, 8), torch.zeros(8, 4, 3, 3), padding=1)
     assert out is sentinel
+
+
+@requires_mps
+def test_scatter_matches_nonscatter(monkeypatch):
+    """The fused channel-major scatter epilogue must produce byte-identical output to the
+    out_flat+permute path (same kernel math, different store)."""
+    from _patches.conv_im2col_mps import conv_im2col
+    torch.manual_seed(0)
+    x = torch.randn(1, 16, 5, 24, 24, device="mps", dtype=torch.float16)
+    w = torch.randn(12, 16, 3, 3, 3, device="mps", dtype=torch.float16)
+    b = torch.randn(12, device="mps", dtype=torch.float16)
+    monkeypatch.setenv("ASFP8_CONV_SCATTER", "0")
+    ref = conv_im2col(x, w, b, stride=1, padding=1)
+    monkeypatch.setenv("ASFP8_CONV_SCATTER", "1")
+    got = conv_im2col(x, w, b, stride=1, padding=1)
+    torch.mps.synchronize()
+    assert got.shape == ref.shape
+    assert torch.equal(got, ref), (got - ref).abs().max().item()
+
+
+@requires_mps
+def test_scatter_drops_extra_buffer(monkeypatch):
+    """DETERMINISTIC proof (current_allocated is NOT a high-watermark, so it cannot observe
+    the transient out_flat/copy that scatter removes). We spy torch.empty: the scatter path
+    must allocate ONLY the channel-major final output [N,Cout,H,W] + the [tile_p,K] A_tile,
+    and NEVER the [P,Cout] out_flat staging buffer the non-scatter path allocates."""
+    from _patches.conv_im2col_mps import conv_im2col
+    N, Cin, H, W, Cout = 1, 64, 256, 256, 128
+    P = N * H * W  # pad=1, stride=1 -> Hout=H, Wout=W
+    x = torch.randn(N, Cin, H, W, device="mps", dtype=torch.float16)
+    w = torch.randn(Cout, Cin, 3, 3, device="mps", dtype=torch.float16)
+
+    real_empty = torch.empty
+
+    def run_and_capture(scatter):
+        shapes = []
+
+        def spy_empty(*size, **kw):
+            # torch.empty(*sizes) or torch.empty((sizes,))
+            s = size[0] if len(size) == 1 and isinstance(size[0], (tuple, list, torch.Size)) else size
+            shapes.append(tuple(int(d) for d in s))
+            return real_empty(*size, **kw)
+        monkeypatch.setenv("ASFP8_CONV_SCATTER", "1" if scatter else "0")
+        monkeypatch.setattr(torch, "empty", spy_empty)
+        out = conv_im2col(x, w, None, 1, 1)
+        torch.mps.synchronize()
+        monkeypatch.setattr(torch, "empty", real_empty)
+        return shapes, out
+
+    s_scatter, out = run_and_capture(True)
+    s_nonscatter, _ = run_and_capture(False)
+
+    out_flat_shape = (P, Cout)
+    final_shape = (N, Cout, H, W)
+    # non-scatter allocates the [P,Cout] out_flat staging buffer ...
+    assert out_flat_shape in s_nonscatter, s_nonscatter
+    # ... scatter NEVER does; it allocates the channel-major output directly.
+    assert out_flat_shape not in s_scatter, s_scatter
+    assert final_shape in s_scatter, s_scatter
+    assert out.shape == final_shape
