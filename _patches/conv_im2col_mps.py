@@ -1,4 +1,4 @@
-"""Patch #18 (opt-in): VAE conv on MPS via tiled im2col + matmul2d tensor-op GEMM.
+"""Patch #18: VAE conv on MPS via tiled im2col + matmul2d tensor-op GEMM (conv3d default-ON).
 
 Routes conv2d/conv3d through `im2col_2d/3d` gather -> NT `matmul2d` GEMM (half/bf16/fp32
 operands, fp32 cooperative-tensor accumulate) + fused bias, looping over output-pixel
@@ -6,8 +6,11 @@ tiles so the lowered patch buffer (`A_tile`) is capped (default 384 MB). Targets
 Session-15 SeedVR2 non-tiled conv3d decode OOM. Authored with torch.mps.compile_shader
 (pure-Python authoring path, no .mm/xcrun/ninja build step).
 
-Gating: no-op unless ASFP8_CONV_IM2COL is set (1|on|true => both ranks; 2d / 3d => that
-rank only). Never fatal: any compile/kernel failure falls back to stock F.conv2d/conv3d.
+Gating: conv3d is ON by default (im2col is ~2.7x faster than stock MPS conv3d and ~31%
+faster end-to-end on SeedVR2 — measured on M5/Metal 4.1). conv2d stays OFF by default
+(stock conv2d is already at-roofline; im2col loses there). Kill switch: ASFP8_CONV_IM2COL=off.
+Opt conv2d in with =2d or =2d,3d (=1|on|true => both ranks). Build is M5/Metal-4.1 gated and
+never fatal: any compile/kernel/shape failure falls back to stock F.conv2d/conv3d.
 
 B.0 probe (M5 Max / macOS 27 / PyTorch 2.11 / Metal 4.1) confirmed the <T,T,float>
 cooperative-accumulate matmul2d compiles+runs+CORRECT for half, bfloat AND float, so all
@@ -411,24 +414,31 @@ _orig_conv2d = None
 _orig_conv3d = None
 
 
+_CONV_OFF = ("off", "0", "false", "none", "no")
+_CONV_BOTH = ("1", "on", "true", "all", "both", "2d,3d", "3d,2d")
+
+
 def _mode():
-    # "1"/"on"/"true" => both; "2d"/"3d" => that rank
-    return os.environ.get("ASFP8_CONV_IM2COL", "").lower()
+    # DEFAULT-ON for conv3d (measured ~2.7x vs stock MPS conv3d, ~31% faster SeedVR2).
+    # conv2d stays OFF by default (stock conv2d is at-roofline; im2col loses there).
+    # Kill switch: ASFP8_CONV_IM2COL=off. Opt conv2d in with =2d / =2d,3d (=1|on|true => both).
+    return os.environ.get("ASFP8_CONV_IM2COL", "3d").strip().lower()
 
 
 def _gate():
-    return _mode() in ("1", "on", "true", "2d", "3d")
+    return _mode() not in _CONV_OFF
 
 
 def _wanted_ranks():
     m = _mode()
-    if m in ("1", "on", "true"):
+    if m in _CONV_OFF:
+        return set()
+    if m in _CONV_BOTH:
         return {2, 3}
     if m == "2d":
         return {2}
-    if m == "3d":
-        return {3}
-    return set()
+    # "3d", the default, and any unrecognized value -> conv3d only (the proven default win)
+    return {3}
 
 
 def _make_wrap(orig, rank):

@@ -154,11 +154,31 @@ def test_conv3d_matches_reference(D, H, W, Cin, Cout, bias, monkeypatch):
     assert (out - ref).abs().max().item() < 2e-1
 
 
-def test_install_noop_without_flag(monkeypatch):
+def test_install_default_on_routes_conv3d_only(monkeypatch):
+    """Default (no env) routes conv3d (the measured ~2.7x win) but NOT conv2d
+    (stock conv2d is at-roofline; im2col loses there)."""
+    import torch.nn.functional as F
     import _patches.conv_im2col_mps as cm
     monkeypatch.delenv("ASFP8_CONV_IM2COL", raising=False)
     monkeypatch.setattr(cm, "_installed_ranks", set(), raising=False)
     monkeypatch.setattr(cm, "_orig_conv2d", None, raising=False)
+    monkeypatch.setattr(cm, "_orig_conv3d", None, raising=False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    try:
+        cm.install()
+        assert cm._installed_ranks == {3}
+    finally:
+        if cm._orig_conv2d is not None:
+            F.conv2d, F.conv3d = cm._orig_conv2d, cm._orig_conv3d
+
+
+def test_install_off_disables(monkeypatch):
+    """ASFP8_CONV_IM2COL=off is the kill switch -- nothing is installed."""
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setenv("ASFP8_CONV_IM2COL", "off")
+    monkeypatch.setattr(cm, "_installed_ranks", set(), raising=False)
+    monkeypatch.setattr(cm, "_orig_conv2d", None, raising=False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
     cm.install()
     assert cm._installed_ranks == set()
 
