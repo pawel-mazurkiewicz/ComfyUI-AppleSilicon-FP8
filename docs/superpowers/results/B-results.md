@@ -51,3 +51,21 @@ grid echo: [0, 100, 200, 1, 101, 201] expect [0, 100, 200, 1, 101, 201] -> PASS
 grid maps with no axis transposition (`threads=(gx*TG, gy, 1)` → `tg.x`/`tg.y` as
 expected). The GEMM's `threads=(gx*NSG*32, gy, 1), group_size=(NSG*32,1,1)` dispatch is
 confirmed correct.
+
+## Task B.1 — baseline stock conv vs measured same-shape GEMM (`dev/bench_mps_conv.py`)
+
+Device: Apple M5 Max, 18 cores (6 Super + 12 Performance), macOS 27.
+
+```
+conv2d 3x3 256ch 512x512: 5.115 ms  60458.8 GFLOP/s
+  measured GEMM @ M=262144,K=2304,N=256: 5.683 ms  54417.2 GFLOP/s (conv2d achieves 111% of achieved GEMM)
+conv3d 3x3x3 128ch 5x256x256: 69.926 ms  4146.0 GFLOP/s
+  measured GEMM @ M=327680,K=3456,N=128: 5.456 ms  53139.6 GFLOP/s (conv3d achieves 8% of achieved GEMM)
+driver_allocated (current, NOT peak): 4.32 GiB
+```
+
+DECISION (data-driven, Open Question #8): stock conv2d already achieves 111% of the
+achieved same-shape GEMM -> conv2d is ALREADY competitive; do NOT route conv2d. Stock
+conv3d achieves only 8% of the same-shape GEMM (~13x headroom) -> conv3d is the firm win.
+**Scope install to conv3d-only (`ASFP8_CONV_IM2COL=3d`).** conv2d path is still built and
+correctness-tested (B.4) but not installed by default.
