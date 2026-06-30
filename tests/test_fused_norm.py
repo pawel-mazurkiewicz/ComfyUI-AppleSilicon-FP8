@@ -164,11 +164,17 @@ def test_bad_optional_shape_falls_back():
     rows, dim = 256, 128
     x = torch.randn(rows, dim, device="mps", dtype=torch.float16)
     bad_w = torch.randn(dim - 1, device="mps", dtype=torch.float16)   # wrong length
-    out = fused_rmsnorm_modulate(x, bad_w, 1e-6)
+    # the validation must route to the fallback (no kernel dispatch / no OOB buffer read); the
+    # torch fallback then legitimately broadcast-fails on the genuinely-malformed tensor. The
+    # load-bearing assertion is that we did NOT dispatch the kernel (backend == "fallback").
+    m._last_backend = "kernel"
+    with pytest.raises(RuntimeError):
+        fused_rmsnorm_modulate(x, bad_w, 1e-6)
     assert m._last_backend == "fallback"
-    # the fallback itself will broadcast-fail or mismatch; here we only assert it did not dispatch
     bad_res = torch.randn(rows, dim + 1, device="mps", dtype=torch.float16)
-    out2 = fused_rmsnorm_modulate(x, None, 1e-6, None, None, bad_res)
+    m._last_backend = "kernel"
+    with pytest.raises(RuntimeError):
+        fused_rmsnorm_modulate(x, None, 1e-6, None, None, bad_res)
     assert m._last_backend == "fallback"
 
 
