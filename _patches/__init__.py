@@ -18,10 +18,15 @@ __all__ = [
     "int_mm_mps",           # patch #12 — torch._int_mm on GPU on MPS (INT8 models, no CPU fallback)
     "int8_linear_mps",      # patch #13 — int8-fast wide-batch Linear via MPS native bf16 GEMM
     "mlx_textgen",          # patch #14 — MLX-backed Qwen3-VL TextGenerate (prompt expansion)
-    # patch #15 (fp8_linear_mps, opt-in fp8-native F.linear) RETIRED — wrong seam:
+    "fp8_linear_kernel_mps", # patch #20 — fp8 e4m3 Linear via native Metal matmul2d (opt-in ASFP8_FP8_NATIVE=1)
+    # patch #15 (fp8_linear_mps, opt-in fp8-native *F.linear*) RETIRED — wrong seam:
     #   real ComfyUI fp8 routes through torch._scaled_mm (QuantizedTensor hides the fp8
     #   dtype so the F.linear gate never fired), and weight-only fp8 only won at tiny M.
     #   The fp8-native win lives in patch #3's _scaled_mm fast path (ASFP8_FP8_EXT=1).
+    #   NOTE: patch #20 (fp8_linear_kernel_mps) is a *different, newer* seam — it wraps
+    #   mixed_precision_ops.Linear.forward (the same factory seam patch #17 uses for int8),
+    #   intercepting BEFORE the activation is fp8-quantized, so the F.linear-gate problem
+    #   that retired #15 does not apply. Default OFF until the real-model seam probe passes.
     # Internal helpers (not patches):
     # "_common"             — decode_fp8, fp8_to_float_lut, FP8_DTYPES
     # "na_gemm"             — optional NA matmul2d backend (not wired into hot path)
