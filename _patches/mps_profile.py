@@ -37,6 +37,50 @@ _t_start = None
 _t_last_dump = None
 _interval = 20.0
 _gguf_wrapped = False
+_rope_wrapped_ids: set = set()
+# id() of every original RoPE function object that has been replaced in
+# all its occurrences (including aliases). Unlike _gguf_wrapped (boolean,
+# single-target), RoPE is multi-target across many model families and alias
+# imports; we never set a global "all done" flag. Each id is added when the
+# corresponding original function is first found and wrapped; subsequent scans
+# skip ids already present, making repeat calls cheap.
+
+# Canonical module-level function names that perform rotary embedding, plus
+# known alias names used by Wan 2.2, EchoShot, Mocha, and KJNodes.
+# Derived from:
+#   grep -rn "def apply_rope\|def rope_apply\|def apply_rotary\|def _ideogram4" \
+#     $COMFYUI --include="*.py"
+# and cross-referenced against Codex review of actual import patterns.
+#
+# NOTE: alias names (apply_rope_comfy, rope_apply_z, etc.) are included so
+# Pass 1 can discover them if they appear as standalone functions. Aliases
+# bound by 'from X import Y as Z' at import time are also caught by Pass 2
+# (object-identity scan) even if their name is not listed here.
+_ROPE_FN_NAMES = frozenset({
+    # Wan 2.2 canonical
+    "rope_apply",
+    "rope_apply_3d",
+    "rope_apply_1d",
+    "apply_rotary_emb_split",
+    # Wan 2.2 aliases (wanvideo/modules/model.py lines 27-29, called at 441-451, 677-680)
+    "apply_rope_comfy",
+    "apply_rope_comfy1",
+    # Flux / Chroma / Ideogram canonical
+    "apply_rope",
+    # HunyuanVideo / LTX
+    "apply_rotary_emb",
+    # ChatGLM-derived
+    "apply_rotary_pos_emb",
+    # KJNodes Ideogram4 int8/convrot path
+    # (comfyui-kjnodes/nodes/model_optimization_nodes.py lines 1967-1992)
+    "_ideogram4_apply_rope_lowp",
+    # EchoShot (echoshot/echoshot.py, referenced by wanvideo/modules/model.py line 24)
+    "rope_apply_z",
+    "rope_apply_c",
+    "rope_apply_echoshot",
+    # Mocha (mocha/nodes.py, referenced by nodes_sampler.py line 968)
+    "rope_apply_mocha",
+})
 
 
 def _is_mps(args):
@@ -73,7 +117,8 @@ def _dump():
               f"({calls} calls, {avg_ms:.3f} ms/call)")
     print(f"{TAG}   {'<unwrapped>':<14} {other:8.2f}s  "
           f"{(100.0 * other / elapsed) if elapsed else 0.0:5.1f}%  "
-          f"(elementwise / copies / gguf math not in a wrapped seam)")
+          f"(elementwise / modulation / rotary-if-not-found / "
+          f"gguf-if-not-found / copies / misc not in a wrapped seam)")
 
 
 def _maybe_dump():
@@ -94,6 +139,7 @@ def _timed(name, orig):
         torch.mps.synchronize()
         _record(name, time.perf_counter() - t0)
         _try_wrap_gguf()
+        _try_wrap_rope()
         _maybe_dump()
         return out
     wrapper._asfp8_timed = True
@@ -129,6 +175,88 @@ def _try_wrap_gguf():
         _gguf_wrapped = True
 
 
+def _try_wrap_rope():
+    """Lazily wrap module-level rotary-embedding functions using two-pass identity scanning.
+
+    Called inside every _timed wrapper closure (like _try_wrap_gguf), but unlike
+    _try_wrap_gguf (single-target, stops permanently once found), _try_wrap_rope
+    never short-circuits globally because:
+      1. RoPE spans many model families; new model modules may load late.
+      2. Alias imports (from wanvideo.modules.model import rope_apply as apply_rope_comfy1)
+         bind the original function object under a different name in the caller's namespace.
+         Patching only the source module leaves caller-module aliases stale.
+
+    Algorithm:
+      Pass 1 — collect unpatched original function objects by canonical name:
+        For each module in sys.modules, look for names in _ROPE_FN_NAMES.
+        Skip: _asfp8_timed (already wrapped), no __code__ (builtin/partial),
+        id already in _rope_wrapped_ids (wrapped in a prior scan).
+        Collect into originals: dict[id(fn) -> fn].
+
+      Pass 2 — patch every occurrence in every module by object identity:
+        For every callable value in every module dict whose id() is in originals
+        and is not _asfp8_timed, replace it with _timed('rotary', val) and
+        record id(val) in _rope_wrapped_ids.
+        This catches aliases regardless of their local attribute name.
+
+    If Pass 1 finds no new originals (all known ids already in _rope_wrapped_ids),
+    returns immediately — cost is one dict-intersection check per call.
+    """
+    global _rope_wrapped_ids
+
+    # Pass 1: discover unpatched rope function objects by name
+    originals: dict = {}  # id(fn) -> fn
+    for _mod_name, mod in list(sys.modules.items()):
+        if (mod is None
+                or _mod_name.startswith("torch._classes")
+                or _mod_name.startswith("torch.classes")):
+            continue
+        try:
+            mod_dict = mod.__dict__
+            for fn_name in _ROPE_FN_NAMES:
+                fn = mod_dict.get(fn_name)
+                if fn is None or not callable(fn):
+                    continue
+                if getattr(fn, "_asfp8_timed", False):
+                    continue
+                # Skip C-extension callables and builtins — they have no __code__.
+                # Note: do NOT check co_argcount; *args-only functions have
+                # co_argcount == 0 but are valid RoPE implementations.
+                if getattr(fn, "__code__", None) is None:
+                    continue
+                fn_id = id(fn)
+                if fn_id not in _rope_wrapped_ids:
+                    originals[fn_id] = fn
+        except Exception:
+            continue
+
+    if not originals:
+        return  # nothing new; cheap exit
+
+    # Pass 2: patch every occurrence in every module (catches alias imports)
+    for _mod_name, mod in list(sys.modules.items()):
+        if (mod is None
+                or _mod_name.startswith("torch._classes")
+                or _mod_name.startswith("torch.classes")):
+            continue
+        try:
+            for attr_name, val in list(mod.__dict__.items()):
+                if not callable(val):
+                    continue
+                if getattr(val, "_asfp8_timed", False):
+                    continue
+                fn_id = id(val)
+                if fn_id not in originals:
+                    continue
+                # Replace with a fresh wrapper pointing at the original fn.
+                # Do not check _rope_wrapped_ids here — the same id may appear
+                # in multiple modules (aliases); we want to patch all of them.
+                _rope_wrapped_ids.add(fn_id)
+                mod.__dict__[attr_name] = _timed("rotary", originals[fn_id])
+        except Exception:
+            continue
+
+
 def install():
     global _installed, _t_start, _t_last_dump, _interval
     if _installed:
@@ -156,8 +284,23 @@ def install():
     torch.matmul = _timed("matmul", torch.matmul)
     torch.bmm = _timed("bmm", torch.bmm)
 
+    # Activation ops. All three share the 'activation' bucket.
+    # PREREQUISITE: run Task 0 probe first to confirm nn.SiLU/nn.GELU dispatch
+    # through F.silu/F.gelu in this PyTorch version. If they bypass F.*, also
+    # wrap nn.SiLU.forward and nn.GELU.forward (see Task 0 probe output).
+    F.silu = _timed("activation", F.silu)
+    F.gelu = _timed("activation", F.gelu)
+    F.glu  = _timed("activation", F.glu)
+
+    # Attempt an early lazy scan for RoPE functions — the model may already be
+    # partially imported by the time mps_profile.install() runs. The wrapper also
+    # calls _try_wrap_rope() on every timed invocation for the late-import case.
+    _try_wrap_rope()
+
     _t_start = time.perf_counter()
     _t_last_dump = _t_start
     _installed = True
     print(f"{TAG} GPU-time profiler active (synchronized; run is slower). "
-          f"Cumulative breakdown every {_interval:.0f}s. GGUF dequant wrapped lazily.")
+          f"Seams: attn / linear / conv2d / conv3d / layernorm / rmsnorm / "
+          f"matmul / bmm / activation (silu+gelu+glu) / rotary (lazy, identity-scan) / "
+          f"gguf_dequant (lazy). Breakdown every {_interval:.0f}s.")
