@@ -1,7 +1,9 @@
-"""JIT loader for the fp8-native matmul2d MPS extension (patch #15 backend).
+"""JIT loader for the fp8-native matmul2d MPS extension.
 
-Builds _patches/fp8_ext/fp8_matmul2d.mm via torch.utils.cpp_extension.load (ObjC++,
-Metal 4.1). Opt-in (ASFP8_FP8_EXT=1), guarded, cached; returns None on any failure so
+Backs patch #3's _scaled_mm fast path (ASFP8_FP8_EXT=1) and patch #20's fp8-native
+Linear wrapper (ASFP8_FP8_NATIVE=1). Builds _patches/fp8_ext/fp8_matmul2d.mm via
+torch.utils.cpp_extension.load (ObjC++, Metal 4.1). Opt-in (builds when EITHER
+ASFP8_FP8_EXT=1 OR ASFP8_FP8_NATIVE=1), guarded, cached; returns None on any failure so
 the caller falls back to the decode path.
 
 Space-in-path workaround: cpp_extension emits the torch lib `-L` UNQUOTED, so a space
@@ -42,7 +44,7 @@ def module():
         return _mod
     _tried = True
 
-    if os.environ.get("ASFP8_FP8_EXT") != "1":
+    if os.environ.get("ASFP8_FP8_EXT") != "1" and os.environ.get("ASFP8_FP8_NATIVE") != "1":
         return None
     if shutil.which("xcrun") is None:
         print("[fp8_ext] no Metal toolchain (xcrun); fp8-native disabled.")
