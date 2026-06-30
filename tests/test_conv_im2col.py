@@ -98,7 +98,7 @@ def test_tile_buffer_capped():
     and for a large conv it actually tiles (tile_p < P) rather than materializing full im2col."""
     import _patches.conv_im2col_mps as cm
     # 512x512, Cin=256, 3x3 -> full im2col is 1.21 GB, well above the 384 MB default cap.
-    N, Cin, H, W, kh, kw = 1, 256, 512, 512, 3, 3
+    N, Cin, kh, kw = 1, 256, 3, 3  # H = W = 512
     Hout = Wout = 512  # pad=1, stride=1
     P, K = N * Hout * Wout, Cin * kh * kw
     elsize = 2  # fp16
@@ -152,3 +152,64 @@ def test_conv3d_matches_reference(D, H, W, Cin, Cout, bias, monkeypatch):
     torch.mps.synchronize()
     assert out.shape == ref.shape
     assert (out - ref).abs().max().item() < 2e-1
+
+
+def test_install_noop_without_flag(monkeypatch):
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.delenv("ASFP8_CONV_IM2COL", raising=False)
+    monkeypatch.setattr(cm, "_installed_ranks", set(), raising=False)
+    monkeypatch.setattr(cm, "_orig_conv2d", None, raising=False)
+    cm.install()
+    assert cm._installed_ranks == set()
+
+
+def test_install_idempotent_per_mode(monkeypatch):
+    """=2d then =3d in one process must install BOTH ranks."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setattr(cm, "_installed_ranks", set(), raising=False)
+    monkeypatch.setattr(cm, "_orig_conv2d", None, raising=False)
+    monkeypatch.setattr(cm, "_orig_conv3d", None, raising=False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    monkeypatch.setenv("ASFP8_CONV_IM2COL", "2d")
+    cm.install()
+    assert cm._installed_ranks == {2}
+    monkeypatch.setenv("ASFP8_CONV_IM2COL", "3d")
+    cm.install()
+    assert cm._installed_ranks == {2, 3}
+    # restore F.conv2d/conv3d to the captured originals so we don't leak the wrap.
+    F.conv2d, F.conv3d = cm._orig_conv2d, cm._orig_conv3d
+
+
+@pytest.mark.parametrize("kwargs", [{"groups": 2}, {"dilation": 2}])
+def test_wrapper_falls_back_unsupported(kwargs):
+    """Grouped / dilated convs must delegate to the captured original, not the kernel."""
+    import _patches.conv_im2col_mps as cm
+    sentinel = object()
+    called = {}
+
+    def fake_orig(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        called["hit"] = True
+        return sentinel
+    conv2 = cm._make_wrap(fake_orig, 2)  # module-level wrapper factory (no MPS/install needed)
+    x = torch.zeros(1, 4, 8, 8)          # CPU tensor, also unsupported device
+    w = torch.zeros(8, 4, 3, 3)
+    out = conv2(x, w, padding=1, **kwargs)
+    assert out is sentinel and called.get("hit") is True
+
+
+def test_wrapper_falls_back_on_kernel_exception(monkeypatch):
+    """If the kernel raises, the wrapper must still return the original's result."""
+    import _patches.conv_im2col_mps as cm
+    sentinel = object()
+
+    def fake_orig(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        return sentinel
+
+    def boom(*a, **k):
+        raise RuntimeError("kernel blew up")
+    monkeypatch.setattr(cm, "_supported", lambda *a, **k: True)
+    monkeypatch.setattr(cm, "conv_im2col", boom)
+    conv2 = cm._make_wrap(fake_orig, 2)
+    out = conv2(torch.zeros(1, 4, 8, 8), torch.zeros(8, 4, 3, 3), padding=1)
+    assert out is sentinel

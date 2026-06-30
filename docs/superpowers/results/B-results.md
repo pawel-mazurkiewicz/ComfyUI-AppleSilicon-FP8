@@ -103,3 +103,23 @@ conv3d im2col is FASTER than stock conv3d (1.6-1.7x) and correct -> firm win con
 Because the 64x64 baseline GEMM already beats stock conv3d, Task B.3b (register-tiling)
 is NOT required. current_alloc 0.21 GiB (NOT a high-watermark; the A_tile cap is the
 deterministic proof, B.8 the definitive OOM check).
+
+## Task B.7 — guarded install + __init__.py registration
+
+Full suite: `pytest tests/test_conv_im2col.py -v` -> 18 passed in 0.28s.
+Install/fallback tests (run everywhere, not just MPS): no-op-without-flag, per-mode
+idempotence (=2d then =3d installs {2,3}), grouped/dilated/CPU fallback, injected-kernel-
+exception fallback -> all pass.
+
+Flag-on grouped-fallback smoke:
+```
+[AppleSilicon-FP8/conv] conv im2col+matmul2d active on MPS (ranks=[2, 3], tile=384MB).
+grouped-fallback ok: (1, 8, 16, 16)
+```
+NOTE: the plan's smoke used w=[8,8,3,3] with groups=2 which is an INVALID grouped conv
+(groups=2 needs weight [8,4,3,3] for 8-ch input); the stock conv legitimately rejected it.
+Corrected to w=[8,4,3,3] -> fallback delegates to stock conv, output (1,8,16,16). Proves
+the fallback path (grouped conv NOT routed to the kernel).
+
+Registered patch #18 in __init__.py (import list + install loop, after int8_linear_kernel_mps;
+docstring line 18). ruff clean on _patches/conv_im2col_mps.py + tests/test_conv_im2col.py.

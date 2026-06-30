@@ -298,3 +298,66 @@ def _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
         _gemm_nt_bias(view, Wmat, bias, out=out_flat[p0:p0 + rows])
     # [P,Cout] -> [N,Dout,Hout,Wout,Cout] -> [N,Cout,Dout,Hout,Wout]
     return out_flat.reshape(N, Dout, Hout, Wout, Cout).permute(0, 4, 1, 2, 3).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Guarded install (never fatal). Mirrors flash_attn_mtl.py.
+# ---------------------------------------------------------------------------
+
+# Track which ranks are installed, NOT a single bool -- so a later =3d after a =2d
+# in the same process can still install conv3d (idempotence-per-mode).
+_installed_ranks = set()   # subset of {2, 3}
+_orig_conv2d = None
+_orig_conv3d = None
+
+
+def _mode():
+    # "1"/"on"/"true" => both; "2d"/"3d" => that rank
+    return os.environ.get("ASFP8_CONV_IM2COL", "").lower()
+
+
+def _gate():
+    return _mode() in ("1", "on", "true", "2d", "3d")
+
+
+def _wanted_ranks():
+    m = _mode()
+    if m in ("1", "on", "true"):
+        return {2, 3}
+    if m == "2d":
+        return {2}
+    if m == "3d":
+        return {3}
+    return set()
+
+
+def _make_wrap(orig, rank):
+    """Module-level so fallback tests can build the wrapper closure without MPS/install()."""
+    def conv(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        try:
+            if weight.dim() - 2 == rank and _supported(x, weight, dilation, groups, x.dtype):
+                return conv_im2col(x, weight, bias, stride, padding, dilation, groups)
+        except Exception as e:
+            print(f"{TAG} conv{rank}d fell back ({e!r})")
+        return orig(x, weight, bias, stride, padding, dilation, groups)
+    return conv
+
+
+def install():
+    global _orig_conv2d, _orig_conv3d
+    import sys
+    if sys.platform != "darwin" or not _gate():
+        return
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        return
+    if _orig_conv2d is None:
+        _orig_conv2d, _orig_conv3d = F.conv2d, F.conv3d   # capture true originals once
+    want = _wanted_ranks()
+    if 2 in want and 2 not in _installed_ranks:
+        F.conv2d = _make_wrap(_orig_conv2d, 2)
+        _installed_ranks.add(2)
+    if 3 in want and 3 not in _installed_ranks:
+        F.conv3d = _make_wrap(_orig_conv3d, 3)
+        _installed_ranks.add(3)
+    print(f"{TAG} conv im2col+matmul2d active on MPS (ranks={sorted(_installed_ranks)}, "
+          f"tile={_TILE_BYTES // 1024**2}MB).")
