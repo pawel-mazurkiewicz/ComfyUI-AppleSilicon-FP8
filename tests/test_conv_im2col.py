@@ -130,3 +130,25 @@ def test_conv_alloc_smoke_nonpeak():
     full_im2col_bytes = (512 * 512) * (256 * 9) * 2       # 1.21 GB
     assert delta < budget, (delta, budget)
     assert delta < full_im2col_bytes, (delta, full_im2col_bytes)
+
+
+@requires_mps
+@pytest.mark.parametrize("D,H,W,Cin,Cout,bias", [(5, 32, 32, 16, 16, False),
+                                                 (4, 24, 24, 8, 12, True)])
+def test_conv3d_matches_reference(D, H, W, Cin, Cout, bias, monkeypatch):
+    import _patches.conv_im2col_mps as cm
+    from _patches.conv_im2col_mps import conv_im2col
+    torch.manual_seed(0)
+    x = torch.randn(1, Cin, D, H, W, device="mps", dtype=torch.float16)
+    w = torch.randn(Cout, Cin, 3, 3, 3, device="mps", dtype=torch.float16)
+    b = torch.randn(Cout, device="mps", dtype=torch.float16) if bias else None
+    ref = torch.nn.functional.conv3d(x.float(), w.float(),
+                                     b.float() if bias else None, padding=1)
+    # SPY: stock fallback must not be how this test passes.
+    def boom(*a, **k):
+        raise AssertionError("conv3d fell back to stock conv instead of running the kernel")
+    monkeypatch.setattr(cm, "_fallback_conv", boom, raising=True)
+    out = conv_im2col(x, w, b, stride=1, padding=1).float()
+    torch.mps.synchronize()
+    assert out.shape == ref.shape
+    assert (out - ref).abs().max().item() < 2e-1

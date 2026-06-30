@@ -87,3 +87,19 @@ Tests: `test_tile_buffer_capped` + `test_conv_alloc_smoke_nonpeak` -> 2 passed. 
 is deterministically <= 384 MB and tile_p < P (true tiling, not full 1.21 GB im2col); the
 non-peak alloc-smoke delta (0.63 GiB) stays well under the budget and under the full-im2col
 size.
+
+## Task B.6 — conv3d variant (firm win + SeedVR2 OOM target)
+
+conv3d correctness (`test_conv3d_matches_reference`, spy active): 2 passed, max|diff| < 2e-1.
+
+conv3d bench (M5 Max, fp16, 1x128x5x256x256, w=128x128x3x3x3, pad=1):
+```
+  correctness: max|diff|=0.1248 -> OK
+conv3d  im2col=43.517ms  stock=69.472ms  speedup=1.60x  current_alloc_after_ours=0.21GiB (NOT peak)
+```
+(re-run standalone: conv3d im2col=44.675ms stock=75.019ms speedup=1.68x)
+
+conv3d im2col is FASTER than stock conv3d (1.6-1.7x) and correct -> firm win confirmed.
+Because the 64x64 baseline GEMM already beats stock conv3d, Task B.3b (register-tiling)
+is NOT required. current_alloc 0.21 GiB (NOT a high-watermark; the A_tile cap is the
+deterministic proof, B.8 the definitive OOM check).

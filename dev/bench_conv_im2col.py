@@ -1,9 +1,14 @@
 # dev/bench_conv_im2col.py
+import os
+import sys
 import time
 
 import torch
 
-from _patches.conv_im2col_mps import conv_im2col
+# repo root (parent of dev/) on path so `_patches` imports when run as a script
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from _patches.conv_im2col_mps import conv_im2col  # noqa: E402
 
 
 def bench(fn, it=20, warmup=3):

@@ -102,9 +102,37 @@ kernel void gemm_nt_bias(
 }
 """
 
-# combined per-dtype source is assembled in _lib(); im2col_3d is appended in B.6.
-# Keep _ALL_SRC as the list of source fragments.
-_ALL_SRC = [_IM2COL_2D_SRC, _GEMM_SRC]
+_IM2COL_3D_SRC = r"""
+#include <metal_stdlib>
+using namespace metal;
+kernel void im2col_3d(
+    device const @T@* X     [[buffer(0)]],
+    device @T@*       Atile [[buffer(1)]],
+    device const int* PRM   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int Cin=PRM[1], D=PRM[2], H=PRM[3], W=PRM[4];
+    const int kd=PRM[5], kh=PRM[6], kw=PRM[7];
+    const int sD=PRM[8], sH=PRM[9], sW=PRM[10];
+    const int pD=PRM[11], pH=PRM[12], pW=PRM[13];
+    const int Dout=PRM[14], Hout=PRM[15], Wout=PRM[16];
+    const int K=PRM[17], p0=PRM[18], rows=PRM[19];
+    const uint total = uint(rows) * uint(K);
+    if (gid >= total) return;
+    const int r=int(gid)/K, kk=int(gid)%K, pix=p0+r;
+    const int ow=pix%Wout, oh=(pix/Wout)%Hout, od=(pix/(Wout*Hout))%Dout;
+    const int n=pix/(Wout*Hout*Dout);
+    const int kj=kk%kw, ki=(kk/kw)%kh, kt=(kk/(kw*kh))%kd, c=kk/(kd*kh*kw);
+    const int id_=od*sD+kt-pD, ih=oh*sH+ki-pH, iw=ow*sW+kj-pW;
+    @T@ v=@T@(0);
+    if (id_>=0 && id_<D && ih>=0 && ih<H && iw>=0 && iw<W)
+        v = X[((((ulong(n)*Cin + c)*D + id_)*H + ih)*W + iw)];
+    Atile[gid]=v;
+}
+"""
+
+# combined per-dtype source is assembled in _lib(). Keep _ALL_SRC as source fragments.
+_ALL_SRC = [_IM2COL_2D_SRC, _IM2COL_3D_SRC, _GEMM_SRC]
 
 
 def _src(dtype_key):
@@ -141,6 +169,24 @@ def _im2col_2d_tile(x, A_tile, kh, kw, s, p, Hout, Wout, p0, rows):
     total = rows * K
     threads, group = _grid1d(total)
     _lib(x.dtype).im2col_2d(x.contiguous(), A_tile, prm, threads=threads, group_size=group)
+
+
+def _out_dhw(D, H, W, kd, kh, kw, s, p):
+    Dout = (D + 2 * p[0] - kd) // s[0] + 1
+    Hout = (H + 2 * p[1] - kh) // s[1] + 1
+    Wout = (W + 2 * p[2] - kw) // s[2] + 1
+    return Dout, Hout, Wout
+
+
+def _im2col_3d_tile(x, A_tile, kd, kh, kw, s, p, Dout, Hout, Wout, p0, rows):
+    N, Cin, D, H, W = x.shape
+    K = Cin * kd * kh * kw
+    prm = torch.tensor([N, Cin, D, H, W, kd, kh, kw, s[0], s[1], s[2],
+                        p[0], p[1], p[2], Dout, Hout, Wout, K, p0, rows],
+                       dtype=torch.int32, device=x.device)
+    total = rows * K
+    threads, group = _grid1d(total)
+    _lib(x.dtype).im2col_3d(x.contiguous(), A_tile, prm, threads=threads, group_size=group)
 
 
 def _im2col_2d_full(x, kh, kw, s, p):
@@ -229,3 +275,26 @@ def _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
         _gemm_nt_bias(view, Wmat, bias, out=out_flat[p0:p0 + rows])
     # [P,Cout] -> [N,Hout,Wout,Cout] -> [N,Cout,Hout,Wout]
     return out_flat.reshape(N, Hout, Wout, Cout).permute(0, 3, 1, 2).contiguous()
+
+
+def _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
+    assert groups == 1 and weight.dim() == 5
+    s = (stride,) * 3 if isinstance(stride, int) else tuple(stride)
+    p = (padding,) * 3 if isinstance(padding, int) else tuple(padding)
+    dil = (dilation,) * 3 if isinstance(dilation, int) else tuple(dilation)
+    assert all(d == 1 for d in dil), "dilation!=1 not supported"
+    N, Cin, D, H, W = x.shape
+    Cout, _, kd, kh, kw = weight.shape
+    Dout, Hout, Wout = _out_dhw(D, H, W, kd, kh, kw, s, p)
+    P, K = N * Dout * Hout * Wout, Cin * kd * kh * kw
+    Wmat = weight.reshape(Cout, K).contiguous()
+    out_flat = torch.empty(P, Cout, device=x.device, dtype=x.dtype)
+    tile_p = max(1, min(P, _TILE_BYTES // (K * x.element_size())))
+    A_tile = torch.empty(tile_p, K, device=x.device, dtype=x.dtype)
+    for p0 in range(0, P, tile_p):
+        rows = min(tile_p, P - p0)
+        view = A_tile[:rows]
+        _im2col_3d_tile(x, view, kd, kh, kw, s, p, Dout, Hout, Wout, p0, rows)
+        _gemm_nt_bias(view, Wmat, bias, out=out_flat[p0:p0 + rows])
+    # [P,Cout] -> [N,Dout,Hout,Wout,Cout] -> [N,Cout,Dout,Hout,Wout]
+    return out_flat.reshape(N, Dout, Hout, Wout, Cout).permute(0, 4, 1, 2, 3).contiguous()
