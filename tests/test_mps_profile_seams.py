@@ -126,18 +126,29 @@ def test_install_wraps_activation_globals(monkeypatch):
     monkeypatch.setenv("ASFP8_PROFILE", "1")
     monkeypatch.setattr(mps_profile, "_installed", False)
 
-    orig_silu = F.silu
-    orig_gelu = F.gelu
-    orig_glu = F.glu
+    # install() globally rebinds the full set of profiled seams (matmul, linear,
+    # sdpa, conv2d/3d, layer_norm, rms_norm, bmm, silu/gelu/glu). Snapshot and
+    # restore *all* of them — restoring only the activations leaks Python timing
+    # wrappers onto torch.matmul/F.linear into later test files, which then makes
+    # torch.compile graph-break and fall back to the CPU C++ inductor backend.
+    _saved_torch = {name: getattr(torch, name) for name in ("matmul", "bmm")}
+    _f_names = [
+        "scaled_dot_product_attention", "linear", "conv2d", "conv3d",
+        "layer_norm", "silu", "gelu", "glu",
+    ]
+    if hasattr(F, "rms_norm"):
+        _f_names.append("rms_norm")
+    _saved_F = {name: getattr(F, name) for name in _f_names}
     try:
         mps_profile.install()
         assert getattr(F.silu, "_asfp8_timed", False), "F.silu not wrapped by install()"
         assert getattr(F.gelu, "_asfp8_timed", False), "F.gelu not wrapped by install()"
         assert getattr(F.glu, "_asfp8_timed", False), "F.glu not wrapped by install()"
     finally:
-        F.silu = orig_silu
-        F.gelu = orig_gelu
-        F.glu = orig_glu
+        for name, fn in _saved_torch.items():
+            setattr(torch, name, fn)
+        for name, fn in _saved_F.items():
+            setattr(F, name, fn)
         monkeypatch.setattr(mps_profile, "_installed", False)
 
 
