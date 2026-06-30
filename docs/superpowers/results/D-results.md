@@ -53,3 +53,39 @@ correctness: max|d|=0.03125   (== 1 bf16 ulp; allclose atol=2e-3 rtol=8e-3 PASS)
 separate=1.035ms fused=0.824ms speedup=1.26x
 ```
 Fused SiLU epilogue is 1.26x faster than (no-act kernel + torch.silu); no slowdown.
+
+## Phase B — fused SwiGLU / GEGLU gate
+
+### Single-pass double-GEMM kernel
+`int8_matmul_swiglu[_small]` runs `w8a8_gemm_compute` twice for the SAME output tile
+(B=Wg then B=Wu) into two int32 register accumulators (64 int32 total on the large config),
+then one combined gated store. The second GEMM's tile coords are asserted to match the first
+(review MAJOR #6): `if (!ok2 || sc2 != sc || mb2 != m_base || nb2 != n_base) return;`.
+GELU-tanh uses the same exp identity as Phase A (precise::tanh is low-accuracy).
+
+### Reference subtlety (correctness contract)
+The fused gate keeps `act(gate)` in fp32 registers and multiplies by `up` in fp32, rounding to
+bf16 ONCE — that single-rounding is the entire point of fusion. The honest reference therefore
+computes torch's INDEPENDENT fp32 activation * up in fp32, rounded once. A naive reference that
+rounds `act(gate)` to bf16 first (as unfused eager does) double-rounds and diverges by up to
+half-a-gate-ulp * |up| (observed max|d|=0.25-1.0 at large `up`) — that is not a kernel bug. The
+kernel matches the fp32-fused reference to ~1 bf16 ulp; near-zero gelu epsilon * large up is
+bounded by atol=2e-3. (B1b's non-scalar-scale path genuinely routes through the per-branch
+fallback, which DOES double-round, so B1b keeps the bf16-intermediate reference.)
+
+### B6 test run (ASFP8_INT8_EXT=1, real Metal kernel, spy guard active)
+`pytest -k swiglu` -> **13 passed**:
+- 12x `test_int8_swiglu_matches_reference` (silu/gelu_tanh x bias x (M,K) in {(1,2560),(512,2560),
+  (512,2576)}). M=1 hits `int8_matmul_swiglu_small`; K=2576 exercises the remainder-K path;
+  spy guard (`_orig_int8_linear` -> raise) proves the REAL fused gate kernel ran.
+- 1x `test_int8_swiglu_nonscalar_scale_falls_back_correctly` (per-channel scales route through the
+  per-branch path, BLOCKER #3).
+Full file: **26 passed** (includes Phase A 11 + bit-exact regression + install/fallback unit tests).
+
+### B7 benchmark (dev/bench_fused_swiglu.py, M=4096 K=1536 N=6144)
+```
+correctness: max|d|=6.404e-33   (fp32-fused reference; allclose atol=2e-3 rtol=8e-3 PASS)
+unfused=2.188ms fused=1.742ms speedup=1.26x
+```
+The single-pass double-GEMM gate is 1.26x faster than (2 fused-no-act kernels + torch.silu + mul);
+no slowdown -> the experimental-fallback decision branch (Open Q #4) is NOT triggered.

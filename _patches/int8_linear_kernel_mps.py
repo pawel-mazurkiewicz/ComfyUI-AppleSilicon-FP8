@@ -164,6 +164,54 @@ def _int8_linear_kernel(
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
 
+def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up=None,
+                        convrot=False, convrot_groupsize=256, act="silu"):
+    """Fused gated linear: H = act(x@w_gate^T + bias_gate) * (x@w_up^T + bias_up).
+
+    Uses the single-pass fused gate kernel only when both weight scales are scalar
+    (the row-scale precombine ws*x_scale[m] is only valid then); otherwise routes
+    through the per-branch _int8_linear_kernel path (which handles per-channel scales
+    and applies the activation itself). act in {"silu","gelu_tanh"} (no "none").
+    """
+    _act_code(act)  # validate (raises on typo)
+    if act == "none":
+        raise ValueError("_int8_swiglu_kernel requires a real gate activation, not 'none'")
+    if w_gate.shape != w_up.shape:
+        raise ValueError(
+            f"gate/up weights must match: {tuple(w_gate.shape)} vs {tuple(w_up.shape)}"
+        )
+
+    scalar_scales = (ws_gate.numel() == 1 and ws_up.numel() == 1)
+    fused_ok = (_kernel is not None and x.device.type == "mps" and w_gate.dtype == torch.int8
+                and w_up.dtype == torch.int8 and scalar_scales
+                and hasattr(_kernel, "i8_matmul2d_nt_swiglu"))
+    if not fused_ok:
+        # Per-branch fallback (kernel missing, off-MPS, non-int8, or per-channel scales —
+        # the row-scale precombine below is only valid for scalar weight scales).
+        g = _int8_linear_kernel(x, w_gate, ws_gate, bias_gate, torch.bfloat16,
+                                convrot, convrot_groupsize, act=act)  # activation applied here
+        u = _int8_linear_kernel(x, w_up, ws_up, bias_up, torch.bfloat16,
+                                convrot, convrot_groupsize, act="none")
+        return g * u
+
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+    if convrot:
+        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, convrot_groupsize)
+    shp = x.shape
+    x2 = x.reshape(-1, x.shape[-1])
+    x8, xs = quantize_int8_rowwise(x2)
+    xs = xs.reshape(-1).float()
+    rsg = (ws_gate.view(-1).float() * xs).contiguous()  # scalar * [M] -> [M] (valid: scalar_scales)
+    rsu = (ws_up.view(-1).float() * xs).contiguous()
+    bg = bias_gate.to(torch.bfloat16) if bias_gate is not None else None
+    bu = bias_up.to(torch.bfloat16) if bias_up is not None else None
+    out = _kernel.i8_matmul2d_nt_swiglu(x8.contiguous(), w_gate.contiguous(),
+            w_up.contiguous(), rsg, rsu, bg, bu, _act_code(act))
+    return out.reshape(*shp[:-1], w_gate.shape[0])
+
+
 def _try_int8_kernel_forward(self, input):
     """Return the layer output via the kernel W8A8 path, or None to fall back.
 

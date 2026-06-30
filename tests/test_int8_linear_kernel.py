@@ -187,3 +187,91 @@ def test_wrapper_rejects_unknown_act():
         patch._int8_linear_kernel(torch.randn(2, 4), torch.randint(-1, 2, (3, 4),
                                   dtype=torch.int8), torch.tensor([0.01]), None,
                                   torch.float32, False, 256, act="sillu")
+
+
+# tolerance: one bf16 ulp (rtol=8e-3) + atol=2e-3 near zero — see the point-activation
+# test rationale above and docs/superpowers/results/D-results.md. act=3 (gelu-erf) dropped.
+@requires_int8_ext
+@pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("M,K", [(1, 2560), (512, 2560), (512, 2576)])  # 2576 = remainder-K
+def test_int8_swiglu_matches_reference(M, K, bias, act):
+    """Fused gate == act(int8_linear(x,Wg)) * int8_linear(x,Wu)."""
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    from _patches.int8_ext import loader
+    from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
+    mod = loader.module()
+    assert mod is not None and hasattr(mod, "i8_matmul2d_nt_swiglu")
+    mod.warmup()
+    patch._kernel = mod
+    patch._orig_int8_linear = orig_int8_linear
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(5)
+    N = 1024
+    x  = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+    wg = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    wu = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    sg = (torch.rand(1, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
+    su = (torch.rand(1, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
+    bg = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+    bu = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+
+    lin_g = patch._int8_linear_kernel(x, wg, sg, bg, torch.bfloat16, False, 256, act="none")
+    lin_u = patch._int8_linear_kernel(x, wu, su, bu, torch.bfloat16, False, 256, act="none")
+    # The fused gate keeps act(gate) in fp32 registers and multiplies by up in fp32,
+    # rounding to bf16 ONCE (that single-rounding is the whole point of fusion). The
+    # reference must do the same: torch's INDEPENDENT fp32 activation (not the kernel's
+    # exp identity) * up in fp32, rounded once. A bf16-rounded intermediate gate would
+    # double-round and diverge by up to half-a-gate-ulp * |up| — that is not a kernel
+    # bug. The kernel matches this fp32-fused reference to ~1 bf16 ulp; near-zero gelu
+    # epsilon * large up is bounded by atol=2e-3. See docs/superpowers/results/D-results.md.
+    gfp = lin_g.float()
+    gate = torch.nn.functional.silu(gfp) if act == "silu" \
+           else torch.nn.functional.gelu(gfp, approximate="tanh")
+    ref = (gate * lin_u.float()).to(torch.bfloat16)
+
+    # Spy guard: prove the fused gated kernel ran, not the per-branch fallback.
+    def _boom(*a, **k):
+        raise AssertionError("SwiGLU fell back to _orig_int8_linear; fused gate did not run")
+    saved = patch._orig_int8_linear
+    patch._orig_int8_linear = _boom
+    try:
+        out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, bg, bu, False, 256, act=act)
+    finally:
+        patch._orig_int8_linear = saved
+    torch.mps.synchronize()
+    assert out.shape == ref.shape
+    assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
+        f"M={M} K={K} {act} bias={bias}: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
+
+
+@requires_int8_ext
+def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
+    """Length-N weight scales must route through the per-branch path, not the fused gate kernel."""
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    from _patches.int8_ext import loader
+    from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
+    mod = loader.module()
+    assert mod is not None
+    mod.warmup()
+    patch._kernel = mod
+    patch._orig_int8_linear = orig_int8_linear
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(7)
+    M, K, N = 64, 2560, 1024
+    x  = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+    wg = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    wu = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    sg = (torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)  # per-channel
+    su = (torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
+
+    lin_g = patch._int8_linear_kernel(x, wg, sg, None, torch.bfloat16, False, 256, act="none")
+    lin_u = patch._int8_linear_kernel(x, wu, su, None, torch.bfloat16, False, 256, act="none")
+    ref = torch.nn.functional.silu(lin_g) * lin_u
+    out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, False, 256, act="silu")
+    torch.mps.synchronize()
+    assert out.shape == ref.shape
+    assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
+        f"nonscalar: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
