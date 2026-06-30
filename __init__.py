@@ -28,7 +28,11 @@ Patches applied:
  16. strided FP8 ops -> CPU on MPS (global)        (NVFP4/MXFP8 quant+dequant: reshape/contiguous of fp8 crashes MPS)
  17. INT8 W8A8 via bit-exact Metal kernel on MPS   (opt-in ASFP8_INT8_EXT=1: int8 matmul ~1.75x over bf16,
                                                     bypasses per-step fp32 weight dequant/un-rotation; Cider-derived kernel)
+ 21. fused standalone RoPE on MPS                  (opt-in ASFP8_ROPE_FAST=1: comfy_kitchen apply_rope /
+                                                    apply_rope_split_half via ONE compile_shader kernel; ~6-17x/call
+                                                    over eager; fp32 math, no Metal-4.1/M5 requirement)
  (#15 fp8-native F.linear retired — wrong seam; the fp8-native win is patch #3's opt-in _scaled_mm fast path)
+ (#20 reserved for fp8-native matmul on a separate branch; ROPE uses #21 to avoid collision)
 
 See README.md for details. MIT licensed.
 """
@@ -44,7 +48,7 @@ if __spec__ is not None and __spec__.parent:
     # string and relative imports would fail.  Checking __spec__.parent is CPython-
     # guaranteed behaviour (see importlib docs) and avoids inspecting ImportError
     # message strings that are implementation details liable to change.
-    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, mlx_textgen, fp8_mps_strided, optrace, mps_profile
+    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, mlx_textgen, fp8_mps_strided, rope_fast_mps, optrace, mps_profile
 
     # Bisection switches (for debugging a regression to a single patch):
     #   ASFP8_ENABLE_ONLY=psutil_vmstat,comfykitchen_fp8   install ONLY these (by module name)
@@ -56,7 +60,7 @@ if __spec__ is not None and __spec__.parent:
 
     # optrace installs LAST (opt-in ASFP8_TRACE_OPS=1) so it sees every matmul the
     # model dispatches, on top of all the seams the other patches wrapped.
-    for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, mlx_textgen, optrace, mps_profile):
+    for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, mlx_textgen, rope_fast_mps, optrace, mps_profile):
         _short = _patch.__name__.rsplit(".", 1)[-1]
         if (_only and _short not in _only) or _short in _disabled:
             print(f"[AppleSilicon-FP8] skipping {_short} (ASFP8_ENABLE_ONLY/ASFP8_DISABLE)")
