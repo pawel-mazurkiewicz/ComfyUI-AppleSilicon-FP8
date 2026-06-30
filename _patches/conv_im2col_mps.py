@@ -301,12 +301,21 @@ def _gemm_nt_bias_scatter(A, Bw, bias, out, p0, Cout, Dout, Hout, Wout):
 def _supported(x, weight, dilation, groups, dtype):
     dil = dilation if isinstance(dilation, tuple) else (dilation,)
     return (x.device.type == "mps" and weight.device.type == "mps"
-            and dtype in _DT and groups == 1 and all(d == 1 for d in dil))
+            and dtype in _DT and weight.dtype == dtype
+            and groups == 1 and all(d == 1 for d in dil))
 
 
 def _fallback_conv(x, weight, bias, stride, padding, dilation, groups):
-    """Single named seam for the stock-conv fallback (monkeypatched by the spy test)."""
-    fn = F.conv2d if weight.dim() == 4 else F.conv3d
+    """Single named seam for the stock-conv fallback (monkeypatched by the spy test).
+
+    MUST call the captured true originals (_orig_conv2d/_orig_conv3d) when install() has
+    replaced F.conv2d/F.conv3d with our wrappers -- otherwise the fallback re-enters the
+    wrapper -> conv_im2col -> (kernel raises) -> _fallback_conv -> wrapper -> ... infinite
+    recursion, breaking the "never fatal" contract. Pre-install, F.conv2d IS the original."""
+    if weight.dim() == 4:
+        fn = _orig_conv2d if _orig_conv2d is not None else F.conv2d
+    else:
+        fn = _orig_conv3d if _orig_conv3d is not None else F.conv3d
     return fn(x, weight, bias, stride, padding, dilation, groups)
 
 
