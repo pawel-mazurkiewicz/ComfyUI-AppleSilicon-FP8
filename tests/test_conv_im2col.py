@@ -64,3 +64,29 @@ def test_gemm_nt_bias_matches_reference(M, K, N, bias, monkeypatch):
     assert out.shape == (M, N)
     # fp16 operands, fp32 accumulate: error is operand rounding only
     assert (out - ref).abs().max().item() < 2e-1
+
+
+@requires_mps
+@pytest.mark.parametrize("H,W,Cin,Cout,s,p,bias", [(64, 64, 32, 32, 1, 1, False),
+                                                   (128, 128, 64, 128, 1, 1, True),
+                                                   (65, 63, 16, 24, 2, 1, True)])
+def test_conv2d_matches_reference(H, W, Cin, Cout, s, p, bias, monkeypatch):
+    import _patches.conv_im2col_mps as cm
+    from _patches.conv_im2col_mps import conv_im2col
+    torch.manual_seed(0)
+    x = torch.randn(1, Cin, H, W, device="mps", dtype=torch.float16)
+    w = torch.randn(Cout, Cin, 3, 3, device="mps", dtype=torch.float16)
+    b = torch.randn(Cout, device="mps", dtype=torch.float16) if bias else None
+    ref = torch.nn.functional.conv2d(x.float(), w.float(),
+                                     b.float() if bias else None, stride=s, padding=p)
+    stock = torch.nn.functional.conv2d(x, w, b, stride=s, padding=p).float()  # capture BEFORE spy
+    # SPY: make the in-module stock fallback explode so a silent fallback fails the test.
+    def boom(*a, **k):
+        raise AssertionError("conv_im2col fell back to stock conv instead of running the kernel")
+    monkeypatch.setattr(cm, "_fallback_conv", boom, raising=True)
+    out = conv_im2col(x, w, b, stride=s, padding=p).float()
+    torch.mps.synchronize()
+    assert out.shape == ref.shape
+    assert (out - ref).abs().max().item() < 2e-1
+    # must be no worse than stock fp16 conv
+    assert (out - ref).abs().max().item() <= (stock - ref).abs().max().item() + 1e-2
