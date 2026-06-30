@@ -6,9 +6,12 @@ Bandwidth/launch win: replaces ~4-5 separate MPS elementwise/reduction launches 
 DRAM round-trip of the activation) with one kernel that reads x+residual once and writes out once,
 fp32 accumulation throughout. One threadgroup per row, 128 threads, fp32 simd_sum reduction for
 mean(x^2). The grid is z-tiled (row = z*ny + y, early-return) so dispatch is correct regardless of
-any per-dimension threadgroup cap. 64-bit element offsets + fp32 math keep it correct at every row
-count, so when installed it SUPERSEDES rmsnorm_mps_large.py's >2^21-row correctness fallback (which
-only fixed the bare norm and reduced over all normalized dims).
+any per-dimension threadgroup cap. Being a SEPARATE fp32-reduction kernel with correct Metal
+dispatch is what keeps it correct in the >2^21-row regime where stock PyTorch MPS rms_norm returns
+garbage, so when installed it SUPERSEDES rmsnorm_mps_large.py's >2^21-row correctness fallback (which
+only fixed the bare norm and reduced over all normalized dims). The 64-bit ulong element offsets are
+additional defense-in-depth that prevents int32 element-offset overflow on truly enormous tensors
+(rows*D > 2^31, e.g. >2^23 rows at D=256) — valid, but not the primary fix for the 2^21-row bug.
 
 Opt-in: ASFP8_FUSED_NORM=1. Never fatal; falls back to an exact, GROUP-AWARE torch composition on
 any error, off-MPS, unsupported dtype, optional-tensor shape/device/dtype mismatch, or indivisible
@@ -67,7 +70,8 @@ kernel void fused_rmsnorm_modulate(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sgid == 0) {
         float v = (lane < NSIMD) ? part[lane] : 0.0f;
-        part[0] = simd_sum(v);
+        float total = simd_sum(v);
+        if (lane == 0) part[0] = total;   // single writer: avoid concurrent-write UB
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = rsqrt(part[0] / float(D) + eps);
@@ -247,13 +251,16 @@ _installed = False
 
 
 def _rms_norm(input, normalized_shape, weight=None, eps=None):
+    global _last_backend
     if input.device.type != "mps" or input.dtype not in _MSL_T:
+        _last_backend = "fallback"   # outer bypass: don't let a stale "kernel" spy false-positive
         return _orig_rms_norm(input, normalized_shape, weight, eps)
     # Codex BLOCKER #2: reduce over ALL normalized dims -> flatten last len(normalized_shape) dims.
     D = 1
     for d in normalized_shape:
         D *= int(d)
     if D <= 0 or input.numel() % D != 0:
+        _last_backend = "fallback"   # outer bypass (indivisible/empty D): same spy hygiene
         return _orig_rms_norm(input, normalized_shape, weight, eps)
     e = eps if eps is not None else torch.finfo(input.dtype).eps
     x2d = input.contiguous().view(-1, D)

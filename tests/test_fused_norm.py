@@ -228,3 +228,39 @@ def test_cpu_falls_back():
     ref = m._reference(x, w, 1e-6, None, None, None)
     assert m._last_backend == "fallback"
     assert torch.allclose(out, ref, atol=1e-6)
+
+
+@mps
+@pytest.mark.parametrize("D", [17, 31])
+def test_direct_kernel_D_not_multiple_of_32(D):
+    """Verify #4 MINOR: exercise the kernel's fp32 simd_sum reduction at D < 32 / not a multiple
+    of 32 against an INDEPENDENT hand-computed fp32 oracle (no m._reference) so a subtle bug in the
+    module's own reference could not mask a partial-simdgroup reduction error."""
+    torch.manual_seed(D)
+    rows = 257                                            # not a multiple of TG either
+    x = torch.randn(rows, D, device="mps", dtype=torch.float16)
+    w = torch.randn(D, device="mps", dtype=torch.float16)
+    out = fused_rmsnorm_modulate(x, w, 1e-6)
+    torch.mps.synchronize()
+    assert m._last_backend == "kernel"
+    # hand-computed fp32 oracle: rmsnorm(x) * weight, eps inside sqrt (LLaMA formulation)
+    xf = x.float()
+    oracle = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + 1e-6)) * w.float()
+    assert torch.allclose(out.float(), oracle, atol=5e-2, rtol=5e-2)
+
+
+def test_reroute_bypass_sets_fallback_backend():
+    """Verify #3 MAJOR: when the F.rms_norm reroute bypasses the kernel on an outer guard (here a
+    non-MPS device), it must set _last_backend = 'fallback' so a stale 'kernel' value from a previous
+    successful call cannot create a false-positive kernel-path test. Uses a CPU tensor with a VALID
+    normalized_shape so the bypass reaches the real stock rms_norm (which then succeeds)."""
+    m.install_for_test()
+    try:
+        m._last_backend = "kernel"                        # simulate a stale spy from a prior kernel run
+        x = torch.randn(4, 16)                            # CPU tensor -> device.type != "mps" outer bypass
+        w = torch.randn(16)
+        out = torch.nn.functional.rms_norm(x, (16,), w, 1e-6)
+        assert m._last_backend == "fallback", "outer reroute bypass must reset the spy to 'fallback'"
+        assert out.shape == x.shape
+    finally:
+        m.uninstall_for_test()

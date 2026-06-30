@@ -28,6 +28,14 @@ Task 0 probes done.
   real 64-bit-indexed kernel handled the int32-offset overflow regime.
 - ruff check: All checks passed.
 
+Root-cause note (corrects an earlier overclaim): the kernel stays correct past ~2^21 rows
+PRIMARILY because it is a separate fp32-reduction implementation with correct Metal dispatch
+(z-tiled grid, fp32 simd_sum), NOT primarily because of the 64-bit ulong element offsets. The
+stock PyTorch MPS rms_norm bug manifests at ~2^21 rows (rows*D ≈ 537M at D=256, still well within
+int32 element range), so it is not an offset-overflow bug. The ulong offsets are valid
+defense-in-depth that only become load-bearing for genuinely enormous tensors (rows*D > 2^31,
+≈ >2^23 rows at D=256) — exactly what `test_overflow_rows_2pow24_kernel_path` exercises.
+
 Deviation from plan: `test_bad_optional_shape_falls_back` — the plan's verbatim body called the
 wrapper with a genuinely-malformed weight/residual then asserted `_last_backend == "fallback"`,
 but the torch fallback legitimately broadcast-raises on the invalid tensor before the assert runs.
