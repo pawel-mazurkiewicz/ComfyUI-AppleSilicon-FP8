@@ -33,10 +33,10 @@ Patches applied:
                                                    supersedes patch #4's >2^21-row correctness fallback)
  19. conv im2col+matmul2d on MPS (ASFP8_CONV_IM2COL, conv3d DEFAULT ON / =off to disable: VAE conv via
                                                    tensor units, ~2.7x vs stock conv3d, A_tile capped at ASFP8_CONV_TILE_MB)
- 20. fp8-native Linear via Metal matmul2d on MPS  (opt-in ASFP8_FP8_NATIVE=1, DEFAULT OFF until the
-                                                    real-model seam probe passes: half act x fp8 e4m3
-                                                    weight on tensor units; bypasses per-step fp8->bf16
-                                                    weight decode + _scaled_mm)
+ 20. fp8-native Linear via Metal matmul2d on MPS  (DEFAULT ON, seam confirmed; ASFP8_FP8_NATIVE=off to
+                                                    disable: half act x fp8 e4m3 weight on tensor units;
+                                                    bypasses per-step fp8->bf16 decode + _scaled_mm. Only
+                                                    fires on min_dim>=8192 layers, so inert on Ideogram-4)
  21. fused standalone RoPE on MPS                  (opt-in ASFP8_ROPE_FAST=1: comfy_kitchen apply_rope /
                                                     apply_rope_split_half via ONE compile_shader kernel; ~6-17x/call
                                                     over eager; fp32 math, no Metal-4.1/M5 requirement)

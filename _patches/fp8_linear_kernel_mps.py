@@ -9,7 +9,9 @@ weight scale (scalar OR per-channel [N]) + bias in fp32, returns bf16. Semantica
 is `input.float() @ dequant_fp8(weight).t() * scale (+bias)` -- CLOSER to unquantized-act x
 dequantized-fp8-weight than the current lossy path (a semantic change, not equivalence).
 
-Opt-in: ASFP8_FP8_NATIVE=1, DEFAULT OFF. Never-fatal: any miss falls back to comfy's
+Default ON (seam confirmed by the live Flux-2 probe); ASFP8_FP8_NATIVE=off disables.
+Note: only fires on large layers (min_dim>=8192), so it is inert on smaller DiTs (e.g. Ideogram-4
+hidden 4096). Never-fatal: any miss falls back to comfy's
 original forward. The real-model seam/scale/range are gated on Task -1 (see plan).
 """
 import os
@@ -178,8 +180,8 @@ def install():
         return
     if sys.platform != "darwin":
         return
-    if os.environ.get("ASFP8_FP8_NATIVE") != "1":
-        return
+    if os.environ.get("ASFP8_FP8_NATIVE", "1").strip().lower() in ("0", "off", "false", "no"):
+        return  # DEFAULT ON (seam confirmed via live Flux-2 probe); ASFP8_FP8_NATIVE=off disables
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
 
