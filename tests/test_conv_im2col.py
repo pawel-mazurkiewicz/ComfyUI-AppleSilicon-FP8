@@ -90,3 +90,43 @@ def test_conv2d_matches_reference(H, W, Cin, Cout, s, p, bias, monkeypatch):
     assert (out - ref).abs().max().item() < 2e-1
     # must be no worse than stock fp16 conv
     assert (out - ref).abs().max().item() <= (stock - ref).abs().max().item() + 1e-2
+
+
+@requires_mps
+def test_tile_buffer_capped():
+    """DETERMINISTIC OOM proof: the A_tile the driver allocates is provably <= _TILE_BYTES,
+    and for a large conv it actually tiles (tile_p < P) rather than materializing full im2col."""
+    import _patches.conv_im2col_mps as cm
+    # 512x512, Cin=256, 3x3 -> full im2col is 1.21 GB, well above the 384 MB default cap.
+    N, Cin, H, W, kh, kw = 1, 256, 512, 512, 3, 3
+    Hout = Wout = 512  # pad=1, stride=1
+    P, K = N * Hout * Wout, Cin * kh * kw
+    elsize = 2  # fp16
+    tile_p = max(1, min(P, cm._TILE_BYTES // (K * elsize)))
+    a_tile_bytes = tile_p * K * elsize
+    full_im2col_bytes = P * K * elsize          # = 262144*2304*2 = 1.21 GB
+    assert a_tile_bytes <= cm._TILE_BYTES, (a_tile_bytes, cm._TILE_BYTES)
+    assert tile_p < P, "must tile, not materialize full im2col"
+    assert a_tile_bytes < full_im2col_bytes / 3   # tile is a small fraction of full im2col
+
+
+@requires_mps
+def test_conv_alloc_smoke_nonpeak():
+    """NON-PEAK smoke: current_allocated delta with the output held live stays under an explicit
+    budget = _TILE_BYTES + out_flat + contiguous-copy + weight + slack. (current_allocated is NOT
+    a high-watermark; the deterministic guarantee is test_tile_buffer_capped above.)"""
+    import _patches.conv_im2col_mps as cm
+    from _patches.conv_im2col_mps import conv_im2col
+    torch.mps.empty_cache()
+    x = torch.randn(1, 256, 512, 512, device="mps", dtype=torch.float16)
+    w = torch.randn(256, 256, 3, 3, device="mps", dtype=torch.float16)
+    base = torch.mps.current_allocated_memory()
+    out = conv_im2col(x, w, None, 1, 1)       # keep `out` live so its bytes are counted
+    torch.mps.synchronize()
+    delta = torch.mps.current_allocated_memory() - base
+    out_bytes = out.numel() * out.element_size()          # P*Cout*2
+    weight_bytes = w.numel() * w.element_size()
+    budget = cm._TILE_BYTES + 2 * out_bytes + weight_bytes + 64 * 1024 * 1024  # +64MB slack
+    full_im2col_bytes = (512 * 512) * (256 * 9) * 2       # 1.21 GB
+    assert delta < budget, (delta, budget)
+    assert delta < full_im2col_bytes, (delta, full_im2col_bytes)

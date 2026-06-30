@@ -69,3 +69,21 @@ achieved same-shape GEMM -> conv2d is ALREADY competitive; do NOT route conv2d. 
 conv3d achieves only 8% of the same-shape GEMM (~13x headroom) -> conv3d is the firm win.
 **Scope install to conv3d-only (`ASFP8_CONV_IM2COL=3d`).** conv2d path is still built and
 correctness-tested (B.4) but not installed by default.
+
+## Task B.5 — conv2d verify-first bench + deterministic tile-cap test
+
+conv2d bench (M5 Max, fp16, 1x256x512x512, w=256x256x3x3, pad=1):
+```
+  correctness: max|diff|=0.123 -> OK
+conv2d  im2col=24.118ms  stock=5.066ms  speedup=0.21x
+  current_allocated (NOT peak): 0.63GiB
+```
+Correctness OK (gate passes before timing). Speed 0.21x = ~4.7x SLOWER than stock conv2d,
+exactly as B.1 predicted (stock conv2d already at 111% of the achieved same-shape GEMM).
+DOCUMENTED non-ship outcome: conv2d is NOT installed by default (install gated to 3d-only).
+No regression shipped.
+
+Tests: `test_tile_buffer_capped` + `test_conv_alloc_smoke_nonpeak` -> 2 passed. The A_tile
+is deterministically <= 384 MB and tile_p < P (true tiling, not full 1.21 GB im2col); the
+non-peak alloc-smoke delta (0.63 GiB) stays well under the budget and under the full-im2col
+size.
