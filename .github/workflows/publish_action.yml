@@ -1,15 +1,17 @@
 name: Publish to Comfy Registry
 
-# Publishes the node to https://registry.comfy.org (which ComfyUI-Manager reads)
-# whenever the version in pyproject.toml changes on the default branch.
+# On every version change in pyproject.toml on main, this both:
+#   1. publishes the node to https://registry.comfy.org (which ComfyUI-Manager reads), and
+#   2. cuts a matching GitHub release (tag v<version>) with a clean drop-in zip attached.
+#
+# It's keyed on the tag: if v<version> already exists, the whole run is a no-op, so a
+# pyproject.toml edit that doesn't bump the version won't republish or re-release.
 #
 # One-time setup:
-#   1. Create a publisher at https://registry.comfy.org and note your PublisherId
-#      (already set in pyproject.toml [tool.comfy].PublisherId).
-#   2. Create an API key at https://registry.comfy.org/nodes and add it to this repo
-#      as a secret named REGISTRY_ACCESS_TOKEN
-#      (Settings -> Secrets and variables -> Actions -> New repository secret).
-# After that, bump [project].version in pyproject.toml and push to main to publish.
+#   1. Create a publisher at https://registry.comfy.org (PublisherId is in pyproject [tool.comfy]).
+#   2. Create an API key at https://registry.comfy.org/nodes and add it as a repo secret
+#      named REGISTRY_ACCESS_TOKEN (Settings -> Secrets and variables -> Actions).
+# After that: bump [project].version in pyproject.toml, push to main, done.
 
 on:
   push:
@@ -28,29 +30,73 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-node:
-    name: Publish custom node to registry
+  publish:
+    name: Publish to registry + cut GitHub release
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'pawel-mazurkiewicz' }}
+    permissions:
+      contents: write   # needed to create the tag + GitHub release
     steps:
       - name: Check out code
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # Publish via comfy-cli directly rather than Comfy-Org/publish-node-action:
-      # that wrapper is just `pip install comfy-cli; comfy env; comfy node publish`,
-      # but it hasn't been updated since 2025-05 and its release tag runs a comfy-cli
-      # flag (`--yes`) that current comfy-cli rejects. Pinning the CLI ourselves keeps
-      # this reproducible and immune to the wrapper's drift. Bump the pin deliberately.
+
+      - name: Read version, skip if already released
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V already released — nothing to do."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$V not released yet — will publish + release."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Publish via comfy-cli directly (pinned) rather than a third-party wrapper action,
+      # so nothing drifts out from under us. Bump the pin deliberately.
       - name: Install comfy-cli
+        if: steps.ver.outputs.released == 'false'
         run: pip install "comfy-cli==1.12.0"
+
       - name: Publish to Comfy Registry
+        if: steps.ver.outputs.released == 'false'
         env:
           COMFY_REGISTRY_TOKEN: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
         run: |
           comfy --skip-prompt --no-enable-telemetry env
           comfy node publish --token "$COMFY_REGISTRY_TOKEN"
+
+      # Clean drop-in for custom_nodes/: runtime files only (mirrors .comfyignore).
+      - name: Build install zip
+        if: steps.ver.outputs.released == 'false'
+        run: |
+          NODE=ComfyUI-AppleSilicon-FP8
+          V="${{ steps.ver.outputs.version }}"
+          STAGE="dist/$NODE"
+          mkdir -p "$STAGE"
+          cp -R _patches __init__.py prestartup_script.py pyproject.toml README.md LICENSE requirements.txt icon.svg "$STAGE/"
+          find "$STAGE" -type d \( -name '__pycache__' -o -name '.omc' -o -name '.serena' \) -prune -exec rm -rf {} + || true
+          find "$STAGE" -name '.DS_Store' -delete || true
+          ( cd dist && zip -rq "$NODE-$V.zip" "$NODE" )
+
+      - name: Cut GitHub release
+        if: steps.ver.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          gh release create "v$V" \
+            --target "${{ github.sha }}" \
+            --title "v$V — Apple Silicon FP8/INT8/INT4 acceleration" \
+            --generate-notes \
+            "dist/ComfyUI-AppleSilicon-FP8-$V.zip#ComfyUI-AppleSilicon-FP8-$V.zip (drop-in for custom_nodes/)"
