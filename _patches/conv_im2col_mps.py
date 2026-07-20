@@ -23,7 +23,16 @@ import torch.nn.functional as F
 
 TAG = "[AppleSilicon-FP8/conv]"
 
-_TILE_BYTES = int(os.environ.get("ASFP8_CONV_TILE_MB", "384")) * 1024 * 1024
+def _tile_mb():
+    # Parsed at import time; a malformed value must NOT crash the whole node before the
+    # per-patch install guards run — fall back to the 384 MB default.
+    try:
+        return max(1, int(os.environ.get("ASFP8_CONV_TILE_MB", "384")))
+    except (TypeError, ValueError):
+        return 384
+
+
+_TILE_BYTES = _tile_mb() * 1024 * 1024
 
 # B.0 (dev/probe_matmul2d_dtype_scatter.py) recorded PASS for all three operand dtypes
 # with an fp32 cooperative-tensor accumulator (matching the handed-down G2 result).

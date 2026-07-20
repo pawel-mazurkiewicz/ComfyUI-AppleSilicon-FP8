@@ -68,6 +68,8 @@ _warned = False
 # Per-call backend trace (MAJOR 5). Each kernel/fallback decision appends one event.
 # Tests inspect the tail to assert BOTH calls of a pair wrapper took the intended path.
 _backend_events: list[tuple] = []   # (fn_name, "kernel"|"fallback", tuple(shape))
+_MAX_EVENTS = 4096                   # bound the spy trace: default-on RoPE fires every block,
+                                     # so an unbounded list would leak across a long session
 
 # captured originals (set in install()/install_for_test()); fallback uses these.
 _orig: dict = {}                    # name -> original eager fn
@@ -75,6 +77,8 @@ _orig: dict = {}                    # name -> original eager fn
 
 def _record(name, backend, shape):
     _backend_events.append((name, backend, tuple(shape)))
+    if len(_backend_events) > _MAX_EVENTS:
+        del _backend_events[:-_MAX_EVENTS // 2]   # keep the most-recent half (tests read the tail)
 
 
 def _last_backend():

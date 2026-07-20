@@ -62,7 +62,17 @@ if __spec__ is not None and __spec__.parent:
     # string and relative imports would fail.  Checking __spec__.parent is CPython-
     # guaranteed behaviour (see importlib docs) and avoids inspecting ImportError
     # message strings that are implementation details liable to change.
-    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, int4_linear_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, fp8_mps_strided, rope_fast_mps, probe_runtime, optrace, mps_profile, fused_norm_mps
+    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, fp8_mps_strided, rope_fast_mps, probe_runtime, optrace, mps_profile, fused_norm_mps
+
+    # int4_linear_mps is an optional / in-progress patch that is not present in every
+    # checkout; import it defensively so a missing module never breaks the whole node at
+    # startup (ImportError would otherwise abort loading before any patch installs). It
+    # stays inert when absent and installs normally when the module is present.
+    try:
+        from ._patches import int4_linear_mps
+    except Exception as _e:
+        int4_linear_mps = None
+        print(f"[AppleSilicon-FP8] int4_linear_mps not present ({_e}); skipping.", flush=True)
 
     # Bisection switches (for debugging a regression to a single patch):
     #   ASFP8_ENABLE_ONLY=psutil_vmstat,comfykitchen_fp8   install ONLY these (by module name)
@@ -84,6 +94,8 @@ if __spec__ is not None and __spec__.parent:
     # optrace installs LAST (opt-in ASFP8_TRACE_OPS=1) so it sees every matmul the
     # model dispatches, on top of all the seams the other patches wrapped.
     for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, fused_norm_mps, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, int4_linear_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, rope_fast_mps, probe_runtime, optrace, mps_profile):
+        if _patch is None:   # optional patch (e.g. int4_linear_mps) absent from this checkout
+            continue
         _short = _patch.__name__.rsplit(".", 1)[-1]
         if (_only and _short not in _only) or _short in _disabled:
             print(f"[AppleSilicon-FP8] skipping {_short} (ASFP8_ENABLE_ONLY/ASFP8_DISABLE)")
