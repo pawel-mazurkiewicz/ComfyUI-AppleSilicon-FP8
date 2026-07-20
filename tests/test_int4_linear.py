@@ -72,8 +72,12 @@ def test_w4a16_bias_and_3d_input():
 
 def _kernel_or_skip():
     import os
-    os.environ.setdefault("ASFP8_INT4_EXT", "1")
+    os.environ["ASFP8_INT4_EXT"] = "1"
     from _patches.int4_ext import loader
+    # Earlier default-off W4A16 tests call loader.module() and permanently cache None;
+    # clear that cache so the W4A8 build is actually attempted (and tested) on capable HW.
+    loader._tried = False
+    loader._mod = None
     mod = loader.module()
     if mod is None:
         pytest.skip("int4 Metal extension unavailable (build failed or no toolchain)")

@@ -321,7 +321,10 @@ torch::Tensor i8i4_linear_fused_nt(torch::Tensor a_i8, torch::Tensor w4,
                 threadsPerThreadgroup:MTLSizeMake(NSG * 32, 1, 1)];
         }
     });
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
+    // Do NOT COMMIT_AND_WAIT here (mirrors int8_gemm.mm): the kernel is encoded on
+    // torch's MPS stream, so ordering is preserved on the same command buffer and torch
+    // commits it naturally. A per-Linear commit+wait serializes the pipeline and kills
+    // async overlap (measured slowdown on int8). The result syncs when the caller reads C.
     return C;
 }
 

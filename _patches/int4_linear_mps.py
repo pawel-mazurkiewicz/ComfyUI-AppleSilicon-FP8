@@ -54,6 +54,11 @@ def _load_kernel():
     try:
         from .int4_ext import loader
         _kernel = loader.module()
+        if _kernel is not None:
+            # Force the Metal 4.1 / int4b shader to compile NOW so an unsupported
+            # GPU/SDK raises here (caught -> W4A16 fallback) instead of aborting a
+            # render at the first kernel dispatch.
+            _kernel.warmup()
     except Exception as e:
         print(f"{TAG} int4 kernel unavailable ({e!r}); using W4A16 fast path.")
         _kernel = None
@@ -66,7 +71,7 @@ def _w4a8_kernel_linear(x_rot_2d, qweight, wscales, bias, kernel):
     absmax = x_rot_2d.float().abs().amax(dim=-1).clamp(min=1e-10)
     x_scale = absmax / 127.0
     qx = torch.round(x_rot_2d.float() / x_scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
-    b = bias.to(torch.bfloat16).contiguous() if bias is not None else None
+    b = bias.to(device=x_rot_2d.device, dtype=torch.bfloat16).contiguous() if bias is not None else None
     y = kernel.i8i4_linear_fused_nt(
         qx.contiguous(), qweight.contiguous(),
         x_scale.contiguous(), wscales.float().contiguous(), b,
@@ -90,12 +95,16 @@ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
 
     kernel = _load_kernel()
     if kernel is not None:
-        y = _w4a8_kernel_linear(x_rot, qweight, wscales, bias, kernel)
-        return y.reshape(*orig_shape[:-1], qweight.shape[0])
+        try:
+            y = _w4a8_kernel_linear(x_rot, qweight, wscales, bias, kernel)
+            return y.reshape(*orig_shape[:-1], qweight.shape[0])
+        except Exception as e:
+            # Never abort a render on a kernel hiccup — drop to the W4A16 unpack path.
+            print(f"{TAG} W4A8 kernel call failed ({e!r}); falling back to W4A16.")
 
     w = _unpack_int4_signed_fast(qweight, x2d.dtype)
     w = w * wscales.to(device=w.device, dtype=x2d.dtype).reshape(-1, 1)
-    b = bias.to(dtype=x2d.dtype) if bias is not None else None
+    b = bias.to(device=x2d.device, dtype=x2d.dtype) if bias is not None else None
     y = torch.nn.functional.linear(x_rot, w, b)
     return y.reshape(*orig_shape[:-1], qweight.shape[0])
 
