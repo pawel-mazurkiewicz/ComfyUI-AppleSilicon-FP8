@@ -8,14 +8,14 @@ out once, fp32 math in registers, store in the input dtype. freqs_cis is the pre
 matrix per (position, pair) -- NO complex multiply, NO cos/sin computed in-kernel.
 
 Pure elementwise compile_shader -> works on Apple Silicon M1+ (torch>=2.5); NOT gated on Metal
-4.1 / M5. Opt-in ASFP8_ROPE_FAST=1 (default OFF). Never fatal: any compile/shape/dtype/convention
+4.1 / M5. DEFAULT ON, gated on compile_shader (ASFP8_ROPE_FAST=off disables); the #21b comfy-func
+retarget is opt-in via ASFP8_ROPE_COMFY_RETARGET=1. Never fatal: any compile/shape/dtype/convention
 mismatch falls back to the captured original eager apply_rope*. Per-call backend trace in
 _backend_events records (fn_name, "kernel"|"fallback", shape) for the spy tests. Patches the four
 comfy_kitchen.backends.eager attributes the registry reads via getattr() on every dispatch, and --
 as defence-in-depth -- the same four names on comfy_kitchen.backends.eager.rope.
 Scope: 4-D [B,H,L,D], fp32 freqs_cis table, batch/head-broadcast table. Anything else -> fallback."""
 from __future__ import annotations
-import os
 import torch
 
 TAG = "[AppleSilicon-FP8/rope-fast]"
@@ -436,7 +436,10 @@ def _do_install():
 
 
 def install():
-    if os.environ.get("ASFP8_ROPE_FAST") != "1":   # default OFF
+    # Patch #21 (standalone fused RoPE kernel) is DEFAULT ON, gated on compile_shader
+    # (Tier A: fp32 math, no Metal-4.1/M5 needed). ASFP8_ROPE_FAST=off disables; =1 forces on.
+    from . import _caps
+    if not _caps.resolve("ASFP8_ROPE_FAST", default_on=True, cap=_caps.has_compile_shader):
         return
     mps = getattr(torch.backends, "mps", None)
     if mps is None or not mps.is_available() or not hasattr(torch.mps, "compile_shader"):
@@ -452,16 +455,20 @@ def install():
             _do_install()
         except Exception as e:                 # never fatal
             print(f"{TAG} eager install failed ({e}); leaving eager rope untouched.", flush=True)
-    # Retarget the REAL comfy rope functions the live models call (patch #21b). Independent of
-    # comfy_kitchen; never fatal.
-    try:
-        _install_comfy()
-    except Exception as e:
-        print(f"{TAG} comfy retarget failed ({e}); leaving comfy rope untouched.", flush=True)
+    # Patch #21b: retarget the REAL comfy rope functions the live models call
+    # (comfy.ldm.flux / llama apply_rope). Higher-risk — it patches live model code — so it
+    # stays OPT-IN behind its own flag (default OFF) until it has broader cross-model
+    # validation. ASFP8_ROPE_COMFY_RETARGET=1 turns it on. Independent of comfy_kitchen; never fatal.
+    if _caps.resolve("ASFP8_ROPE_COMFY_RETARGET", default_on=False, cap=_caps.has_compile_shader):
+        try:
+            _install_comfy()
+        except Exception as e:
+            print(f"{TAG} comfy retarget failed ({e}); leaving comfy rope untouched.", flush=True)
     targeted = sorted(_orig_comfy.keys())
-    print(f"{TAG} fused RoPE active on MPS (eager apply_rope/apply_rope_split_half + comfy "
-          f"{targeted or 'none'} rerouted; interleaved + split-half; fp32 math, "
-          f"no Metal-4.1/M5 requirement).", flush=True)
+    print(f"{TAG} fused RoPE active on MPS (eager apply_rope/apply_rope_split_half"
+          f"{' + comfy ' + str(targeted) if targeted else ''} rerouted; interleaved + split-half; "
+          f"fp32 math, no Metal-4.1/M5 requirement; comfy-retarget "
+          f"{'ON' if targeted else 'OFF (ASFP8_ROPE_COMFY_RETARGET=1 to enable)'}).", flush=True)
 
 
 def install_for_test():

@@ -131,8 +131,29 @@ def test_fast_ineligible_non_mps(monkeypatch):
     assert scaled_mm_fp8._fast_eligible(inp, other) is False
 
 
-def test_fast_ineligible_when_opt_out(monkeypatch):
+def test_fast_ineligible_when_explicitly_off(monkeypatch):
+    # Explicit opt-out wins over capability + shape, even on supported hardware.
+    from _patches import _caps
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_FP8_EXT", "off")
+    inp, other = _operands(K=12288, N=3072)
+    assert scaled_mm_fp8._fast_eligible(inp, other) is False
+
+
+def test_default_on_when_capable(monkeypatch):
+    # DEFAULT ON: unset + Tier-B capable -> eligible (no explicit flag needed).
+    from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    inp, other = _operands(K=12288, N=3072)
+    assert scaled_mm_fp8._fast_eligible(inp, other) is True
+
+
+def test_default_off_when_not_capable(monkeypatch):
+    # DEFAULT gated: unset + unsupported hardware -> inert (the promise).
+    from _patches import _caps
+    monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
     inp, other = _operands(K=12288, N=3072)
     assert scaled_mm_fp8._fast_eligible(inp, other) is False
 

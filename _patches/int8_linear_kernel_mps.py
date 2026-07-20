@@ -32,10 +32,9 @@ global memory -- bit-identical to the chunked path, ~1.2-1.65x faster per call.
 Everything else (other quant formats, transposed weights, LoRA weight/bias
 functions, non-MPS) falls back to comfy's original forward unchanged.
 
-Opt-in: only active when ``ASFP8_INT8_EXT=1`` (the kernel build flag).
+DEFAULT ON, gated on M5/Metal-4.1 + ninja; ``ASFP8_INT8_EXT=off`` force-disables, ``=1`` forces the build attempt.
 """
 
-import os
 import sys
 
 import torch
@@ -268,7 +267,11 @@ def install():
         return
     if sys.platform != "darwin":
         return
-    if os.environ.get("ASFP8_INT8_EXT") != "1":
+    # DEFAULT ON, gated on Tier B (Metal-4 tensor ops + ninja to build the ObjC++
+    # extension). On unsupported HW the default resolves to OFF so we never attempt a
+    # build; ASFP8_INT8_EXT=off force-disables, =1 forces the build attempt anyway.
+    from . import _caps
+    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready):
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return

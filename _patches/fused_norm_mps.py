@@ -13,13 +13,12 @@ only fixed the bare norm and reduced over all normalized dims). The 64-bit ulong
 additional defense-in-depth that prevents int32 element-offset overflow on truly enormous tensors
 (rows*D > 2^31, e.g. >2^23 rows at D=256) — valid, but not the primary fix for the 2^21-row bug.
 
-Opt-in: ASFP8_FUSED_NORM=1. Never fatal; falls back to an exact, GROUP-AWARE torch composition on
+DEFAULT ON, gated on compile_shader (ASFP8_FUSED_NORM=off disables). Never fatal; falls back to an exact, GROUP-AWARE torch composition on
 any error, off-MPS, unsupported dtype, optional-tensor shape/device/dtype mismatch, or indivisible
 modulation grouping. `_last_backend` records which path ran ("kernel" | "fallback") for tests.
 """
 from __future__ import annotations
 
-import os
 
 import torch
 import torch.nn.functional as F
@@ -271,7 +270,10 @@ def _rms_norm(input, normalized_shape, weight=None, eps=None):
 
 def install():
     global _orig_rms_norm, _installed
-    if _installed or os.environ.get("ASFP8_FUSED_NORM") != "1":
+    # DEFAULT ON, gated on compile_shader (Tier A: fp32 kernel, no Metal-4.1 needed).
+    # ASFP8_FUSED_NORM=off disables; =1 forces on. See _patches/_caps.py.
+    from . import _caps
+    if _installed or not _caps.resolve("ASFP8_FUSED_NORM", default_on=True, cap=_caps.has_compile_shader):
         return
     if not torch.backends.mps.is_available() or not hasattr(torch.mps, "compile_shader"):
         return

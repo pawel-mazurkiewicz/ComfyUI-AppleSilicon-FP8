@@ -20,10 +20,21 @@ requires_int8_ext = pytest.mark.skipif(
 )
 
 
-def test_install_noop_without_flag(monkeypatch):
-    """install() must be a no-op unless ASFP8_INT8_EXT=1 (opt-in build)."""
+def test_install_noop_when_explicitly_off(monkeypatch):
+    """ASFP8_INT8_EXT=off force-disables even on capable hardware."""
+    from _patches import _caps
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_INT8_EXT", "off")
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    patch.install()
+    assert patch._installed is False
+
+
+def test_install_noop_when_not_capable(monkeypatch):
+    """DEFAULT ON but gated: unsupported hardware -> no build attempt, stays inert."""
+    from _patches import _caps
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    # Reset module state so a prior install() in-session doesn't mask this.
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False

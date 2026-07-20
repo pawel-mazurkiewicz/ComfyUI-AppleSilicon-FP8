@@ -1,0 +1,32 @@
+# Keep the published Registry package to what ComfyUI actually needs at runtime.
+# Syntax matches .gitignore. Everything under _patches/ (incl. the .mm kernel
+# sources built on demand), __init__.py, prestartup_script.py, requirements.txt,
+# README.md and LICENSE are kept.
+
+# Test suite + dev/research harnesses
+tests/
+dev/
+docs/
+conftest.py
+
+# Repo tooling / CI (runs on GitHub, not shipped in the node package)
+.github/
+.claude/
+.omc/
+.serena/
+.ruff_cache/
+.pytest_cache/
+.mcp.json
+
+# Session write-ups & long-form docs (not needed to run the node)
+SESSION_*.md
+*_FINDINGS.md
+INVESTIGATION_FACTS.md
+ISSUE_*.md
+BLOG_POST.md
+blog-*.md
+
+# Junk
+__pycache__/
+*.pyc
+.DS_Store

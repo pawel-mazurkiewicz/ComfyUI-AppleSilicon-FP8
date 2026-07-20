@@ -426,7 +426,17 @@ def _mode():
 
 
 def _gate():
-    return _mode() not in _CONV_OFF
+    mode = _mode()
+    if mode in _CONV_OFF:
+        return False
+    # When the user hasn't explicitly set ASFP8_CONV_IM2COL, only default-on where the
+    # Metal-4 tensor-ops matmul2d kernel actually compiles (M5 / Metal 4.1). An explicit
+    # 3d/2d/1 still forces it on (the wrapper falls back per-call if a conv can't run).
+    if os.environ.get("ASFP8_CONV_IM2COL") is None:
+        from . import _caps
+        if not _caps.has_tensor_ops_matmul2d():
+            return False
+    return True
 
 
 def _wanted_ranks():

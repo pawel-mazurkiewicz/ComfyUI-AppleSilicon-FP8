@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-applesilicon-fp8"
 description = "Run FP8 and INT8 quantized models (FLUX, SD3.5, Ideogram 4, Krea2) on Apple Silicon / MPS — compatibility fixes plus bit-exact fp8/int8 Metal matmul kernels, plus a psutil fix for recent macOS betas."
-version = "1.1.0"
+version = "1.2.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,9 +11,11 @@ Repository = "https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8"
 
 [project.optional-dependencies]
 mlx = ["mlx-vlm"]
-# Build toolchain for the opt-in Metal matmul kernels (fp8-native patch #3 via
-# ASFP8_FP8_EXT=1, int8 W8A8 patch #17 via ASFP8_INT8_EXT=1). torch's
-# cpp_extension needs the ninja build tool; install with the [kernels] extra.
+# Build toolchain for the ObjC++ Metal matmul kernels (fp8-native #3/#20, int8 W8A8
+# #17). These are DEFAULT ON but gated on M5/Metal-4.1 AND the presence of `ninja`
+# (torch's cpp_extension needs it to build). Without this extra the kernels simply
+# stay inert — nothing breaks — so install [kernels] to unlock them on an M5:
+#   pip install "comfyui-applesilicon-fp8[kernels]"
 kernels = ["ninja"]
 
 [tool.pytest.ini_options]
@@ -24,4 +26,4 @@ addopts = "--import-mode=importlib"
 [tool.comfy]
 PublisherId = "pawel-mazurkiewicz"
 DisplayName = "ComfyUI-AppleSilicon-FP8"
-Icon = ""
+Icon = "icon.svg"

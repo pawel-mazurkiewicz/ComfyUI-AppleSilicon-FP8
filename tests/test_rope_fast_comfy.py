@@ -228,3 +228,28 @@ def test_flux_non_broadcast_table_falls_back_and_matches(comfy_patched):
     assert [e[1] for e in _events("flux.apply_rope")] == ["fallback"]
     assert torch.allclose(out_q.float(), ref_q.float(), atol=2e-2, rtol=2e-2)
     assert torch.allclose(out_k.float(), ref_k.float(), atol=2e-2, rtol=2e-2)
+
+
+# --- patch #21b install-gate: the comfy retarget is OPT-IN (default OFF) --------------------
+@mps
+def test_comfy_retarget_off_by_default(monkeypatch):
+    """install() must NOT retarget the real comfy functions unless ASFP8_ROPE_COMFY_RETARGET=1."""
+    monkeypatch.delenv("ASFP8_ROPE_COMFY_RETARGET", raising=False)
+    monkeypatch.delenv("ASFP8_ROPE_FAST", raising=False)  # master gate defaults on
+    hits = []
+    monkeypatch.setattr(m, "_do_install", lambda: True)              # skip the eager reroute
+    monkeypatch.setattr(m, "_install_comfy", lambda: hits.append(1))
+    m.install()
+    assert hits == [], "comfy retarget fired without the opt-in flag"
+
+
+@mps
+def test_comfy_retarget_on_with_flag(monkeypatch):
+    """ASFP8_ROPE_COMFY_RETARGET=1 opts the real-comfy retarget in."""
+    monkeypatch.setenv("ASFP8_ROPE_COMFY_RETARGET", "1")
+    monkeypatch.delenv("ASFP8_ROPE_FAST", raising=False)
+    hits = []
+    monkeypatch.setattr(m, "_do_install", lambda: True)
+    monkeypatch.setattr(m, "_install_comfy", lambda: hits.append(1))
+    m.install()
+    assert hits == [1], "comfy retarget did not fire despite the opt-in flag"

@@ -1,0 +1,36 @@
+name: Publish to Comfy Registry
+
+# Publishes the node to https://registry.comfy.org (which ComfyUI-Manager reads)
+# whenever the version in pyproject.toml changes on the default branch.
+#
+# One-time setup:
+#   1. Create a publisher at https://registry.comfy.org and note your PublisherId
+#      (already set in pyproject.toml [tool.comfy].PublisherId).
+#   2. Create an API key at https://registry.comfy.org/nodes and add it to this repo
+#      as a secret named REGISTRY_ACCESS_TOKEN
+#      (Settings -> Secrets and variables -> Actions -> New repository secret).
+# After that, bump [project].version in pyproject.toml and push to main to publish.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish-node:
+    name: Publish custom node to registry
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'pawel-mazurkiewicz' }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish custom node
+        uses: Comfy-Org/publish-node-action@v1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}

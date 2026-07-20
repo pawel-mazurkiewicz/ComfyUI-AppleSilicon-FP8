@@ -16,7 +16,7 @@ We monkey-patch torch._scaled_mm so that, for MPS + FP8 operands, it:
 
 Non-MPS or non-FP8 calls fall through to the original implementation untouched.
 
-EXPERIMENTAL (opt-in, ASFP8_FP8_EXT=1): for large fp8(e4m3) x fp8(e4m3) matmuls
+DEFAULT ON, gated on M5/Metal-4.1 + ninja (ASFP8_FP8_EXT=off disables): for large fp8(e4m3) x fp8(e4m3) matmuls
 this seam routes both operands through a Metal 4.1 fp8-native kernel (no bf16
 decode), then applies scales/bias in fp32 — bit-exact vs the decode path, faster.
 When the flag is unset/0 the fast path is inert and numerics are unchanged.
@@ -33,7 +33,7 @@ TAG = "[AppleSilicon-FP8/scaled_mm]"
 _original = None
 _installed = False
 
-# fp8-native fast path (EXPERIMENTAL, opt-in via ASFP8_FP8_EXT=1). When the flag is
+# fp8-native fast path (DEFAULT ON where capable; ASFP8_FP8_EXT=off disables). When the gate is
 # unset/0 this whole path is inert and torch._scaled_mm behaves exactly as the decode
 # implementation below — same numerics, zero extra work, no extension build.
 _backend = None          # the cpp module, or False once known-unavailable
@@ -64,9 +64,12 @@ def _min_dim():
 
 
 def _fast_eligible(input, other):
-    """Pure shape/dtype/env predicate (no device work, no import). Returns False
-    instantly when ASFP8_FP8_EXT is unset/0 so the default decode path is untouched."""
-    if os.environ.get("ASFP8_FP8_EXT") != "1":
+    """Shape/dtype/capability predicate (no per-call device work). The fp8_ext fast
+    path is DEFAULT ON, gated on Tier B (Metal-4 tensor ops + ninja for the ObjC++
+    extension). ASFP8_FP8_EXT=off force-disables; =1 forces it on. The capability
+    probes are memoised, so this stays cheap on the hot matmul path."""
+    from . import _caps
+    if not _caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.tier_b_ready):
         return False
     # The kernel decodes both operands as e4m3; only route when that's exact.
     if input.dtype != torch.float8_e4m3fn or other.dtype != torch.float8_e4m3fn:
@@ -162,7 +165,7 @@ def _mps_scaled_mm(
             bias=bias, scale_result=scale_result, use_fast_accum=use_fast_accum,
         )
 
-    # EXPERIMENTAL opt-in fast path: fp8xfp8 -> f32 via the Metal 4.1 kernel. Any
+    # fp8-native fast path: fp8xfp8 -> f32 via the Metal 4.1 kernel. Any
     # failure (build/parity/runtime) falls through to the decode path below, so a
     # render never breaks. Inert unless ASFP8_FP8_EXT=1.
     if _fast_eligible(input, other):
