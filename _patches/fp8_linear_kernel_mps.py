@@ -40,7 +40,13 @@ def _min_dim():
 
 
 def _range_guard_on():
-    return os.environ.get("ASFP8_FP8_NATIVE_RANGE_GUARD") == "1"
+    # DEFAULT ON now that this kernel path is default-on: the kernel casts bf16
+    # activations to fp16 (max finite 65504), so a bf16 outlier above that would
+    # become inf and silently skew the output. The guard detects it and falls back
+    # to the bit-exact decode path. Set ASFP8_FP8_NATIVE_RANGE_GUARD=0 to skip the
+    # per-call amax check if you know your activations stay in fp16 range.
+    return os.environ.get("ASFP8_FP8_NATIVE_RANGE_GUARD", "1").strip().lower() not in (
+        "0", "off", "false", "no")
 
 
 def _load_kernel():
@@ -159,7 +165,7 @@ def _try_fp8_kernel_forward(self, input):
         if max(N, K) < _min_dim():
             return None
 
-        # --- optional real-activation fp16 range guard (off by default; see plan §3a) ---
+        # --- real-activation fp16 range guard (DEFAULT ON; =0 to skip the amax check) ---
         if _range_guard_on() and input.dtype is torch.bfloat16:
             if bool((input.detach().abs().amax() > 65504).item()):
                 return None

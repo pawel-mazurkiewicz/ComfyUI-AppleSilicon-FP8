@@ -16,12 +16,16 @@ _probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_probe)
 
 import shutil
+from _patches import _caps
 _NO_MPS = not torch.backends.mps.is_available()
 _NO_TOOLCHAIN = shutil.which("xcrun") is None
 
 pytestmark = [
     pytest.mark.skipif(_NO_MPS, reason="needs MPS device"),
     pytest.mark.skipif(_NO_TOOLCHAIN, reason="needs Xcode CLI tools (xcrun)"),
+    # Match the docstring: a missing ninja toolchain is a legitimate skip, not a build
+    # failure (build_extension() would return None and fail the probe_mod assertion).
+    pytest.mark.skipif(not _caps.ninja_available(), reason="needs ninja to build the ObjC++ extension"),
 ]
 
 

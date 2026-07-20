@@ -224,7 +224,7 @@ torch.mps.synchronize()
 t1=time.perf_counter()
 print(f"cold_ms={(t1-t0)*1e3:.0f}")
 """
-    python = "/Volumes/IMPERIAL SPACE/AI/ComfyUI/.venv/bin/python"
+    python = sys.executable  # the interpreter running this probe (portable across machines)
 
     # Cold run (empty cache)
     with tempfile.TemporaryDirectory() as cache1:

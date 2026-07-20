@@ -277,9 +277,11 @@ def _scatter_on():
 
 
 def _gemm_nt_bias_scatter(A, Bw, bias, out, p0, Cout, Dout, Hout, Wout):
-    """OUT[N,Cout,(Dout,)Hout,Wout] += A[rows,K] @ Bw[Cout,K]^T + bias, scattered to the
-    channel-major destination by decoding pix=p0+(m0+r) -> (n,od,oh,ow). `out` is the final
-    channel-major tensor (no out_flat staging, no permute copy). For 2D pass Dout=1."""
+    """OUT[N,Cout,(Dout,)Hout,Wout] = A[rows,K] @ Bw[Cout,K]^T + bias, scattered to the
+    channel-major destination by decoding pix=p0+(m0+r) -> (n,od,oh,ow). Each element is
+    STORED exactly once (assign, not accumulate) and every (m<M, n<Cout) is covered across
+    tiles, so `out` needs no pre-zeroing. `out` is the final channel-major tensor (no
+    out_flat staging, no permute copy). For 2D pass Dout=1."""
     M, K = A.shape
     N = Bw.shape[0]
     has_bias = 1 if bias is not None else 0

@@ -12,8 +12,8 @@ from _patches import _caps
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
+    # Setup-only: monkeypatch auto-reverts, so no teardown/yield is needed.
     monkeypatch.delenv("ASFP8_CAPS_TEST", raising=False)
-    yield
 
 
 def _cap(value):
@@ -80,4 +80,6 @@ def test_tier_b_requires_both_probe_and_ninja(monkeypatch):
 
 def test_summary_is_a_string():
     s = _caps.summary()
-    assert isinstance(s, str) and "mps=" in s and "ninja=" in s
+    assert isinstance(s, str)
+    assert "mps=" in s
+    assert "ninja=" in s

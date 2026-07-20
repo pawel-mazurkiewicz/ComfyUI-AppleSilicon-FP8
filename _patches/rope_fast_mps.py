@@ -233,6 +233,7 @@ def apply_rope_split_half_fused_pair(xq, xk, freqs_cis):
 # 'llama.apply_rope'. Kept separate from _orig (which holds comfy_kitchen eager originals).
 _orig_comfy: dict = {}
 _comfy_replacements: list = []   # (module_dict, attr_name, original_fn) for clean uninstall
+_comfy_installed = False         # idempotency: a 2nd call would capture wrappers as "originals"
 
 
 def _interleaved_single(x, freqs_cis):
@@ -357,6 +358,9 @@ def _install_comfy():
     identity, mirroring mps_profile._try_wrap_rope) so aliased re-imports -- e.g.
     comfy.ldm.ideogram4.model.apply_rope, which IS llama.apply_rope -- are all rerouted. Best-effort:
     a missing module just skips that target."""
+    global _comfy_installed
+    if _comfy_installed:
+        return
     import sys
     id_map = {}   # id(original_fn) -> wrapper
     try:
@@ -388,9 +392,12 @@ def _install_comfy():
                     d[attr] = wrap
         except Exception:
             continue
+    _comfy_installed = True
 
 
 def _uninstall_comfy():
+    global _comfy_installed
+    _comfy_installed = False
     for d, attr, orig in _comfy_replacements:
         try:
             d[attr] = orig

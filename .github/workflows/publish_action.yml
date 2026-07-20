@@ -22,6 +22,11 @@ on:
 permissions:
   contents: read
 
+# Never let two publishes race (e.g. rapid pushes); the latest version wins.
+concurrency:
+  group: comfy-registry-publish
+  cancel-in-progress: false
+
 jobs:
   publish-node:
     name: Publish custom node to registry
@@ -30,7 +35,10 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Publish custom node
-        uses: Comfy-Org/publish-node-action@v1
+        # Pinned to a full commit SHA (supply-chain hardening); bump deliberately.
+        uses: Comfy-Org/publish-node-action@7578cdb0c1410f2515e6f9b1443c6859cab94f05  # 1.0.1
         with:
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
