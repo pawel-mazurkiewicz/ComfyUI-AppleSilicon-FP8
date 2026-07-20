@@ -1,8 +1,11 @@
-"""JIT loader for the fp8-native matmul2d MPS extension (patch #15 backend).
+"""JIT loader for the fp8-native matmul2d MPS extension.
 
-Builds _patches/fp8_ext/fp8_matmul2d.mm via torch.utils.cpp_extension.load (ObjC++,
-Metal 4.1). Opt-in (ASFP8_FP8_EXT=1), guarded, cached; returns None on any failure so
-the caller falls back to the decode path.
+Backs patch #3's _scaled_mm fast path (ASFP8_FP8_EXT) and patch #20's fp8-native
+Linear wrapper (ASFP8_FP8_NATIVE). Builds _patches/fp8_ext/fp8_matmul2d.mm via
+torch.utils.cpp_extension.load (ObjC++, Metal 4.1). DEFAULT ON where capable —
+builds when EITHER seam resolves on via the shared three-state gate (Tier B: M5 /
+Metal 4.1 + ninja); guarded, cached; returns None on any failure so the caller
+falls back to the decode path.
 
 Space-in-path workaround: cpp_extension emits the torch lib `-L` UNQUOTED, so a space
 in torch's install path (e.g. ".../IMPERIAL SPACE/...") breaks the link. We point the
@@ -42,11 +45,37 @@ def module():
         return _mod
     _tried = True
 
-    if os.environ.get("ASFP8_FP8_EXT") != "1":
+    # DEFAULT ON where capable: build when EITHER seam wants it. Each flag resolves
+    # via the shared three-state gate (unset -> on iff Tier B; off -> off; 1 -> force).
+    # The callers (#3 _fast_eligible, #20 install) independently decide whether to USE
+    # the built module; this only decides whether to attempt the (cached) build.
+    from .. import _caps
+    if not (_caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.tier_b_ready) or
+            _caps.resolve("ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready)):
         return None
     if shutil.which("xcrun") is None:
         print("[fp8_ext] no Metal toolchain (xcrun); fp8-native disabled.")
         return None
+
+    # torch's cpp_extension needs the `ninja` *binary* on PATH (not just the python
+    # module). ComfyUI-Desktop often launches with a PATH that lacks homebrew/venv
+    # bins, so add the ninja package's bundled binary dir (mirrors int8_ext/loader).
+    if shutil.which("ninja") is None:
+        try:
+            import ninja  # provides a bundled `ninja` executable
+            bin_dir = getattr(ninja, "BIN_DIR", None) or os.path.join(
+                os.path.dirname(ninja.__file__), "data", "bin"
+            )
+            if os.path.isdir(bin_dir):
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        except Exception as e:
+            print(f"[fp8_ext] ninja not importable ({e!r}); fp8-native disabled.")
+            return None
+    if shutil.which("ninja") is None:
+        print("[fp8_ext] ninja binary not found on PATH; fp8-native disabled "
+              "(pip install ninja into the ComfyUI venv).")
+        return None
+
     try:
         import torch.utils.cpp_extension as cpp
         from torch.utils.cpp_extension import load as cpp_load

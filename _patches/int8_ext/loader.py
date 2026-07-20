@@ -1,8 +1,9 @@
 """JIT loader for the bit-exact int8 matmul2d MPS extension.
 
 Builds _patches/int8_ext/int8_gemm.mm via torch.utils.cpp_extension.load (ObjC++,
-Metal 4.1). Opt-in (ASFP8_INT8_EXT=1), guarded, cached; returns None on any failure
-so callers fall back to the fp32/bf16 _int_mm path.
+Metal 4.1). DEFAULT ON where capable (Tier B: M5 / Metal 4.1 + ninja, via the shared
+three-state gate); guarded, cached; returns None on any failure so callers fall back
+to the fp32/bf16 _int_mm path.
 
 Space-in-path workaround (same as fp8_ext): cpp_extension emits torch's lib `-L`
 UNQUOTED, so a space in torch's install path (".../IMPERIAL SPACE/...") breaks the
@@ -42,7 +43,10 @@ def module():
         return _mod
     _tried = True
 
-    if os.environ.get("ASFP8_INT8_EXT") != "1":
+    # DEFAULT ON where capable (Tier B: M5/Metal-4.1 + ninja). Three-state gate:
+    # unset -> on iff tier_b_ready; ASFP8_INT8_EXT=off -> off; =1 -> force the build.
+    from .. import _caps
+    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready):
         return None
     if shutil.which("xcrun") is None:
         print("[int8_ext] no Metal toolchain (xcrun); int8-native disabled.")

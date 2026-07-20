@@ -108,6 +108,76 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device OutT *dst,
   }
 }
 
+// ── Fragment store: fused dequant + optional bias + activation ──
+// P0 verdict (M5 Max / macOS 27 / Metal 4.1): precise::exp/precise::tanh compile;
+// `erf`/`metal::erf` do NOT -> act=3 (gelu-erf) is removed. Supported act enum:
+//   0=none, 1=silu (x*sigmoid(x)), 2=gelu-tanh (F.gelu approximate='tanh').
+// Activation is applied AFTER rescale+bias (FFN convention), in fp32 on the
+// bf16-rounded post-bias value, then rounded back to OutT.
+template <typename OutT>
+inline void nax_frag_store_dequant_act(const thread int32_t *src, device OutT *dst,
+                                       int ld, short2 sc, short off_m, short off_n,
+                                       uint M, uint N, uint m_base, uint n_base,
+                                       const device float *row_scale,
+                                       const device OutT *bias, bool has_bias, uint act) {
+  for (short i = 0; i < 2; i++) {
+    for (short j = 0; j < kElemCols; j++) {
+      uint mi = m_base + sc.y + off_m + i * kElemRowsJump;
+      uint ni = n_base + sc.x + off_n + j;
+      if (mi < M && ni < N) {
+        float acc = float(src[i * kElemCols + j]) * row_scale[mi];
+        OutT r = OutT(acc);
+        if (has_bias) { r = r + bias[ni]; }
+        float y = float(r);                 // promote the bf16 linear output to fp32
+        if (act == 1u) {                    // SiLU: x * sigmoid(x)
+          y = y / (1.0f + precise::exp(-y));
+        } else if (act == 2u) {             // GELU tanh-approx (F.gelu approximate='tanh')
+          // tanh(z)=2*sigmoid(2z)-1 => 0.5*x*(1+tanh(z)) == x*sigmoid(2z)
+          //  = x / (1 + exp(-2z)).  Metal precise::tanh is low-accuracy (~160 ulp
+          // off torch), but precise::exp matches torch (silu is bit-exact to 1 ulp),
+          // so route GELU-tanh through exp.  z = sqrt(2/pi)*(x + 0.044715 x^3).
+          float c2 = 1.5957691216057308f;   // 2*sqrt(2/pi)
+          y = y / (1.0f + precise::exp(-c2 * (y + 0.044715f * y * y * y)));
+        }
+        dst[(sc.y + off_m + i * kElemRowsJump) * ld + (sc.x + off_n + j)] = OutT(y);
+      }
+    }
+  }
+}
+
+// ── Fragment store: fused SwiGLU/GEGLU gate ─────────────────────
+// H[m,n] = act(gate[m,n]*rs_g[m] + bias_g[n]) * (up[m,n]*rs_u[m] + bias_u[n]),
+// gate/up being two int32 register accumulators for the SAME (m,n) tile from two
+// GEMMs (B=Wg, B=Wu). act: 1=silu (SwiGLU), 2=gelu-tanh (GEGLU). GELU via the exp
+// identity (precise::tanh is low-accuracy; see nax_frag_store_dequant_act).
+template <typename OutT>
+inline void nax_frag_store_swiglu(const thread int32_t *gate, const thread int32_t *up,
+                                  device OutT *dst, int ld, short2 sc, short off_m, short off_n,
+                                  uint M, uint N, uint m_base, uint n_base,
+                                  const device float *rs_g, const device float *rs_u,
+                                  const device OutT *bias_g, const device OutT *bias_u,
+                                  bool hb_g, bool hb_u, uint act) {
+  for (short i = 0; i < 2; i++) {
+    for (short j = 0; j < kElemCols; j++) {
+      uint mi = m_base + sc.y + off_m + i * kElemRowsJump;
+      uint ni = n_base + sc.x + off_n + j;
+      if (mi < M && ni < N) {
+        short e = i * kElemCols + j;
+        OutT g = OutT(float(gate[e]) * rs_g[mi]); if (hb_g) g = g + bias_g[ni];
+        OutT u = OutT(float(up[e])   * rs_u[mi]); if (hb_u) u = u + bias_u[ni];
+        float gf = float(g);
+        if (act == 1u) {                              // SwiGLU
+          gf = gf / (1.0f + precise::exp(-gf));
+        } else if (act == 2u) {                       // GEGLU-tanh (via exp identity)
+          float c2 = 1.5957691216057308f;             // 2*sqrt(2/pi)
+          gf = gf / (1.0f + precise::exp(-c2 * (gf + 0.044715f * gf * gf * gf)));
+        }
+        dst[(sc.y + off_m + i * kElemRowsJump) * ld + (sc.x + off_n + j)] = OutT(gf * float(u));
+      }
+    }
+  }
+}
+
 // ── Raw INT32 GEMM compute (B is [N, K], transpose_b=true) ──────
 // Fills c_frags (int32 register accumulators) for this simdgroup's tile
 // of C[M,N] = A[M,K] × B[N,K]^T, and reports the tile origin (m_base,
@@ -323,6 +393,7 @@ kernel void int8_matmul_fused(
     const device float *row_scale [[buffer(9)]],
     const device bfloat *bias [[buffer(10)]],
     constant uint &has_bias [[buffer(11)]],
+    constant uint &act [[buffer(12)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
@@ -337,10 +408,16 @@ kernel void int8_matmul_fused(
   device bfloat *Dp = D + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
-                                     short(mm * 16), short(nn * 16), M, N,
-                                     m_base, n_base, row_scale, bias,
-                                     has_bias != 0u);
+      if (act == 0u)
+        nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                       short(mm * 16), short(nn * 16), M, N,
+                                       m_base, n_base, row_scale, bias,
+                                       has_bias != 0u);
+      else
+        nax_frag_store_dequant_act<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                           short(mm * 16), short(nn * 16), M, N,
+                                           m_base, n_base, row_scale, bias,
+                                           has_bias != 0u, act);
 }
 
 kernel void int8_matmul_fused_small(
@@ -352,6 +429,7 @@ kernel void int8_matmul_fused_small(
     const device float *row_scale [[buffer(9)]],
     const device bfloat *bias [[buffer(10)]],
     constant uint &has_bias [[buffer(11)]],
+    constant uint &act [[buffer(12)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lid [[thread_index_in_simdgroup]]) {
@@ -366,10 +444,78 @@ kernel void int8_matmul_fused_small(
   device bfloat *Dp = D + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
-                                     short(mm * 16), short(nn * 16), M, N,
-                                     m_base, n_base, row_scale, bias,
-                                     has_bias != 0u);
+      if (act == 0u)
+        nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                       short(mm * 16), short(nn * 16), M, N,
+                                       m_base, n_base, row_scale, bias,
+                                       has_bias != 0u);
+      else
+        nax_frag_store_dequant_act<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+                                           short(mm * 16), short(nn * 16), M, N,
+                                           m_base, n_base, row_scale, bias,
+                                           has_bias != 0u, act);
+}
+
+// ── Fused SwiGLU/GEGLU gate entry points, bf16 output ───────────
+// Runs the templated GEMM body twice for the SAME output tile (B=Bg, then
+// B=Bu) into two int32 register accumulators, then one combined gated store:
+// D = act(A@Bg^T*rs_g + bias_g) * (A@Bu^T*rs_u + bias_u).
+kernel void int8_matmul_swiglu(
+    const device int8_t *A [[buffer(0)]], const device int8_t *Bg [[buffer(1)]],
+    const device int8_t *Bu [[buffer(2)]], device bfloat *D [[buffer(3)]],
+    constant uint &M [[buffer(4)]], constant uint &N [[buffer(5)]], constant uint &K [[buffer(6)]],
+    constant uint &swizzle_log [[buffer(7)]], constant uint &tiles_m [[buffer(8)]],
+    constant uint &tiles_n [[buffer(9)]], const device float *rs_g [[buffer(10)]],
+    const device float *rs_u [[buffer(11)]], const device bfloat *bias_g [[buffer(12)]],
+    const device bfloat *bias_u [[buffer(13)]], constant uint &hb_g [[buffer(14)]],
+    constant uint &hb_u [[buffer(15)]], constant uint &act [[buffer(16)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+  constexpr short TM = ((128 / 4) / 16), TN = ((128 / 4) / 16);
+  int32_t cg[TM * TN][kElemsPerFrag];
+  short2 sc; uint m_base, n_base;
+  if (!w8a8_gemm_compute<128, 128, 512, 32, 4, 4>(A, Bg, cg, sc, m_base, n_base, M, N, K,
+        swizzle_log, tiles_m, tiles_n, tgid, sgid, lid)) return;
+  int32_t cu[TM * TN][kElemsPerFrag];
+  short2 sc2; uint mb2, nb2;
+  bool ok2 = w8a8_gemm_compute<128, 128, 512, 32, 4, 4>(A, Bu, cu, sc2, mb2, nb2, M, N, K,
+        swizzle_log, tiles_m, tiles_n, tgid, sgid, lid);
+  if (!ok2 || sc2.x != sc.x || sc2.y != sc.y || mb2 != m_base || nb2 != n_base) return;
+  device bfloat *Dp = D + m_base * N + n_base;
+  for (short mm = 0; mm < TM; mm++)
+    for (short nn = 0; nn < TN; nn++)
+      nax_frag_store_swiglu<bfloat>(cg[mm * TN + nn], cu[mm * TN + nn], Dp, int(N), sc,
+        short(mm * 16), short(nn * 16), M, N, m_base, n_base, rs_g, rs_u, bias_g, bias_u,
+        hb_g != 0u, hb_u != 0u, act);
+}
+
+kernel void int8_matmul_swiglu_small(
+    const device int8_t *A [[buffer(0)]], const device int8_t *Bg [[buffer(1)]],
+    const device int8_t *Bu [[buffer(2)]], device bfloat *D [[buffer(3)]],
+    constant uint &M [[buffer(4)]], constant uint &N [[buffer(5)]], constant uint &K [[buffer(6)]],
+    constant uint &swizzle_log [[buffer(7)]], constant uint &tiles_m [[buffer(8)]],
+    constant uint &tiles_n [[buffer(9)]], const device float *rs_g [[buffer(10)]],
+    const device float *rs_u [[buffer(11)]], const device bfloat *bias_g [[buffer(12)]],
+    const device bfloat *bias_u [[buffer(13)]], constant uint &hb_g [[buffer(14)]],
+    constant uint &hb_u [[buffer(15)]], constant uint &act [[buffer(16)]],
+    uint2 tgid [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lid [[thread_index_in_simdgroup]]) {
+  constexpr short TM = ((32 / 1) / 16), TN = ((128 / 4) / 16);
+  int32_t cg[TM * TN][kElemsPerFrag];
+  short2 sc; uint m_base, n_base;
+  if (!w8a8_gemm_compute<32, 128, 512, 32, 1, 4>(A, Bg, cg, sc, m_base, n_base, M, N, K,
+        swizzle_log, tiles_m, tiles_n, tgid, sgid, lid)) return;
+  int32_t cu[TM * TN][kElemsPerFrag];
+  short2 sc2; uint mb2, nb2;
+  bool ok2 = w8a8_gemm_compute<32, 128, 512, 32, 1, 4>(A, Bu, cu, sc2, mb2, nb2, M, N, K,
+        swizzle_log, tiles_m, tiles_n, tgid, sgid, lid);
+  if (!ok2 || sc2.x != sc.x || sc2.y != sc.y || mb2 != m_base || nb2 != n_base) return;
+  device bfloat *Dp = D + m_base * N + n_base;
+  for (short mm = 0; mm < TM; mm++)
+    for (short nn = 0; nn < TN; nn++)
+      nax_frag_store_swiglu<bfloat>(cg[mm * TN + nn], cu[mm * TN + nn], Dp, int(N), sc,
+        short(mm * 16), short(nn * 16), M, N, m_base, n_base, rs_g, rs_u, bias_g, bias_u,
+        hb_g != 0u, hb_u != 0u, act);
 }
 )MTL";
 
@@ -378,6 +524,8 @@ static id<MTLComputePipelineState> g_pso_large = nil;
 static id<MTLComputePipelineState> g_pso_small = nil;
 static id<MTLComputePipelineState> g_pso_fused = nil;
 static id<MTLComputePipelineState> g_pso_fused_small = nil;
+static id<MTLComputePipelineState> g_pso_swiglu = nil;
+static id<MTLComputePipelineState> g_pso_swiglu_small = nil;
 static id<MTLLibrary> g_lib = nil;
 static std::string g_compile_error;
 
@@ -425,6 +573,15 @@ static id<MTLComputePipelineState> pso_for_fused(bool small) {
   id<MTLComputePipelineState> pso =
       pso_for_name(small ? @"int8_matmul_fused_small" : @"int8_matmul_fused");
   if (small) g_pso_fused_small = pso; else g_pso_fused = pso;
+  return pso;
+}
+
+static id<MTLComputePipelineState> pso_for_swiglu(bool small) {
+  if (small && g_pso_swiglu_small) return g_pso_swiglu_small;
+  if (!small && g_pso_swiglu) return g_pso_swiglu;
+  id<MTLComputePipelineState> pso =
+      pso_for_name(small ? @"int8_matmul_swiglu_small" : @"int8_matmul_swiglu");
+  if (small) g_pso_swiglu_small = pso; else g_pso_swiglu = pso;
   return pso;
 }
 
@@ -509,7 +666,8 @@ torch::Tensor i8_matmul2d_nt(torch::Tensor a_i8, torch::Tensor b_i8) {
 // written to global memory — this is the per-call epilogue we skip.
 torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
                                    torch::Tensor row_scale,
-                                   c10::optional<torch::Tensor> bias_opt) {
+                                   c10::optional<torch::Tensor> bias_opt,
+                                   int64_t act) {
   TORCH_CHECK(a_i8.is_mps() && b_i8.is_mps() && row_scale.is_mps(),
               "inputs must be on mps");
   TORCH_CHECK(a_i8.scalar_type() == torch::kChar && b_i8.scalar_type() == torch::kChar,
@@ -520,6 +678,10 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
   TORCH_CHECK(row_scale.scalar_type() == torch::kFloat && row_scale.is_contiguous(),
               "row_scale must be contiguous float32");
   TORCH_CHECK(row_scale.numel() == a_i8.size(0), "row_scale must have M elements");
+  // Defense-in-depth: the store epilogue only branches on act 1 (silu) / 2 (gelu-tanh);
+  // act 0 means "none". Any other value would silently emit un-activated output, so reject
+  // it here (act=3 gelu-erf was dropped — Metal `erf` does not compile under 4.1).
+  TORCH_CHECK(act >= 0 && act <= 2, "fused: act must be 0(none)/1(silu)/2(gelu-tanh)");
 
   const int M = (int)a_i8.size(0);
   const int K = (int)a_i8.size(1);
@@ -550,6 +712,7 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
   uint Mu = (uint)M, Nu = (uint)N, Ku = (uint)K;
   uint swizzle_log = g.swizzle_log, tiles_m = g.tiles_m, tiles_n = g.tiles_n;
   uint has_bias_u = has_bias ? 1u : 0u;
+  uint act_u = (uint)act;
 
   dispatch_sync(stream->queue(), ^(){
     @autoreleasepool {
@@ -567,6 +730,99 @@ torch::Tensor i8_matmul2d_nt_fused(torch::Tensor a_i8, torch::Tensor b_i8,
       [enc setBuffer:sBuf offset:sOff atIndex:9];
       [enc setBuffer:biasBuf offset:biasOff atIndex:10];
       [enc setBytes:&has_bias_u length:sizeof(uint) atIndex:11];
+      [enc setBytes:&act_u length:sizeof(uint) atIndex:12];
+      [enc dispatchThreadgroups:MTLSizeMake(g.grid_x, g.grid_y, 1)
+          threadsPerThreadgroup:MTLSizeMake(g.THREADS, 1, 1)];
+    }
+  });
+  return D;
+}
+
+// Fused gated: D[M,N] bf16 = act(A@Bg^T*rs_g[M] + bias_g[N]) * (A@Bu^T*rs_u[M] +
+// bias_u[N]). One launch, two register accumulators, two bf16 intermediates that
+// never leave registers. act: 1=silu (SwiGLU), 2=gelu-tanh (GEGLU).
+torch::Tensor i8_matmul2d_nt_swiglu(torch::Tensor a_i8, torch::Tensor bg_i8,
+                                    torch::Tensor bu_i8, torch::Tensor row_scale_gate,
+                                    torch::Tensor row_scale_up,
+                                    c10::optional<torch::Tensor> bias_gate,
+                                    c10::optional<torch::Tensor> bias_up,
+                                    int64_t act) {
+  TORCH_CHECK(a_i8.is_mps() && bg_i8.is_mps() && bu_i8.is_mps(), "swiglu: inputs must be MPS");
+  TORCH_CHECK(a_i8.scalar_type() == torch::kChar && bg_i8.scalar_type() == torch::kChar
+              && bu_i8.scalar_type() == torch::kChar, "swiglu: A/Bg/Bu must be int8");
+  TORCH_CHECK(a_i8.dim() == 2 && bg_i8.dim() == 2 && bu_i8.dim() == 2, "swiglu: A/Bg/Bu must be 2D");
+  TORCH_CHECK(bg_i8.sizes() == bu_i8.sizes(), "swiglu: Bg and Bu must have identical [N,K]");
+  TORCH_CHECK(a_i8.size(1) == bg_i8.size(1), "swiglu: K mismatch A vs Bg/Bu");
+  TORCH_CHECK(a_i8.is_contiguous() && bg_i8.is_contiguous() && bu_i8.is_contiguous(),
+              "swiglu: A/Bg/Bu must be contiguous");
+  const int64_t Mll = a_i8.size(0), Nll = bg_i8.size(0);
+  TORCH_CHECK(row_scale_gate.is_contiguous() && row_scale_up.is_contiguous()
+              && row_scale_gate.scalar_type() == torch::kFloat
+              && row_scale_up.scalar_type() == torch::kFloat
+              && row_scale_gate.numel() == Mll && row_scale_up.numel() == Mll,
+              "swiglu: row scales must be contiguous fp32 of length M");
+
+  const int M = (int)Mll;
+  const int K = (int)a_i8.size(1);
+  const int N = (int)Nll;
+  auto D = torch::empty({(long)M, (long)N}, a_i8.options().dtype(torch::kBFloat16));
+
+  const bool hb_g = bias_gate.has_value();
+  const bool hb_u = bias_up.has_value();
+  torch::Tensor bg = hb_g ? bias_gate.value().to(torch::kBFloat16).contiguous()
+                          : torch::zeros({1}, a_i8.options().dtype(torch::kBFloat16));
+  torch::Tensor bu = hb_u ? bias_up.value().to(torch::kBFloat16).contiguous()
+                          : torch::zeros({1}, a_i8.options().dtype(torch::kBFloat16));
+  if (hb_g) TORCH_CHECK(bg.is_mps() && bg.numel() == N, "swiglu: bias_gate must be N MPS elements");
+  if (hb_u) TORCH_CHECK(bu.is_mps() && bu.numel() == N, "swiglu: bias_up must be N MPS elements");
+  // Defense-in-depth: the gated store only branches on act 1 (SwiGLU) / 2 (GEGLU-tanh);
+  // act 0 / anything else would gate by the raw linear value (un-activated), so reject it.
+  TORCH_CHECK(act == 1 || act == 2, "swiglu: act must be 1(silu) or 2(gelu-tanh)");
+
+  Geom g = geom_for(M, N);
+  id<MTLComputePipelineState> pso = pso_for_swiglu(g.small);
+  MPSStream* stream = getCurrentMPSStream();
+  id<MTLBuffer> aBuf = __builtin_bit_cast(id<MTLBuffer>, a_i8.storage().data());
+  id<MTLBuffer> bgBuf = __builtin_bit_cast(id<MTLBuffer>, bg_i8.storage().data());
+  id<MTLBuffer> buBuf = __builtin_bit_cast(id<MTLBuffer>, bu_i8.storage().data());
+  id<MTLBuffer> dBuf = __builtin_bit_cast(id<MTLBuffer>, D.storage().data());
+  id<MTLBuffer> sgBuf = __builtin_bit_cast(id<MTLBuffer>, row_scale_gate.storage().data());
+  id<MTLBuffer> suBuf = __builtin_bit_cast(id<MTLBuffer>, row_scale_up.storage().data());
+  id<MTLBuffer> bgBiasBuf = __builtin_bit_cast(id<MTLBuffer>, bg.storage().data());
+  id<MTLBuffer> buBiasBuf = __builtin_bit_cast(id<MTLBuffer>, bu.storage().data());
+  const NSUInteger aOff = a_i8.storage_offset() * a_i8.element_size();
+  const NSUInteger bgOff = bg_i8.storage_offset() * bg_i8.element_size();
+  const NSUInteger buOff = bu_i8.storage_offset() * bu_i8.element_size();
+  const NSUInteger dOff = D.storage_offset() * D.element_size();
+  const NSUInteger sgOff = row_scale_gate.storage_offset() * row_scale_gate.element_size();
+  const NSUInteger suOff = row_scale_up.storage_offset() * row_scale_up.element_size();
+  const NSUInteger bgBiasOff = bg.storage_offset() * bg.element_size();
+  const NSUInteger buBiasOff = bu.storage_offset() * bu.element_size();
+  uint Mu = (uint)M, Nu = (uint)N, Ku = (uint)K;
+  uint swizzle_log = g.swizzle_log, tiles_m = g.tiles_m, tiles_n = g.tiles_n;
+  uint hb_g_u = hb_g ? 1u : 0u, hb_u_u = hb_u ? 1u : 0u, act_u = (uint)act;
+
+  dispatch_sync(stream->queue(), ^(){
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> enc = stream->commandEncoder();
+      [enc setComputePipelineState:pso];
+      [enc setBuffer:aBuf offset:aOff atIndex:0];
+      [enc setBuffer:bgBuf offset:bgOff atIndex:1];
+      [enc setBuffer:buBuf offset:buOff atIndex:2];
+      [enc setBuffer:dBuf offset:dOff atIndex:3];
+      [enc setBytes:&Mu length:sizeof(uint) atIndex:4];
+      [enc setBytes:&Nu length:sizeof(uint) atIndex:5];
+      [enc setBytes:&Ku length:sizeof(uint) atIndex:6];
+      [enc setBytes:&swizzle_log length:sizeof(uint) atIndex:7];
+      [enc setBytes:&tiles_m length:sizeof(uint) atIndex:8];
+      [enc setBytes:&tiles_n length:sizeof(uint) atIndex:9];
+      [enc setBuffer:sgBuf offset:sgOff atIndex:10];
+      [enc setBuffer:suBuf offset:suOff atIndex:11];
+      [enc setBuffer:bgBiasBuf offset:bgBiasOff atIndex:12];
+      [enc setBuffer:buBiasBuf offset:buBiasOff atIndex:13];
+      [enc setBytes:&hb_g_u length:sizeof(uint) atIndex:14];
+      [enc setBytes:&hb_u_u length:sizeof(uint) atIndex:15];
+      [enc setBytes:&act_u length:sizeof(uint) atIndex:16];
       [enc dispatchThreadgroups:MTLSizeMake(g.grid_x, g.grid_y, 1)
           threadsPerThreadgroup:MTLSizeMake(g.THREADS, 1, 1)];
     }
@@ -578,12 +834,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("i8_matmul2d_nt", &i8_matmul2d_nt,
         "Bit-exact NT int8 matmul: C[M,N] int32 = A[M,K] @ B[N,K]^T on MPS");
   m.def("i8_matmul2d_nt_fused", &i8_matmul2d_nt_fused,
-        "Fused NT int8 matmul: D[M,N] bf16 = (A@B^T)*row_scale[M] + bias[N]",
+        "Fused NT int8 matmul: D[M,N] bf16 = act((A@B^T)*row_scale[M] + bias[N]); "
+        "act 0=none,1=silu,2=gelu-tanh",
         pybind11::arg("a_i8"), pybind11::arg("b_i8"), pybind11::arg("row_scale"),
-        pybind11::arg("bias") = c10::optional<torch::Tensor>());
+        pybind11::arg("bias") = c10::optional<torch::Tensor>(),
+        pybind11::arg("act") = 0);
+  m.def("i8_matmul2d_nt_swiglu", &i8_matmul2d_nt_swiglu,
+        "Fused gated int8 matmul: D[M,N] bf16 = act(A@Bg^T*rsg+bg) * (A@Bu^T*rsu+bu); "
+        "act 1=silu (SwiGLU), 2=gelu-tanh (GEGLU)",
+        pybind11::arg("a_i8"), pybind11::arg("bg_i8"), pybind11::arg("bu_i8"),
+        pybind11::arg("row_scale_gate"), pybind11::arg("row_scale_up"),
+        pybind11::arg("bias_gate") = c10::optional<torch::Tensor>(),
+        pybind11::arg("bias_up") = c10::optional<torch::Tensor>(),
+        pybind11::arg("act") = 1);
   m.def("warmup", []() {
         pso_for(false); pso_for(true);
         pso_for_fused(false); pso_for_fused(true);
+        pso_for_swiglu(false); pso_for_swiglu(true);
         return true;
       },
       "compile + build pipelines");
