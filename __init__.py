@@ -45,6 +45,10 @@ Patches applied:
                                                     Metal-4.1/M5 requirement)
  21b. fused RoPE retargeted onto real comfy funcs  (OPT-IN ASFP8_ROPE_COMFY_RETARGET=1: reroutes comfy.ldm.flux /
                                                     llama apply_rope on live models; higher-risk, off by default)
+ 22. INT4 ConvRot W4A16/W4A8 Linear on MPS          (DEFAULT reroute: skip comfy_kitchen's wasted activation-int4
+                                                    quant, run W4A16 bf16 GEMM — fixes "int4 ~2x slower than int8"
+                                                    (issue #3), brings PARITY with int8; int4's win is memory not
+                                                    speed. Opt-in W4A8 fused Metal kernel via ASFP8_INT4_EXT=1)
  (#15 fp8-native F.linear retired — wrong seam; the fp8-native win is patch #3's opt-in _scaled_mm fast path)
  (#20 reserved for fp8-native matmul on a separate branch; ROPE uses #21 to avoid collision)
 

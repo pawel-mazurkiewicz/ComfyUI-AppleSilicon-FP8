@@ -136,6 +136,7 @@ speedup is gated on a startup capability probe (see the banner in
 | 19 | **VAE / SeedVR2 conv3d decode is slow (or OOMs non-tiled) on MPS** | Stock MPS `conv3d` doesn't use the tensor units and materialises large intermediates | **On by default where supported (M5 / Metal 4.1; `ASFP8_CONV_IM2COL=off` to disable):** run conv3d as im2col + `matmul2d` on the tensor units (~2.7× vs stock conv3d, ~31% faster SeedVR2), with the patch buffer capped at `ASFP8_CONV_TILE_MB`. conv2d stays off unless opted in (`=2d`/`=2d,3d`); falls back per-conv on any unsupported shape |
 | 20 | **FP8 `mixed_precision_ops` Linear decodes fp8→bf16 every step** (Ideogram-4-style eager fp8 checkpoints) | The weight is stored fp8 but each forward LUT-decodes it to bf16 before the matmul | **On by default where supported (M5 + Metal 4.1 + `ninja`; `ASFP8_FP8_NATIVE=off` to disable):** route wide fp8 Linears (min_dim ≥ 8192) through a native fp8-e4m3 `matmul2d` — half activation × fp8 weight on the tensor units — bypassing the per-step decode. Seam confirmed via a live Flux-2 probe; falls back per-call otherwise |
 | 21 | **Rotary position embedding is a chain of small MPS ops per attention block** | `apply_rope` / `apply_rope_split_half` do the interleave/rotate as several elementwise kernels | **On by default where supported (any MPS with `compile_shader`; `ASFP8_ROPE_FAST=off` to disable):** fuse `comfy_kitchen`'s `apply_rope` / `apply_rope_split_half` into **one** `compile_shader` kernel (~6–17×/call over eager; fp32 math, no Metal 4.1/M5). **#21b** additionally retargets the *real* `comfy.ldm.flux` / `llama` rope on live models — higher-risk, so **opt-in** via `ASFP8_ROPE_COMFY_RETARGET=1` |
+| 22 | **INT4 ConvRot models run ~2× slower than INT8 on MPS** (e.g. Krea2 int4 convrot — GitHub [#3](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/3)) | comfy_kitchen's eager `convrot_w4a4` quantizes + packs the *activation* to int4, then unpacks **both** operands back to bf16 for a float GEMM — the int4 activation quant only ever fed a CUDA int4 MMA, so on MPS it's pure wasted work (measured **2.24× int8**) | On MPS, reroute ConvRot W4A4 Linears to a **W4A16 fast path** (default, `compile_shader`-free, comfy_kitchen-gated): skip the wasted activation quant, dequantize the packed int4 weight and run MPS's bf16 GEMM — faster *and* more accurate (15.8% vs 22.5% rel err). Brings int4 to **parity with int8** — see the caveat below: **int4's benefit is memory, not speed**. Opt-in W4A8 fused Metal kernel via `ASFP8_INT4_EXT=1` (M5 / Metal 4.1 + `ninja`) |
 
 ### How the FP8 trick works
 
@@ -182,6 +183,7 @@ your machine), then only the patch lines relevant to it:
 [AppleSilicon-FP8/int_mm] torch._int_mm runs on GPU (float32) on MPS instead of falling back to CPU (INT8 models).
 [AppleSilicon-FP8/int8_linear] int8-fast wide-batch matmul routed via MPS native bf16 GEMM (was fp32 _int_mm).
 [AppleSilicon-FP8/int8_kernel] INT8 convrot Linear routed through bit-exact Metal kernel on MPS (clean W8A8; weight-only fp32 dequant/un-rotation bypassed).
+[AppleSilicon-FP8/int4_linear] ConvRot W4A4 (int4) Linear on MPS -> W4A16 rotated-basis fast path.
 [AppleSilicon-FP8/conv] conv im2col+matmul2d active on MPS (ranks=[3], tile=384MB).
 [AppleSilicon-FP8/rope-fast] fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; ...; comfy-retarget OFF).
 [AppleSilicon-FP8/mlx_textgen] TextGenerate routed through MLX on Apple Silicon (qwen3vl_4b -> mlx-community/Qwen3-VL-4B-Instruct-4bit; gemma3_12b -> mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit).
@@ -294,6 +296,27 @@ your machine), then only the patch lines relevant to it:
   |---|---|
   | `ASFP8_CONV_IM2COL` (default `3d` where capable) | `off`/`0` → disable; `3d` (default) → conv3d only; `2d` / `2d,3d` / `1` → include conv2d. Unset + non-M5 → inert. |
   | `ASFP8_CONV_TILE_MB` (384) | Cap the im2col patch buffer (MB) so large convs tile instead of OOMing. |
+- **INT4 ConvRot (patch #22) — set expectations: parity with INT8, and the win is
+  MEMORY, not speed.** This patch *fixes* the reported "int4 is ~2× slower than int8"
+  bug (GitHub #3) by skipping comfy_kitchen's wasted activation-int4 quant, but it
+  does **not** make int4 faster than int8. On M5 the int4 tensor dtype (`int4b`) has
+  **no cooperative-input matmul intrinsics** (verified in the Metal 4.1 headers), so
+  it's structurally capped at int8's throughput — measured **parity within ±3%** at
+  diffusion shapes, int4 edging ahead only as the token count grows. int4's real
+  benefit is **resident memory** (~6.5 GB vs ~12.3 GB for int8), at int8-parity
+  speed. The default path is a `compile_shader`-free W4A16 reroute (weight-only,
+  comfy_kitchen-gated, inert off-MPS / on older comfy_kitchen); the opt-in W4A8
+  fused Metal kernel adds nothing at compute-bound shapes and is off by default.
+
+  **Experimental / honest caveats:** the kernels are bit-exact vs a torch reference
+  in headless tests, but int4 has **not yet been visually validated on a full
+  render**, and there is a known **unresolved ~1.7× gap** between live-ComfyUI int4
+  and the headless harness at matching shapes that nobody has root-caused. Treat int4
+  as experimental; prefer int8 unless you specifically need the memory saving.
+
+  | Env var | Behaviour |
+  |---|---|
+  | `ASFP8_INT4_EXT` (default **off**) | Opt-in W4A8 fused int4 Metal kernel (M5 / Metal 4.1 + `ninja`). Off → the default W4A16 reroute handles int4. The default reroute itself has no switch (it's a compatibility path, like patch #13); disable everything int4 with `ASFP8_DISABLE=int4_linear_mps`. |
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
@@ -326,10 +349,11 @@ your machine), then only the patch lines relevant to it:
 
 First and foremost a "make it work on Mac" compatibility layer: it targets the
 specific gaps that block FP8 / INT8 diffusion models on MPS today. On top of that
-it adds **bit-exact acceleration kernels** (fp8-native, int8 W8A8, fused RMSNorm,
-fused RoPE, conv im2col) for the hot seams — **on by default, but gated by a
-startup capability probe** so each only activates on the hardware/software that
-can run it (and any env var above forces a patch on or off). It is not a general
+it adds **bit-exact acceleration kernels** (fp8-native, int8 W8A8, int4 W4A16/W4A8,
+fused RMSNorm, fused RoPE, conv im2col) for the hot seams — **on by default, but
+gated by a startup capability probe** so each only activates on the hardware/software
+that can run it (and any env var above forces a patch on or off). (int4's heavy W4A8
+kernel is the exception — off by default; see the int4 caveat above.) It is not a general
 performance library. If a model hits a *different* unsupported op (e.g. some
 `nvfp4` / `mxfp8` compute paths), it may surface a new error — open an issue with
 the traceback.
