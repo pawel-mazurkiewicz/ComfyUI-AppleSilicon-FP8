@@ -20,9 +20,11 @@
   activates where it's supported; everywhere else it stays inert (nothing to
   configure, nothing breaks). The startup log prints a one-line capability summary
   so you can see exactly which tier is active on your machine. The heavier matmul
-  kernels compile against **Metal 4.1** (developed on **macOS 27**) and need an
-  **M5** GPU plus `ninja` to build — so on M1–M4 or older macOS they simply don't
-  engage. Any env var below can force a patch on or off regardless of the probe.
+  kernels compile against **Metal 4.1** (developed on **macOS 27**) and need
+  Metal-4 tensor ops — established by a runtime shader-compile probe, in practice
+  an **M5** — plus `ninja` to build, so on M1–M4 or older macOS they normally
+  don't engage. Any env var below can force a patch on or off regardless of the
+  probe.
 
 ## Quick start — by machine
 
@@ -41,16 +43,24 @@ are satisfied:
   version; developed on **macOS 27**). Older macOS → the capability probe fails
   and the kernel stays inert. Needs Xcode command-line tools (the Metal compiler)
   and `ninja` to build the ObjC++ extension.
-- **GPU:** the **int8** kernel needs an **M5** (Metal 4 cooperative TensorOps);
-  the **fp8** kernel needs Metal 4.1's fp8 format type. Anything unsupported is
-  detected up front and skipped.
+- **GPU:** the **int8** kernel needs Metal 4 cooperative TensorOps; the **fp8**
+  kernel needs Metal 4.1's fp8 format type — in practice an **M5**.
 
-**M1 / M2 / M3 / M4 — nothing to do.** The M5-class matmul kernels self-detect as
-unsupported and never build, so there's no failed-compile noise and no config.
-You still get the full compatibility layer plus the compile_shader speedups that
-*don't* need Metal 4.1 (fused RMSNorm #18, fused RoPE #21): FP8 matmuls run
-accelerated via bf16 decode on `simdgroup_matrix`, and int8 runs comfy's (fixed)
-weight-only path.
+**How the probe actually decides.** There is no chip-model check anywhere in the
+code. The gate is `tier_b_ready()`: it (a) tries to compile a small
+`mpp::tensor_ops::matmul2d` Metal shader via `torch.mps.compile_shader` and (b)
+looks for `ninja`. Both must succeed. Because (a) depends on your macOS, Metal
+SDK and PyTorch build as much as on the GPU, the answer is not strictly "M5 =
+yes, M1–M4 = no": an M5 on some stacks probes `tensor_ops=no`, and an M4 on a
+recent macOS + PyTorch nightly has probed `tensor_ops=yes`. The startup log's
+`capabilities:` line prints exactly what your machine resolved to — trust that
+over the chip name.
+
+**M1 / M2 / M3 / M4 — nothing to do.** These normally fail the tensor-ops probe,
+so the M5-class matmul kernels stay inert and never build. You still get the full
+compatibility layer plus the compile_shader speedups that *don't* need Metal 4.1
+(fused RMSNorm #18, fused RoPE #21): FP8 matmuls run accelerated via bf16 decode
+on `simdgroup_matrix`, and int8 runs comfy's (fixed) weight-only path.
 
 **M5 / M5 Pro / M5 Max on a recent macOS — just install the build toolchain and
 the kernels turn themselves on:**
@@ -62,11 +72,15 @@ pip install ninja                      # or:  pip install 'comfyui-applesilicon-
 # M5 + Metal 4.1 + ninja and activate automatically — no env vars required.
 ```
 
-Each kernel builds on first use (watch the startup log for the capability summary
-and the `int8_kernel` / fp8 lines) and silently stays inert on any failure —
-including too-old macOS or missing `ninja` — so the defaults are safe everywhere.
-To force a kernel off on a supported machine, set its env var to `off` (e.g.
-`ASFP8_INT8_EXT=off`); to force a build attempt anyway, set it to `1`.
+Each kernel is compiled lazily, on the **first model layer that can use it** —
+never during ComfyUI's startup import. The build prints a `compiling the ... Metal
+kernel` line first so it can't be mistaken for a freeze, and is abandoned after
+`ASFP8_EXT_BUILD_TIMEOUT` seconds (default 600, `0` waits forever) so a wedged
+toolchain degrades to "kernel unavailable" instead of hanging. Any failure —
+too-old macOS, missing `ninja`, build error — silently falls back, so the defaults
+are safe everywhere. To force a kernel off on a supported machine, set its env var
+to `off` (e.g. `ASFP8_INT8_EXT=off`); to force a build attempt anyway, set it
+to `1`.
 
 It started as an FP8 compatibility layer and has grown into a broader Apple
 Silicon quantization layer: it keeps FP8 **and INT8** diffusion models running on
@@ -277,6 +291,7 @@ your machine), then only the patch lines relevant to it:
   | Env var | Behaviour |
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
+  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20) before giving up and falling back. `0` waits indefinitely. |
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
   `compile_shader`** — no Metal 4.1 / M5 needed. Patch #18 fuses the DiT adaLN tail
   (rmsnorm + `(1+scale)·x+shift` + residual) into one `compile_shader` pass and

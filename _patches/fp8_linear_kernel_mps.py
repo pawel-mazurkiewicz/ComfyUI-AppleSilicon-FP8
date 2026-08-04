@@ -23,6 +23,7 @@ TAG = "[AppleSilicon-FP8/fp8_kernel]"
 
 _installed = False
 _kernel = None
+_kernel_tried = False
 _self_checked = False
 _self_ok = True
 _MIN_DIM_DEFAULT = 8192
@@ -63,6 +64,24 @@ def _load_kernel():
             print(f"{TAG} warmup failed; disabling: {e!r}")
             return None
     return mod
+
+
+def _ensure_kernel():
+    """Build the Metal extension lazily, on the FIRST layer that can actually use it.
+
+    Building inside install() blocked ComfyUI's startup import on a synchronous
+    ninja+clang build (issue: "hangs forever at startup when ninja is installed").
+    Deferring it here matches scaled_mm_fp8._get_backend and keeps startup
+    non-blocking; a failed build is remembered so we retry once only.
+    """
+    global _kernel, _kernel_tried
+    if _kernel is not None or _kernel_tried:
+        return _kernel
+    _kernel_tried = True
+    _kernel = _load_kernel()
+    if _kernel is None:
+        print(f"{TAG} fp8 Metal kernel unavailable; using the LUT decode path.")
+    return _kernel
 
 
 def _self_check():
@@ -116,8 +135,6 @@ def _fp8_linear_kernel(input, qdata, scale_weight, bias):
 
 
 def _try_fp8_kernel_forward(self, input):
-    if _kernel is None:
-        return None
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
@@ -170,7 +187,10 @@ def _try_fp8_kernel_forward(self, input):
             if bool((input.detach().abs().amax() > 65504).item()):
                 return None
 
-        # --- BLOCKER: self-check only AFTER all gates pass, never on ineligible layers ---
+        # --- BLOCKER: build + self-check only AFTER all gates pass, never on
+        # ineligible layers (the build is a full ninja/clang extension compile) ---
+        if _ensure_kernel() is None:
+            return None
         if not _self_check():
             return None
 
@@ -181,7 +201,7 @@ def _try_fp8_kernel_forward(self, input):
 
 
 def install():
-    global _installed, _kernel
+    global _installed
     if _installed:
         return
     if sys.platform != "darwin":
@@ -194,10 +214,6 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-
-    _kernel = _load_kernel()
-    if _kernel is None:
-        return  # loader already explained why
 
     try:
         import comfy.ops as ops
@@ -234,4 +250,4 @@ def install():
     _installed = True
     print(f"{TAG} fp8 e4m3 Linear routed through native fp8 matmul2d on MPS "
           f"(half act x fp8 weight; LUT->bf16 weight decode bypassed; min_dim={_min_dim()}; "
-          f"range_guard={_range_guard_on()}).")
+          f"range_guard={_range_guard_on()}). Kernel builds on first fp8 layer, not now.")
