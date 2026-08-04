@@ -40,8 +40,12 @@ def _clear_stale_lock(build_dir, tag=""):
         age = time.time() - os.path.getmtime(lock)
     except OSError:
         return
+    # Twice the abandon timeout, not once: we give up waiting at T but never kill
+    # the build, so a lock just past T may still belong to a compile that is slow
+    # rather than wedged. Being too patient only costs one more stall on a machine
+    # that is already broken; being too eager puts two ninja runs in one directory.
     timeout = _build_timeout()
-    threshold = timeout if timeout > 0 else BUILD_TIMEOUT_DEFAULT
+    threshold = 2 * (timeout if timeout > 0 else BUILD_TIMEOUT_DEFAULT)
     if age <= threshold:
         return
     try:
@@ -52,16 +56,20 @@ def _clear_stale_lock(build_dir, tag=""):
         pass
 
 
-def _abandoned_lock_cleanup(build_dir, thread):
+def _abandoned_lock_cleanup(build_dir, thread, owned=True):
     """Cleanup for a build we stopped waiting on.
 
     torch releases the baton in a `finally` that an abandoned daemon thread never
     reaches, so without this every timeout strands a lock for the next run.
+
+    `owned` guards the case a live thread cannot distinguish on its own: a thread
+    blocked in FileBaton.wait() is alive but holds nothing, and unlinking there
+    would free another process's lock and fail its build on release.
     """
     lock = _lock_path(build_dir)
 
     def cleanup():
-        if thread.is_alive() and os.path.exists(lock):
+        if owned and thread.is_alive() and os.path.exists(lock):
             try:
                 os.unlink(lock)
             except OSError:
@@ -82,6 +90,9 @@ def _cpp_load_guarded(cpp_load, **kwargs):
         return cpp_load(**kwargs)
 
     build_dir = kwargs.get("build_directory")
+    # A lock already present isn't ours: our thread will be waiting on it, not
+    # holding it, so we must not clean it up on the way out.
+    pre_existing_lock = os.path.exists(_lock_path(build_dir))
     result = {}
 
     def run():
@@ -95,7 +106,9 @@ def _cpp_load_guarded(cpp_load, **kwargs):
     t.start()
     t.join(timeout)
     if t.is_alive():
-        atexit.register(_abandoned_lock_cleanup(build_dir, t))
+        atexit.register(
+            _abandoned_lock_cleanup(build_dir, t, owned=not pre_existing_lock)
+        )
         raise TimeoutError(
             f"Metal extension build still running after {timeout:g}s; giving up. "
             f"If this repeats, delete {build_dir} and restart. Raise "

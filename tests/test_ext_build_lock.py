@@ -96,3 +96,34 @@ def test_abandoned_build_cleanup_drops_the_lock(loader, tmp_path):
         assert not os.path.exists(lock)
     finally:
         release.set()
+
+
+def test_lock_from_a_slow_but_live_build_is_preserved(loader, tmp_path, monkeypatch):
+    """We abandon a build at the timeout but never kill it.
+
+    So a lock only just past that age may still belong to a compile that is slow
+    rather than wedged; clearing it would put two ninja runs in one directory.
+    """
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "60")
+    lock = _plant_lock(tmp_path, age_seconds=90)
+
+    loader._clear_stale_lock(str(tmp_path))
+
+    assert os.path.exists(lock)
+
+
+def test_cleanup_leaves_a_lock_we_never_owned(loader, tmp_path):
+    """A thread stuck in FileBaton.wait() is alive but owns nothing.
+
+    Unlinking there would free another process's live lock and make its build
+    fail on release.
+    """
+    lock = _plant_lock(tmp_path)
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait, args=(30,), daemon=True)
+    thread.start()
+    try:
+        loader._abandoned_lock_cleanup(str(tmp_path), thread, owned=False)()
+        assert os.path.exists(lock)
+    finally:
+        release.set()

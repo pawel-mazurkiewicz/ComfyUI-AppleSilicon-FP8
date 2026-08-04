@@ -123,6 +123,9 @@ def _bring(param, target_dtype, device):
         return None
     if _needs_handling(param):
         return _to_compute(param, target_dtype, device)
+    # Note: a passed-through QuantizedTensor reaches weight_function still wrapped,
+    # where native would have dequantized it first. Reachable only with a non-fp8
+    # QuantizedTensor weight, a raw-fp8 bias, and a LoRA on the same layer.
     if param.device != device:
         param = param.to(device=device)
     if param.dtype == target_dtype:

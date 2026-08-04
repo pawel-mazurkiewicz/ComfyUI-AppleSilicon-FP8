@@ -77,6 +77,10 @@ def module():
     os.makedirs(build_dir, exist_ok=True)
     _clear_stale_lock(build_dir, "[int4_ext]")
 
+    print("[int4_ext] compiling the INT4 Metal kernel (first use; seconds to a few "
+          "minutes depending on the toolchain) — not frozen, this resumes when the "
+          "build ends.", flush=True)
+
     saved = cpp.TORCH_LIB_PATH
     try:
         cpp.TORCH_LIB_PATH = _nospace_torch_lib()
