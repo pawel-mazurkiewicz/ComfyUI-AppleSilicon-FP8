@@ -73,6 +73,7 @@ def install():
         import comfy_kitchen  # noqa: F401  (ensures backends register)
         from comfy_kitchen.registry import registry
         import comfy_kitchen.backends.eager.quantization as qmod
+        import comfy_kitchen.float_utils as fumod
     except Exception:
         return  # comfy_kitchen not installed; nothing to patch
 
@@ -114,6 +115,25 @@ def install():
         for mod in (eager, qmod):
             setattr(mod, fname, wrapped)
         nvfp4_mxfp8.append(fname)
+
+    # The NVFP4 *quantize* direction swizzles its fp8 block-scales with `to_blocked`, which
+    # pads via `padded[:rows, :cols] = input_matrix` — a strided fp8 copy MPS has no kernel
+    # for. This is the default branch of comfy.quant_ops NVFP4 quantize (stochastic_rounding
+    # defaults to 0), so an NVFP4 load hits it with no LoRA involved. Same fix as
+    # comfy.float.to_blocked in stochastic_round_fp8; the rearrangement is pure data movement
+    # so the CPU round-trip is bit-exact. MXFP8's uint8 E8M0 scales work on MPS and are left
+    # alone. Patched on every module that resolves the name (eager quantization imports it).
+    orig_to_blocked = getattr(fumod, "to_blocked", None)
+    if orig_to_blocked is not None:
+        def to_blocked(input_matrix, *args, **kwargs):
+            if input_matrix.device.type == "mps" and input_matrix.dtype in FP8_DTYPES:
+                return orig_to_blocked(input_matrix.cpu(), *args, **kwargs).to(input_matrix.device)
+            return orig_to_blocked(input_matrix, *args, **kwargs)
+
+        for mod in (fumod, qmod, comfy_kitchen):
+            if getattr(mod, "to_blocked", None) is not None:
+                mod.to_blocked = to_blocked
+        nvfp4_mxfp8.append("to_blocked")
 
     extra = f" (+ {', '.join(nvfp4_mxfp8)} via CPU)" if nvfp4_mxfp8 else ""
     print(f"{TAG} patched comfy_kitchen eager FP8 dequantize/quantize for MPS{extra}.")
