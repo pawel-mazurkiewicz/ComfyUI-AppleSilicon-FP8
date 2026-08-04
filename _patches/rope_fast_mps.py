@@ -8,8 +8,8 @@ out once, fp32 math in registers, store in the input dtype. freqs_cis is the pre
 matrix per (position, pair) -- NO complex multiply, NO cos/sin computed in-kernel.
 
 Pure elementwise compile_shader -> works on Apple Silicon M1+ (torch>=2.5); NOT gated on Metal
-4.1 / M5. DEFAULT ON, gated on compile_shader (ASFP8_ROPE_FAST=off disables); the #21b comfy-func
-retarget is opt-in via ASFP8_ROPE_COMFY_RETARGET=1. Never fatal: any compile/shape/dtype/convention
+4.1 / M5. DEFAULT ON, gated on compile_shader (ASFP8_ROPE_FAST=off disables). Never fatal: any
+compile/shape/dtype/convention
 mismatch falls back to the captured original eager apply_rope*. Per-call backend trace in
 _backend_events records (fn_name, "kernel"|"fallback", shape) for the spy tests. Patches the four
 comfy_kitchen.backends.eager attributes the registry reads via getattr() on every dispatch, and --
@@ -208,209 +208,6 @@ def apply_rope_split_half_fused_pair(xq, xk, freqs_cis):
             apply_rope_split_half1_fused(xk, freqs_cis))
 
 
-# ===========================================================================
-# Patch #21b: retarget the REAL comfy RoPE functions the live models call.
-#
-# A live probe (2026-07-01) showed comfy_kitchen.backends.eager fires at most ONCE per model --
-# the DiT / TE actually call comfy's OWN rope functions, which we must intercept directly:
-#
-#   comfy.ldm.flux.math.apply_rope / .apply_rope1      INTERLEAVED 2x2 form (single fp32 freqs
-#       tensor, shape (...,halfD,2,2)); identical convention to comfy_kitchen's apply_rope, so it
-#       maps onto the existing split=0 kernel with NO new math.  (flux.math.apply_rope itself only
-#       delegates to comfy.quant_ops.ck.apply_rope when not training; we intercept ABOVE that.)
-#
-#   comfy.text_encoders.llama.apply_rope               HALF-SPLIT rotate_half form. freqs_cis is a
-#   (== comfy.ldm.ideogram4.model.apply_rope,           3-TUPLE (cos, sin, nsin), cos full-dim D,
-#       same object, imported by alias)                 sin/nsin half-dim. Expressed on the split=1
-#       kernel by building a per-pair 2x2 table:
-#           out[p]        = cos[p]*x[p]      + nsin[p]*x[p+halfD]   (= f00*a + f01*b)
-#           out[p+halfD]  = sin[p]*x[p]      + cos[p+halfD]*x[p+halfD] (= f10*a + f11*b)
-#       i.e. table row = [cos[:halfD], nsin, sin, cos[halfD:]]. Bit-faithful to the real fn (it does
-#       q*cos then addcmul_ with nsin/sin in fp32, then casts back).
-#
-# Both retargets are guarded, never fatal, and gated on the SAME opt-in ASFP8_ROPE_FAST=1.
-# Fallback for each comfy target is the captured REAL comfy function (NOT eager) -- so a fallback is
-# always bit-identical to stock comfy. Anything the kernel cannot match -> fall back, never wrong.
-# ===========================================================================
-
-# captured REAL comfy originals (oracle + fallback). Keys: 'flux.apply_rope', 'flux.apply_rope1',
-# 'llama.apply_rope'. Kept separate from _orig (which holds comfy_kitchen eager originals).
-_orig_comfy: dict = {}
-_comfy_replacements: list = []   # (module_dict, attr_name, original_fn) for clean uninstall
-_comfy_installed = False         # idempotency: a 2nd call would capture wrappers as "originals"
-
-
-def _interleaved_single(x, freqs_cis):
-    """Run the split=0 (interleaved 2x2) kernel for one tensor. Returns out or None (-> fallback).
-    Shared validity gate with _rope_fused, but never touches _orig / never records."""
-    if (x.device.type != "mps" or x.dtype not in _MSL_T
-            or not torch.is_tensor(freqs_cis) or freqs_cis.device != x.device
-            or x.numel() == 0 or x.dim() != 4):
-        return None
-    D = x.shape[-1]
-    if D % 2 != 0:
-        return None
-    halfD = D // 2
-    L = x.shape[-2]
-    fr = _prep_table(freqs_cis, halfD, L)
-    if fr is None:
-        return None
-    return _launch(x, fr, D, halfD, L, split=0)
-
-
-def _flux_apply_rope1_fused(x, freqs_cis):
-    global _warned
-    try:
-        out = _interleaved_single(x, freqs_cis)
-    except Exception as e:
-        if not _warned:
-            print(f"{TAG} flux apply_rope1 kernel error ({e}); falling back.", flush=True)
-            _warned = True
-        out = None
-    if out is None:
-        _record("flux.apply_rope1", "fallback", getattr(x, "shape", ()))
-        return _orig_comfy["flux.apply_rope1"](x, freqs_cis)
-    _record("flux.apply_rope1", "kernel", x.shape)
-    return out
-
-
-def _flux_apply_rope_fused(xq, xk, freqs_cis):
-    """flux pair wrapper. Run the kernel for BOTH q and k; if either cannot, fall back the whole
-    pair to the real comfy original (never mix kernel + fallback within one pair)."""
-    global _warned
-    try:
-        oq = _interleaved_single(xq, freqs_cis)
-        ok = _interleaved_single(xk, freqs_cis) if oq is not None else None
-    except Exception as e:
-        if not _warned:
-            print(f"{TAG} flux apply_rope kernel error ({e}); falling back.", flush=True)
-            _warned = True
-        oq = ok = None
-    if oq is None or ok is None:
-        _record("flux.apply_rope", "fallback", getattr(xq, "shape", ()))
-        return _orig_comfy["flux.apply_rope"](xq, xk, freqs_cis)
-    _record("flux.apply_rope", "kernel", xq.shape)
-    _record("flux.apply_rope", "kernel", xk.shape)
-    return oq, ok
-
-
-def _prep_table_llama(freqs_cis, halfD):
-    """Build a contiguous fp32 [L, halfD, 4] split=1 rotation table from llama's (cos, sin, nsin)
-    3-tuple, or return (None, 0) -> fallback. cos has last-dim 2*halfD; sin/nsin have last-dim halfD.
-    Leading dims must collapse to exactly L rows (i.e. batch/head broadcast == 1) so the kernel's
-    row%L indexing is valid; a true batch (>1) table is rejected (-> fallback)."""
-    if not (isinstance(freqs_cis, (tuple, list)) and len(freqs_cis) == 3):
-        return None, 0
-    cos, sin, nsin = freqs_cis
-    if not all(torch.is_tensor(t) for t in (cos, sin, nsin)):
-        return None, 0
-    if cos.shape[-1] != 2 * halfD or sin.shape[-1] != halfD or nsin.shape[-1] != halfD:
-        return None, 0
-
-    def _flatten(t, last):
-        flat = t.reshape(-1, last)   # collapse all leading dims
-        return flat                  # rows must equal L (checked against the cos rows below)
-
-    cflat = _flatten(cos, 2 * halfD)
-    sflat = _flatten(sin, halfD)
-    nflat = _flatten(nsin, halfD)
-    L = cflat.shape[0]
-    if sflat.shape[0] != L or nflat.shape[0] != L:   # batch/head broadcast mismatch -> fallback
-        return None, 0
-    cos_lo = cflat[:, :halfD]
-    cos_hi = cflat[:, halfD:]
-    table = torch.stack([cos_lo, nflat, sflat, cos_hi], dim=-1)   # (L, halfD, 4)
-    return table.reshape(L, halfD, 4).to(torch.float32).contiguous(), L
-
-
-def _llama_apply_rope_fused(xq, xk, freqs_cis):
-    """llama/ideogram pair wrapper (half-split rotate_half). Build the 2x2 table once from
-    (cos,sin,nsin), then run the split=1 kernel for both q and k. Fall back the whole pair to the
-    real comfy original on any mismatch."""
-    global _warned
-    fb = _orig_comfy["llama.apply_rope"]
-    try:
-        if (xq.device.type != "mps" or xq.dtype not in _MSL_T or xk.dtype not in _MSL_T
-                or xq.dim() != 4 or xk.dim() != 4
-                or xq.shape[-1] % 2 or xk.shape[-1] != xq.shape[-1]
-                or xq.numel() == 0 or xk.numel() == 0):
-            raise ValueError("unsupported shape/dtype")
-        D = xq.shape[-1]
-        halfD = D // 2
-        table, L = _prep_table_llama(freqs_cis, halfD)
-        if table is None or table.device != xq.device:
-            raise ValueError("table not buildable on device")
-        # The table has exactly L position rows; require both tensors' sequence length == L so the
-        # kernel's row%L indexing lands on the right position (self-attention: Lq == Lk == L).
-        if xq.shape[-2] != L or xk.shape[-2] != L:
-            raise ValueError("seq length != table rows")
-        oq = _launch(xq, table, D, halfD, L, split=1)
-        ok = _launch(xk, table, D, halfD, L, split=1)
-    except Exception as e:
-        if not isinstance(e, ValueError) and not _warned:
-            print(f"{TAG} llama apply_rope kernel error ({e}); falling back.", flush=True)
-            _warned = True
-        _record("llama.apply_rope", "fallback", getattr(xq, "shape", ()))
-        return fb(xq, xk, freqs_cis)
-    _record("llama.apply_rope", "kernel", xq.shape)
-    _record("llama.apply_rope", "kernel", xk.shape)
-    return oq, ok
-
-
-def _install_comfy():
-    """Capture the REAL comfy rope functions and replace every reference to them (by object
-    identity, mirroring mps_profile._try_wrap_rope) so aliased re-imports -- e.g.
-    comfy.ldm.ideogram4.model.apply_rope, which IS llama.apply_rope -- are all rerouted. Best-effort:
-    a missing module just skips that target."""
-    global _comfy_installed
-    if _comfy_installed:
-        return
-    import sys
-    id_map = {}   # id(original_fn) -> wrapper
-    try:
-        import comfy.ldm.flux.math as _fm
-        _orig_comfy["flux.apply_rope"] = _fm.apply_rope
-        _orig_comfy["flux.apply_rope1"] = _fm.apply_rope1
-        id_map[id(_fm.apply_rope)] = _flux_apply_rope_fused
-        id_map[id(_fm.apply_rope1)] = _flux_apply_rope1_fused
-    except Exception:
-        pass
-    try:
-        import comfy.text_encoders.llama as _ll
-        _orig_comfy["llama.apply_rope"] = _ll.apply_rope
-        id_map[id(_ll.apply_rope)] = _llama_apply_rope_fused
-    except Exception:
-        pass
-    if not id_map:
-        return
-    for _mod_name, mod in list(sys.modules.items()):
-        if (mod is None or _mod_name.startswith("torch._classes")
-                or _mod_name.startswith("torch.classes")):
-            continue
-        try:
-            d = mod.__dict__
-            for attr, val in list(d.items()):
-                wrap = id_map.get(id(val))
-                if wrap is not None and val is not wrap:
-                    _comfy_replacements.append((d, attr, val))
-                    d[attr] = wrap
-        except Exception:
-            continue
-    _comfy_installed = True
-
-
-def _uninstall_comfy():
-    global _comfy_installed
-    _comfy_installed = False
-    for d, attr, orig in _comfy_replacements:
-        try:
-            d[attr] = orig
-        except Exception:
-            pass
-    _comfy_replacements.clear()
-    _orig_comfy.clear()
-
-
 _PATCH_MAP = {
     "apply_rope1": "apply_rope1_fused",
     "apply_rope": "apply_rope_fused_pair",
@@ -466,33 +263,12 @@ def install():
             _do_install()
         except Exception as e:                 # never fatal
             print(f"{TAG} eager install failed ({e}); leaving eager rope untouched.", flush=True)
-    # Patch #21b: retarget the REAL comfy rope functions the live models call
-    # (comfy.ldm.flux / llama apply_rope). Higher-risk — it patches live model code — so it
-    # stays OPT-IN behind its own flag (default OFF) until it has broader cross-model
-    # validation. ASFP8_ROPE_COMFY_RETARGET=1 turns it on. Independent of comfy_kitchen; never fatal.
-    if _caps.resolve("ASFP8_ROPE_COMFY_RETARGET", default_on=False, cap=_caps.has_compile_shader):
-        try:
-            _install_comfy()
-        except Exception as e:
-            print(f"{TAG} comfy retarget failed ({e}); leaving comfy rope untouched.", flush=True)
-    targeted = sorted(_orig_comfy.keys())
-    print(f"{TAG} fused RoPE active on MPS (eager apply_rope/apply_rope_split_half"
-          f"{' + comfy ' + str(targeted) if targeted else ''} rerouted; interleaved + split-half; "
-          f"fp32 math, no Metal-4.1/M5 requirement; comfy-retarget "
-          f"{'ON' if targeted else 'OFF (ASFP8_ROPE_COMFY_RETARGET=1 to enable)'}).", flush=True)
+    print(f"{TAG} fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; "
+          f"interleaved + split-half; fp32 math, no Metal-4.1/M5 requirement).", flush=True)
 
 
 def install_for_test():
     _do_install()
-
-
-def install_comfy_for_test():
-    """Test-only: capture + patch the comfy targets (requires comfy importable)."""
-    _install_comfy()
-
-
-def uninstall_comfy_for_test():
-    _uninstall_comfy()
 
 
 def uninstall_for_test():

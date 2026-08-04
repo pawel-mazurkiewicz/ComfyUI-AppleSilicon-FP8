@@ -43,8 +43,6 @@ Patches applied:
                                                     disable: comfy_kitchen apply_rope / apply_rope_split_half via ONE
                                                     compile_shader kernel; ~6-17x/call over eager; fp32 math, no
                                                     Metal-4.1/M5 requirement)
- 21b. fused RoPE retargeted onto real comfy funcs  (OPT-IN ASFP8_ROPE_COMFY_RETARGET=1: reroutes comfy.ldm.flux /
-                                                    llama apply_rope on live models; higher-risk, off by default)
  22. INT4 ConvRot W4A16/W4A8 Linear on MPS          (DEFAULT reroute: skip comfy_kitchen's wasted activation-int4
                                                     quant, run W4A16 bf16 GEMM — fixes "int4 ~2x slower than int8"
                                                     (issue #3), brings PARITY with int8; int4's win is memory not
