@@ -37,6 +37,8 @@ from ._common import FP8_DTYPES, decode_fp8
 
 TAG = "[AppleSilicon-FP8/comfy_kitchen]"
 
+_installed = False
+
 
 def _cpu_dequant_on_mps(orig):
     """Run a comfy_kitchen eager dequant on CPU when its inputs are on MPS, then move
@@ -65,6 +67,9 @@ def _cpu_dequant_on_mps(orig):
 
 
 def install():
+    global _installed
+    if _installed:
+        return
     if sys.platform != "darwin":
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
@@ -73,9 +78,15 @@ def install():
         import comfy_kitchen  # noqa: F401  (ensures backends register)
         from comfy_kitchen.registry import registry
         import comfy_kitchen.backends.eager.quantization as qmod
-        import comfy_kitchen.float_utils as fumod
     except Exception:
         return  # comfy_kitchen not installed; nothing to patch
+
+    # Only backs the NVFP4 to_blocked reroute below. Kept out of the gate above so a
+    # comfy_kitchen build without it still gets the fp8 fix this patch exists for.
+    try:
+        import comfy_kitchen.float_utils as fumod
+    except Exception:
+        fumod = None
 
     eager = registry._backends.get("eager")
     if eager is None:
@@ -123,7 +134,7 @@ def install():
     # comfy.float.to_blocked in stochastic_round_fp8; the rearrangement is pure data movement
     # so the CPU round-trip is bit-exact. MXFP8's uint8 E8M0 scales work on MPS and are left
     # alone. Patched on every module that resolves the name (eager quantization imports it).
-    orig_to_blocked = getattr(fumod, "to_blocked", None)
+    orig_to_blocked = getattr(fumod, "to_blocked", None) if fumod is not None else None
     if orig_to_blocked is not None:
         def to_blocked(input_matrix, *args, **kwargs):
             if input_matrix.device.type == "mps" and input_matrix.dtype in FP8_DTYPES:
@@ -135,5 +146,6 @@ def install():
                 mod.to_blocked = to_blocked
         nvfp4_mxfp8.append("to_blocked")
 
+    _installed = True
     extra = f" (+ {', '.join(nvfp4_mxfp8)} via CPU)" if nvfp4_mxfp8 else ""
     print(f"{TAG} patched comfy_kitchen eager FP8 dequantize/quantize for MPS{extra}.")

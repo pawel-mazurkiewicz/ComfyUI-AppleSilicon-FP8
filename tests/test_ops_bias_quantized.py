@@ -177,3 +177,20 @@ def test_raw_fp8_weight_is_still_decoded(patched):
     assert w.dtype == torch.bfloat16
     assert w.device.type == "mps"
     torch.testing.assert_close(w.cpu().float(), src.to(torch.float8_e4m3fn).float())
+
+
+@requires_mps
+def test_int8_weight_survives_an_fp8_bias(patched):
+    """The rescue is decided per layer but must be applied per parameter.
+
+    An fp8 bias must not drag an int8 weight through dequantize() -- that is the
+    issue #9 failure reached by a different route.
+    """
+    weight = _quantized("TensorWiseINT8Layout")
+    bias = torch.randn(64, dtype=torch.bfloat16).to(torch.float8_e4m3fn).to("mps")
+    layer = _FakeLayer(weight, bias)
+
+    w, b = ops.cast_bias_weight(layer, device=torch.device("mps"), dtype=weight.dtype)
+
+    assert isinstance(w, QuantizedTensor), f"wrapper stripped by the bias: {type(w).__name__}"
+    assert b.dtype == torch.bfloat16, "the fp8 bias still needs decoding"

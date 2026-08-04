@@ -112,6 +112,24 @@ def _to_compute(param, target_dtype, device):
     return param.to(dtype=target_dtype)
 
 
+def _bring(param, target_dtype, device):
+    """Rescue only the param that needs it.
+
+    The fast path is chosen per layer, so an fp8 bias can pull in a weight that
+    was fine as-is; dequantizing that weight would strip a wrapper comfy still
+    needs (issue #9).
+    """
+    if param is None:
+        return None
+    if _needs_handling(param):
+        return _to_compute(param, target_dtype, device)
+    if param.device != device:
+        param = param.to(device=device)
+    if param.dtype == target_dtype:
+        return param
+    return param.to(dtype=target_dtype)
+
+
 def _fp8_safe_bias_dtype(bias_dtype, dtype, input_tensor):
     """Fallback for delegated paths: never let bias_dtype be FP8 on MPS."""
     if bias_dtype is not None:
@@ -164,13 +182,13 @@ def install():
                 if bias_dtype is not None and bias_dtype not in FP8_DTYPES:
                     btarget = bias_dtype
 
-                w = _to_compute(weight, target, dev)
+                w = _bring(weight, target, dev)
                 for f in s.weight_function:
                     w = f(w)
 
                 b = None
                 if bias is not None:
-                    b = _to_compute(bias, btarget, dev)
+                    b = _bring(bias, btarget, dev)
                     for f in s.bias_function:
                         b = f(b)
 

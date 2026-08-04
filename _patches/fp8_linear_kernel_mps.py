@@ -138,6 +138,11 @@ def _try_fp8_kernel_forward(self, input):
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
+        # Build already attempted and failed: bail before the range guard below,
+        # which costs a full-tensor amax plus a device sync on every forward.
+        if _kernel_tried and _kernel is None:
+            return None
+
         # --- cheap rejects first (so non-fp8 / int8 / plain layers fall through fast) ---
         if not isinstance(input, torch.Tensor) or input.device.type != "mps":
             return None

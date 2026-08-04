@@ -266,3 +266,43 @@ def test_wrapper_dispatches_native_not_fallback(monkeypatch):
     inp = (torch.randn(64, K) * 0.3).to(torch.bfloat16).to("mps")
     out = forward(holder, inp)
     assert torch.equal(out, SENTINEL), "wrapper did not dispatch the native sentinel path"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_failed_build_short_circuits_before_the_range_guard(monkeypatch):
+    """Once the build is known to have failed, an eligible layer must bail early.
+
+    The fp16 range guard is a full-tensor amax plus a device sync, and it sits
+    ahead of _ensure_kernel(), so without a top-level short circuit every
+    eligible fp8 Linear pays it on every step for the rest of the session.
+    """
+    QuantizedTensor = pytest.importorskip("comfy_kitchen.tensor").QuantizedTensor
+    from _patches import fp8_linear_kernel_mps as patch
+
+    monkeypatch.setenv("ASFP8_FP8_NATIVE_MIN_DIM", "8")
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+
+    wf = torch.randn(32, 32, dtype=torch.bfloat16)
+    qw = QuantizedTensor.from_float(
+        wf, "TensorCoreFP8Layout", scale=torch.tensor(1.0)
+    ).to(device="mps")
+
+    class Layer:
+        weight = qw
+        bias = None
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 32, dtype=torch.bfloat16, device="mps")
+
+    seen = []
+    real_amax = torch.Tensor.amax
+    monkeypatch.setattr(
+        torch.Tensor,
+        "amax",
+        lambda self, *a, **k: (seen.append(1), real_amax(self, *a, **k))[1],
+    )
+
+    assert patch._try_fp8_kernel_forward(Layer(), x) is None
+    assert seen == [], "range guard ran though the kernel is known unavailable"
