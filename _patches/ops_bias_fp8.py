@@ -87,7 +87,12 @@ def _needs_handling(param):
     if param is None:
         return False
     if isinstance(param, _QuantizedTensor):
-        return True
+        # Only FP8-backed storage needs rescuing: MPS can neither cast nor gather
+        # on fp8, so comfy's embedding lookup would raise on the raw qdata.
+        # Other layouts (int8, int4) must keep their wrapper — comfy reaches
+        # into it for the raw storage, and a dequantized stand-in makes
+        # dequantize_int8_embedding reject the dtype outright (issue #9).
+        return getattr(param, "storage_dtype", None) in FP8_DTYPES
     return param.dtype in FP8_DTYPES
 
 
