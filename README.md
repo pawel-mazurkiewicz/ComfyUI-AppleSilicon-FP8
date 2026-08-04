@@ -75,8 +75,10 @@ pip install ninja                      # or:  pip install 'comfyui-applesilicon-
 Each kernel is compiled lazily, on the **first model layer that can use it** —
 never during ComfyUI's startup import. The build prints a `compiling the ... Metal
 kernel` line first so it can't be mistaken for a freeze, and is abandoned after
-`ASFP8_EXT_BUILD_TIMEOUT` seconds (default 600, `0` waits forever) so a wedged
-toolchain degrades to "kernel unavailable" instead of hanging. Any failure —
+`ASFP8_EXT_BUILD_TIMEOUT` seconds (default 600) so a wedged toolchain degrades to
+"kernel unavailable" instead of hanging. A build lock left behind by a killed
+ComfyUI is cleared automatically once it is older than that timeout, so a
+force-quit mid-build can't wedge later runs. Any failure —
 too-old macOS, missing `ninja`, build error — silently falls back, so the defaults
 are safe everywhere. To force a kernel off on a supported machine, set its env var
 to `off` (e.g. `ASFP8_INT8_EXT=off`); to force a build attempt anyway, set it
@@ -291,7 +293,7 @@ your machine), then only the patch lines relevant to it:
   | Env var | Behaviour |
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
-  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20) before giving up and falling back. `0` waits indefinitely. |
+  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. Doubles as the age after which an abandoned build lock is treated as stale and cleared. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
   `compile_shader`** — no Metal 4.1 / M5 needed. Patch #18 fuses the DiT adaLN tail
   (rmsnorm + `(1+scale)·x+shift` + residual) into one `compile_shader` pass and

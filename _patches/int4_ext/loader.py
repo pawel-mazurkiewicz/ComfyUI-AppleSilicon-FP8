@@ -8,6 +8,13 @@ any failure. Same space-in-path workaround as int8_ext/fp8_ext.
 import os
 import shutil
 
+from .._extbuild import (  # noqa: F401  (re-exported for the build-lock tests)
+    _abandoned_lock_cleanup,
+    _build_timeout,
+    _clear_stale_lock,
+    _cpp_load_guarded,
+)
+
 _mod = None
 _tried = False
 
@@ -68,11 +75,13 @@ def module():
     src = os.path.join(here, "int4_matmul2d.mm")
     build_dir = os.path.join(_NOSPACE_ROOT, "int4_ext")
     os.makedirs(build_dir, exist_ok=True)
+    _clear_stale_lock(build_dir, "[int4_ext]")
 
     saved = cpp.TORCH_LIB_PATH
     try:
         cpp.TORCH_LIB_PATH = _nospace_torch_lib()
-        _mod = cpp_load(
+        _mod = _cpp_load_guarded(
+            cpp_load,
             name="asfp8_int4_matmul2d",
             sources=[src],
             extra_cflags=["-std=c++17", "-ObjC++"],
