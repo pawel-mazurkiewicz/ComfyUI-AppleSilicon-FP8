@@ -1,4 +1,7 @@
 import os
+import shutil
+import threading
+import time
 
 import pytest
 import torch
@@ -68,6 +71,74 @@ def test_install_noop_when_not_capable(monkeypatch):
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
+
+
+# --- the Metal build must never run on the ComfyUI startup thread ---------------
+
+
+def test_install_does_not_build_the_extension(monkeypatch):
+    """install() runs at import time: it may wire the seam, never build the kernel."""
+    from _patches import _caps
+    monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+
+    builds = []
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    patch.install()
+    assert builds == [], "install() built the Metal extension on the startup thread"
+
+
+def test_ineligible_layer_does_not_trigger_a_build(monkeypatch):
+    """A non-fp8 Linear must not drag in the multi-minute Metal build."""
+    builds = []
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    class Holder:
+        weight = torch.zeros(8, 8)  # plain tensor, not a QuantizedTensor
+        bias = None
+
+    assert patch._try_fp8_kernel_forward(Holder(), torch.zeros(4, 8)) is None
+    assert builds == [], "an ineligible layer triggered the Metal build"
+
+
+def test_loader_gives_up_when_the_build_stalls(monkeypatch):
+    """A stalled toolchain must degrade to 'kernel unavailable', not block forever."""
+    import torch.utils.cpp_extension as cpp
+
+    from _patches import _caps
+
+    if shutil.which("xcrun") is None or not _caps.ninja_available():
+        pytest.skip("needs the Metal toolchain + ninja to reach the build call")
+
+    monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
+    monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
+    _reset_loader(monkeypatch)
+
+    started = threading.Event()
+    never = object()
+
+    def stalled_build(*a, **k):
+        started.set()
+        time.sleep(5.0)
+        return never
+
+    monkeypatch.setattr(cpp, "load", stalled_build)
+
+    t0 = time.monotonic()
+    mod = loader.module()
+    elapsed = time.monotonic() - t0
+
+    assert started.is_set(), "the build was never attempted"
+    assert mod is None, "a stalled build must report the kernel as unavailable"
+    assert elapsed < 3.0, f"loader blocked {elapsed:.1f}s on a stalled build"
 
 
 def test_eligibility_returns_none_no_kernel(monkeypatch):

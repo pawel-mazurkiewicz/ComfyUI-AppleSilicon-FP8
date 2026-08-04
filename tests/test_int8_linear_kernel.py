@@ -7,9 +7,14 @@ Integration test (opt-in, ASFP8_INT8_EXT=1 on an MPS box): the kernel-backed
 int8_linear is bit-identical to comfy_kitchen's original across convrot/bias/3D/M=1.
 """
 import os
+import shutil
+import threading
+import time
 
 import pytest
 import torch
+
+from conftest import requires_mps
 
 from _patches import int8_linear_kernel_mps as patch
 
@@ -38,6 +43,119 @@ def test_install_noop_when_not_capable(monkeypatch):
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
+
+
+# --- the Metal build must never run on the ComfyUI startup thread ---------------
+# Regression guard for "ComfyUI hangs forever at startup when `ninja` is installed":
+# install() used to run a synchronous ninja+clang build of the ObjC++/Metal source
+# while ComfyUI was still importing custom nodes, with no timeout and no message.
+
+
+@requires_mps
+def test_install_does_not_build_the_extension(monkeypatch):
+    """install() runs at import time: it may wire the seam, never build the kernel."""
+    from _patches import _caps
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+
+    builds = []
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    patch.install()
+    assert builds == [], "install() built the Metal extension on the startup thread"
+
+
+@requires_mps
+def test_kernel_builds_on_first_eligible_forward(monkeypatch):
+    """The build is deferred to the first int8 layer that really needs it, once."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    builds = []
+    fake_kernel = object()
+
+    def fake_build():
+        builds.append(1)
+        return fake_kernel
+
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", fake_build, raising=False)
+
+    out = torch.full((1,), 7.0)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: out, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    assert patch._try_int8_kernel_forward(Holder(), x) is out
+    assert builds == [1], "first eligible forward did not build the kernel"
+    assert patch._try_int8_kernel_forward(Holder(), x) is out
+    assert builds == [1], "kernel was rebuilt on a later forward"
+
+
+@requires_mps
+def test_ineligible_layer_does_not_trigger_a_build(monkeypatch):
+    """A non-int8 Linear must not drag in the multi-minute Metal build."""
+    builds = []
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    class Holder:
+        weight = torch.zeros(8, 8)  # plain tensor, not a QuantizedTensor
+        bias = None
+
+    got = patch._try_int8_kernel_forward(Holder(), torch.zeros(4, 8, device="mps"))
+    assert got is None
+    assert builds == [], "an ineligible layer triggered the Metal build"
+
+
+def test_loader_gives_up_when_the_build_stalls(monkeypatch):
+    """A stalled toolchain must degrade to 'kernel unavailable', not block forever."""
+    import torch.utils.cpp_extension as cpp
+
+    from _patches import _caps
+    from _patches.int8_ext import loader
+
+    if shutil.which("xcrun") is None or not _caps.ninja_available():
+        pytest.skip("needs the Metal toolchain + ninja to reach the build call")
+
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
+    monkeypatch.setattr(loader, "_tried", False, raising=False)
+    monkeypatch.setattr(loader, "_mod", None, raising=False)
+
+    started = threading.Event()
+    never = object()
+
+    def stalled_build(*a, **k):
+        started.set()
+        time.sleep(5.0)
+        return never
+
+    monkeypatch.setattr(cpp, "load", stalled_build)
+
+    t0 = time.monotonic()
+    mod = loader.module()
+    elapsed = time.monotonic() - t0
+
+    assert started.is_set(), "the build was never attempted"
+    assert mod is None, "a stalled build must report the kernel as unavailable"
+    assert elapsed < 3.0, f"loader blocked {elapsed:.1f}s on a stalled build"
 
 
 def test_wrapper_falls_back_off_mps(monkeypatch):

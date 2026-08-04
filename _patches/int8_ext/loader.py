@@ -13,11 +13,59 @@ no-space directory. Best-effort, reverted on failure.
 
 import os
 import shutil
+import threading
 
 _mod = None
 _tried = False
 
 _NOSPACE_ROOT = "/tmp/asfp8_build"
+
+# Ceiling on one cold Metal-extension build, in seconds (ASFP8_EXT_BUILD_TIMEOUT;
+# <=0 disables the watchdog). A cold build measures ~5 s on an M5 Max / macOS 27, so
+# 600 s only fires when something is genuinely wedged (a stale build lock, a toolchain
+# that never returns) — the case that froze ComfyUI's startup outright.
+_BUILD_TIMEOUT_DEFAULT = 600.0
+
+
+def _build_timeout():
+    try:
+        return float(os.environ.get("ASFP8_EXT_BUILD_TIMEOUT", _BUILD_TIMEOUT_DEFAULT))
+    except ValueError:
+        return _BUILD_TIMEOUT_DEFAULT
+
+
+def _cpp_load_guarded(cpp_load, **kwargs):
+    """`torch.utils.cpp_extension.load` with a wall-clock ceiling.
+
+    torch's loader takes no timeout and can block forever, which used to freeze
+    ComfyUI outright. There is no safe way to cancel it, so on expiry we raise and
+    leave the build running on a daemon thread: the caller degrades to "kernel
+    unavailable" for this session and the compile, if it ever finishes, lands in
+    ninja's cache for the next start.
+    """
+    timeout = _build_timeout()
+    if timeout <= 0:
+        return cpp_load(**kwargs)
+
+    result = {}
+
+    def run():
+        try:
+            result["mod"] = cpp_load(**kwargs)
+        except BaseException as e:  # re-raised on the calling thread
+            result["err"] = e
+
+    t = threading.Thread(target=run, name="asfp8-int8-ext-build", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(
+            f"Metal extension build still running after {timeout:g}s; giving up "
+            f"(raise ASFP8_EXT_BUILD_TIMEOUT, or set it to 0, to wait longer)"
+        )
+    if "err" in result:
+        raise result["err"]
+    return result.get("mod")
 
 
 def _nospace_torch_lib():
@@ -83,10 +131,15 @@ def module():
     build_dir = os.path.join(_NOSPACE_ROOT, "int8_ext")
     os.makedirs(build_dir, exist_ok=True)
 
+    print("[int8_ext] compiling the INT8 Metal kernel (first use; seconds to a few "
+          "minutes depending on the toolchain) — not frozen, this resumes when the "
+          "build ends.", flush=True)
+
     saved = cpp.TORCH_LIB_PATH
     try:
         cpp.TORCH_LIB_PATH = _nospace_torch_lib()
-        _mod = cpp_load(
+        _mod = _cpp_load_guarded(
+            cpp_load,
             name="asfp8_int8_gemm",
             sources=[src],
             extra_cflags=["-std=c++17", "-ObjC++"],

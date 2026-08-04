@@ -44,6 +44,7 @@ TAG = "[AppleSilicon-FP8/int8_kernel]"
 _installed = False
 _orig_int8_linear = None
 _kernel = None
+_kernel_tried = False
 
 # Supported fused activations. P0 verdict (M5 Max / macOS 27 / Metal 4.1):
 # Metal `erf` is unavailable, so act=3 (gelu-erf) is dropped entirely; only
@@ -76,6 +77,24 @@ def _load_kernel():
         print(f"{TAG} loader import failed: {e!r}")
         return None
     return loader.module()
+
+
+def _ensure_kernel():
+    """Build the Metal extension lazily, on the FIRST layer that can actually use it.
+
+    Building inside install() blocked ComfyUI's startup import on a synchronous
+    ninja+clang build (issue: "hangs forever at startup when ninja is installed").
+    Deferring it here matches scaled_mm_fp8._get_backend / int4_linear_mps._load_kernel
+    and keeps startup non-blocking; a failed build is remembered so we retry once only.
+    """
+    global _kernel, _kernel_tried
+    if _kernel is not None or _kernel_tried:
+        return _kernel
+    _kernel_tried = True
+    _kernel = _load_kernel()
+    if _kernel is None:
+        print(f"{TAG} INT8 Metal kernel unavailable; using comfy's int8 path.")
+    return _kernel
 
 
 def _int8_linear_kernel(
@@ -220,12 +239,12 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
 def _try_int8_kernel_forward(self, input):
     """Return the layer output via the kernel W8A8 path, or None to fall back.
 
-    Eligible iff: kernel built; input is a plain MPS Tensor (not a QuantizedTensor);
-    weight is a TensorWiseINT8Layout QuantizedTensor; not full-precision-mm; no
-    force-cast; no LoRA weight/bias functions; weight not logically transposed.
+    Eligible iff: input is a plain MPS Tensor (not a QuantizedTensor); weight is a
+    TensorWiseINT8Layout QuantizedTensor; not full-precision-mm; no force-cast; no
+    LoRA weight/bias functions; weight not logically transposed; and the Metal
+    kernel builds. The build is attempted only AFTER every cheap eligibility gate
+    passes, so a model with no int8 convrot layers never pays for it.
     """
-    if _kernel is None:
-        return None
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
@@ -248,6 +267,9 @@ def _try_int8_kernel_forward(self, input):
         if getattr(params, "transposed", False):
             return None
 
+        if _ensure_kernel() is None:
+            return None
+
         qdata = w._qdata
         scale = params.scale
         convrot = getattr(params, "convrot", False)
@@ -262,7 +284,7 @@ def _try_int8_kernel_forward(self, input):
 
 
 def install():
-    global _installed, _orig_int8_linear, _kernel
+    global _installed, _orig_int8_linear
     if _installed:
         return
     if sys.platform != "darwin":
@@ -275,10 +297,6 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-
-    _kernel = _load_kernel()
-    if _kernel is None:
-        return  # loader already explained why
 
     # Capture the original eager int8_linear for the fallback inside the wrapper.
     try:
@@ -325,5 +343,5 @@ def install():
     print(
         f"{TAG} INT8 convrot Linear routed through bit-exact Metal kernel on MPS "
         f"(clean W8A8: rotate->per-row quant->int8 matmul; weight-only fp32 "
-        f"dequant/un-rotation bypassed)."
+        f"dequant/un-rotation bypassed). Kernel builds on first int8 layer, not now."
     )
