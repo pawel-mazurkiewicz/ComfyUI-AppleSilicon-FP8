@@ -83,6 +83,9 @@ def test_kernel_builds_on_first_eligible_forward(monkeypatch):
     monkeypatch.setattr(patch, "_kernel", None, raising=False)
     monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
     monkeypatch.setattr(patch, "_load_kernel", fake_build, raising=False)
+    # this test is about build deferral, not kernel correctness
+    monkeypatch.setattr(patch, "_self_checked", True, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", True, raising=False)
 
     out = torch.full((1,), 7.0)
     monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: out, raising=False)
@@ -448,3 +451,49 @@ def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
     assert out.shape == ref.shape
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
         f"nonscalar: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
+
+
+@requires_mps
+def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
+    """The Metal library compiles on first kernel USE, not at extension build time.
+
+    A toolchain that rejects it (issue #13) otherwise recompiles on every eligible
+    Linear -- measured at 1.46x slower than not having the kernel at all, with 822
+    fallback lines in one run. The cpp_extension build succeeds, so _kernel_tried
+    never short-circuits this.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    calls = []
+
+    class FailingKernel:
+        def i8_matmul2d_nt(self, *args, **kwargs):
+            calls.append(1)
+            raise RuntimeError(
+                "int8 Metal library compile failed: no matching member function "
+                "for call to 'get_destination_cooperative_tensor'"
+            )
+
+    monkeypatch.setattr(patch, "_kernel", FailingKernel(), raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+    monkeypatch.setattr(patch, "_self_checked", False, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", False, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(calls) == 1, f"Metal library compile retried per forward ({len(calls)}x)"

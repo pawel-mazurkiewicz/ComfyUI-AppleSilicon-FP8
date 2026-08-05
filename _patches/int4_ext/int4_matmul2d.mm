@@ -175,16 +175,26 @@ static id<MTLComputePipelineState> g_pso_i8i4 = nil;
 static id<MTLComputePipelineState> g_pso_bf16i4 = nil;
 static id<MTLComputePipelineState> g_pso_i8i4_fused = nil;
 
+// Latch failure too, not just success: the library is compiled on first dispatch,
+// so a toolchain that rejects it would otherwise recompile on every call (issue #13).
+static std::string g_compile_error;
+static bool g_compile_failed = false;
+
 static id<MTLLibrary> get_lib() {
     if (g_lib) return g_lib;
+    TORCH_CHECK(!g_compile_failed,
+                "int4 Metal library compile failed (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
     opts.languageVersion = MTLLanguageVersion4_1;
     NSError* err = nil;
     g_lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc]
                               options:opts error:&err];
-    TORCH_CHECK(g_lib, "int4 Metal library compile failed: ",
-                err ? err.localizedDescription.UTF8String : "unknown");
+    if (!g_lib) {
+        g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+        g_compile_failed = true;
+    }
+    TORCH_CHECK(g_lib, "int4 Metal library compile failed: ", g_compile_error);
     return g_lib;
 }
 

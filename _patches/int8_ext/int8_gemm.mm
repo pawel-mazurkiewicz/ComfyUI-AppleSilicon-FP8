@@ -528,9 +528,14 @@ static id<MTLComputePipelineState> g_pso_swiglu = nil;
 static id<MTLComputePipelineState> g_pso_swiglu_small = nil;
 static id<MTLLibrary> g_lib = nil;
 static std::string g_compile_error;
+// Latch failure too, not just success: the library is compiled on first dispatch,
+// so a toolchain that rejects it would otherwise recompile on every call (issue #13).
+static bool g_compile_failed = false;
 
 static id<MTLLibrary> build_library() {
   if (g_lib) return g_lib;
+  TORCH_CHECK(!g_compile_failed,
+              "int8 Metal library compile failed (cached): ", g_compile_error);
   id<MTLDevice> dev = MPSDevice::getInstance()->device();
   MTLCompileOptions* opts = [MTLCompileOptions new];
   opts.languageVersion = MTLLanguageVersion4_1;
@@ -539,6 +544,7 @@ static id<MTLLibrary> build_library() {
                                          options:opts error:&err];
   if (!lib) {
     g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+    g_compile_failed = true;
     TORCH_CHECK(false, "int8 Metal library compile failed: ", g_compile_error);
   }
   g_lib = lib;

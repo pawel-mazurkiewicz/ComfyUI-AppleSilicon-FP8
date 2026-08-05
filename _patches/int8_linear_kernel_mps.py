@@ -45,6 +45,8 @@ _installed = False
 _orig_int8_linear = None
 _kernel = None
 _kernel_tried = False
+_self_checked = False
+_self_ok = False
 
 # Supported fused activations. P0 verdict (M5 Max / macOS 27 / Metal 4.1):
 # Metal `erf` is unavailable, so act=3 (gelu-erf) is dropped entirely; only
@@ -95,6 +97,36 @@ def _ensure_kernel():
     if _kernel is None:
         print(f"{TAG} INT8 Metal kernel unavailable; using comfy's int8 path.")
     return _kernel
+
+
+def _self_check():
+    """One-time correctness gate on a tiny int8 matmul.
+
+    The .so loading is not proof the kernel works: the Metal library is compiled
+    by newLibraryWithSource on the FIRST dispatch, so a toolchain that rejects it
+    fails here rather than at build time. Without this latch that compile is
+    retried on every eligible Linear (issue #13) — slower than not having the
+    kernel at all. Mirrors fp8_linear_kernel_mps._self_check.
+
+    MUST be called only AFTER a layer passes every eligibility gate.
+    """
+    global _self_checked, _self_ok
+    if _self_checked:
+        return _self_ok
+    _self_checked = True
+    try:
+        g = torch.Generator().manual_seed(0)
+        a = torch.randint(-127, 128, (32, 128), generator=g, dtype=torch.int8)
+        w = torch.randint(-127, 128, (64, 128), generator=g, dtype=torch.int8)
+        ref = a.int() @ w.int().t()
+        out = _kernel.i8_matmul2d_nt(a.to("mps").contiguous(), w.to("mps").contiguous())
+        _self_ok = torch.equal(out.cpu(), ref)
+        if not _self_ok:
+            print(f"{TAG} self-check mismatch; using comfy's int8 path.")
+    except Exception as e:
+        _self_ok = False
+        print(f"{TAG} self-check raised; using comfy's int8 path: {e!r}")
+    return _self_ok
 
 
 def _int8_linear_kernel(
@@ -268,6 +300,8 @@ def _try_int8_kernel_forward(self, input):
             return None
 
         if _ensure_kernel() is None:
+            return None
+        if not _self_check():
             return None
 
         qdata = w._qdata

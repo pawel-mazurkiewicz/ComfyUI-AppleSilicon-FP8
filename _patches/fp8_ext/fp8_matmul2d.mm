@@ -159,9 +159,14 @@ kernel void gemm_fp8fp8_nt(
 
 static id<MTLComputePipelineState> g_pso = nil;
 static std::string g_compile_error;
+// Latch failure too, not just success: the library is compiled on first dispatch,
+// so a toolchain that rejects it would otherwise recompile on every call (issue #13).
+static bool g_compile_failed = false;
 
 static id<MTLComputePipelineState> get_pso() {
     if (g_pso) return g_pso;
+    TORCH_CHECK(!g_compile_failed,
+                "fp8 Metal library compile failed (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
     // Metal 4.1 is what enables __HAVE_METAL_FP8_E4M3_FORMAT_TYPE__ (verified via xcrun).
@@ -171,6 +176,7 @@ static id<MTLComputePipelineState> get_pso() {
     id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
     if (!lib) {
         g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+        g_compile_failed = true;
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8"];
@@ -185,6 +191,8 @@ static id<MTLComputePipelineState> g_pso_nt = nil;
 
 static id<MTLComputePipelineState> get_pso_nt() {
     if (g_pso_nt) return g_pso_nt;
+    TORCH_CHECK(!g_compile_failed,
+                "fp8 Metal library compile failed (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
     opts.languageVersion = MTLLanguageVersion4_1;
@@ -193,6 +201,7 @@ static id<MTLComputePipelineState> get_pso_nt() {
                                            options:opts error:&err];
     if (!lib) {
         g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+        g_compile_failed = true;
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8_nt"];
@@ -207,6 +216,8 @@ static id<MTLComputePipelineState> g_pso_ff_nt = nil;
 
 static id<MTLComputePipelineState> get_pso_fp8fp8_nt() {
     if (g_pso_ff_nt) return g_pso_ff_nt;
+    TORCH_CHECK(!g_compile_failed,
+                "fp8 Metal library compile failed (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
     opts.languageVersion = MTLLanguageVersion4_1;
@@ -215,6 +226,7 @@ static id<MTLComputePipelineState> get_pso_fp8fp8_nt() {
                                            options:opts error:&err];
     if (!lib) {
         g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+        g_compile_failed = true;
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8fp8_nt"];
