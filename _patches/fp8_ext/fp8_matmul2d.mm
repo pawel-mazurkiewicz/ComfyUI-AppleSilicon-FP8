@@ -10,6 +10,7 @@
 // 64x64x64 tile, 4 simdgroups), with the right operand = fp8.
 
 #include <torch/extension.h>
+#include <sstream>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/mps/MPSDevice.h>
 #import <Metal/Metal.h>
@@ -163,6 +164,20 @@ static std::string g_compile_error;
 // so a toolchain that rejects it would otherwise recompile on every call (issue #13).
 static bool g_compile_failed = false;
 
+// Latch every deterministic failure, not just the library compile. A missing
+// function or a rejected pipeline state repeats identically on the next call, so
+// leaving them bare would just move issue #13's retry storm one stage later.
+#define ASFP8_LATCH_CHECK(cond, ...)                    \
+  do {                                                  \
+    if (!(cond)) {                                      \
+      std::ostringstream _oss;                          \
+      _oss << __VA_ARGS__;                              \
+      g_compile_error = _oss.str();                     \
+      g_compile_failed = true;                          \
+      TORCH_CHECK(false, g_compile_error);              \
+    }                                                   \
+  } while (0)
+
 static id<MTLComputePipelineState> get_pso() {
     if (g_pso) return g_pso;
     TORCH_CHECK(!g_compile_failed,
@@ -180,10 +195,10 @@ static id<MTLComputePipelineState> get_pso() {
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8"];
-    TORCH_CHECK(fn, "gemm_fp8 function not found in compiled library");
+    ASFP8_LATCH_CHECK(fn, "gemm_fp8 function not found in compiled library");
     g_pso = [dev newComputePipelineStateWithFunction:fn error:&err];
-    TORCH_CHECK(g_pso, "pipeline state creation failed: ",
-                err ? err.localizedDescription.UTF8String : "unknown");
+    ASFP8_LATCH_CHECK(g_pso, "pipeline state creation failed: "
+                << (err ? err.localizedDescription.UTF8String : "unknown"));
     return g_pso;
 }
 
@@ -205,10 +220,10 @@ static id<MTLComputePipelineState> get_pso_nt() {
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8_nt"];
-    TORCH_CHECK(fn, "gemm_fp8_nt function not found in compiled library");
+    ASFP8_LATCH_CHECK(fn, "gemm_fp8_nt function not found in compiled library");
     g_pso_nt = [dev newComputePipelineStateWithFunction:fn error:&err];
-    TORCH_CHECK(g_pso_nt, "NT pipeline state creation failed: ",
-                err ? err.localizedDescription.UTF8String : "unknown");
+    ASFP8_LATCH_CHECK(g_pso_nt, "NT pipeline state creation failed: "
+                << (err ? err.localizedDescription.UTF8String : "unknown"));
     return g_pso_nt;
 }
 
@@ -230,10 +245,10 @@ static id<MTLComputePipelineState> get_pso_fp8fp8_nt() {
         TORCH_CHECK(false, "fp8 Metal library compile failed: ", g_compile_error);
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"gemm_fp8fp8_nt"];
-    TORCH_CHECK(fn, "gemm_fp8fp8_nt function not found in compiled library");
+    ASFP8_LATCH_CHECK(fn, "gemm_fp8fp8_nt function not found in compiled library");
     g_pso_ff_nt = [dev newComputePipelineStateWithFunction:fn error:&err];
-    TORCH_CHECK(g_pso_ff_nt, "fp8fp8 NT pipeline state creation failed: ",
-                err ? err.localizedDescription.UTF8String : "unknown");
+    ASFP8_LATCH_CHECK(g_pso_ff_nt, "fp8fp8 NT pipeline state creation failed: "
+                << (err ? err.localizedDescription.UTF8String : "unknown"));
     return g_pso_ff_nt;
 }
 

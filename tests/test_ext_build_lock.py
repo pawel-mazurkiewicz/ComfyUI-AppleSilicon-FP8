@@ -127,3 +127,42 @@ def test_cleanup_leaves_a_lock_we_never_owned(loader, tmp_path):
         assert os.path.exists(lock)
     finally:
         release.set()
+
+
+def test_concurrent_builds_do_not_corrupt_the_prepared_global(loader, monkeypatch):
+    """prepare() mutates torch's module-level TORCH_LIB_PATH.
+
+    Two overlapping build workers would each snapshot the *other's* temporary
+    value and restore that, permanently leaking it. Overlap is reachable because
+    a build we abandon on timeout keeps running while the next one starts.
+    """
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "30")
+    state = {"path": "ORIGINAL"}
+    in_prepare = threading.Event()
+
+    def prepare():
+        saved = state["path"]
+        state["path"] = "TEMP"
+        in_prepare.set()
+        time.sleep(0.05)          # widen the window both workers race through
+        return lambda: state.__setitem__("path", saved)
+
+    def slow_load(**kwargs):
+        time.sleep(0.05)
+
+    threads = [
+        threading.Thread(
+            target=lambda: loader._cpp_load_guarded(slow_load, prepare=prepare),
+            daemon=True,
+        )
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+
+    assert state["path"] == "ORIGINAL", (
+        f"TORCH_LIB_PATH left as {state['path']!r}; a worker restored another "
+        "worker's temporary value"
+    )

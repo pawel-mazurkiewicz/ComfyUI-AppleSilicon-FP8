@@ -27,6 +27,7 @@
 // ============================================================
 
 #include <torch/extension.h>
+#include <sstream>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/mps/MPSDevice.h>
 #import <Metal/Metal.h>
@@ -544,6 +545,20 @@ static std::string g_compile_error;
 // so a toolchain that rejects it would otherwise recompile on every call (issue #13).
 static bool g_compile_failed = false;
 
+// Latch every deterministic failure, not just the library compile. A missing
+// function or a rejected pipeline state repeats identically on the next call, so
+// leaving them bare would just move issue #13's retry storm one stage later.
+#define ASFP8_LATCH_CHECK(cond, ...)                    \
+  do {                                                  \
+    if (!(cond)) {                                      \
+      std::ostringstream _oss;                          \
+      _oss << __VA_ARGS__;                              \
+      g_compile_error = _oss.str();                     \
+      g_compile_failed = true;                          \
+      TORCH_CHECK(false, g_compile_error);              \
+    }                                                   \
+  } while (0)
+
 static id<MTLLibrary> build_library() {
   if (g_lib) return g_lib;
   TORCH_CHECK(!g_compile_failed,
@@ -567,12 +582,12 @@ static id<MTLComputePipelineState> pso_for_name(NSString* name) {
   id<MTLDevice> dev = MPSDevice::getInstance()->device();
   id<MTLLibrary> lib = build_library();
   id<MTLFunction> fn = [lib newFunctionWithName:name];
-  TORCH_CHECK(fn, "kernel function not found: ", name.UTF8String);
+  ASFP8_LATCH_CHECK(fn, "kernel function not found: " << name.UTF8String);
   NSError* err = nil;
   id<MTLComputePipelineState> pso =
       [dev newComputePipelineStateWithFunction:fn error:&err];
-  TORCH_CHECK(pso, "pipeline state creation failed: ",
-              err ? err.localizedDescription.UTF8String : "unknown");
+  ASFP8_LATCH_CHECK(pso, "pipeline state creation failed: "
+              << (err ? err.localizedDescription.UTF8String : "unknown"));
   return pso;
 }
 

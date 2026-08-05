@@ -24,6 +24,14 @@ def _build_timeout():
         return BUILD_TIMEOUT_DEFAULT
 
 
+# Serialises prepare/load/undo across every loader. prepare() mutates torch's
+# module-level TORCH_LIB_PATH, so two overlapping workers would each snapshot the
+# other's temporary value and restore that, leaking it for the rest of the
+# session. Overlap is reachable through our own timeout path: a build we abandon
+# keeps running while the caller starts the next one.
+_BUILD_LOCK = threading.Lock()
+
+
 def _lock_path(build_dir):
     return os.path.join(build_dir or "", "lock")
 
@@ -91,12 +99,13 @@ def _cpp_load_guarded(cpp_load, prepare=None, **kwargs):
     """
     timeout = _build_timeout()
     if timeout <= 0:
-        undo = prepare() if prepare is not None else None
-        try:
-            return cpp_load(**kwargs)
-        finally:
-            if undo is not None:
-                undo()
+        with _BUILD_LOCK:
+            undo = prepare() if prepare is not None else None
+            try:
+                return cpp_load(**kwargs)
+            finally:
+                if undo is not None:
+                    undo()
 
     build_dir = kwargs.get("build_directory")
     # A lock already present isn't ours: our thread will be waiting on it, not
@@ -106,18 +115,21 @@ def _cpp_load_guarded(cpp_load, prepare=None, **kwargs):
 
     def run():
         undo = None
-        try:
-            if prepare is not None:
-                undo = prepare()
-            result["mod"] = cpp_load(**kwargs)
-        except BaseException as e:  # re-raised on the calling thread
-            result["err"] = e
-        finally:
-            if undo is not None:
-                try:
-                    undo()
-                except Exception:
-                    pass
+        # Held across prepare/load/undo so the global prepare() touches is never
+        # observed or restored by a second worker mid-build.
+        with _BUILD_LOCK:
+            try:
+                if prepare is not None:
+                    undo = prepare()
+                result["mod"] = cpp_load(**kwargs)
+            except BaseException as e:  # re-raised on the calling thread
+                result["err"] = e
+            finally:
+                if undo is not None:
+                    try:
+                        undo()
+                    except Exception:
+                        pass
 
     label = os.path.basename(build_dir or "") or "ext"
     t = threading.Thread(target=run, name=f"asfp8-{label}-build", daemon=True)

@@ -23,8 +23,10 @@
   kernels compile against **Metal 4.1** (developed on **macOS 27**) and need
   Metal-4 tensor ops — established by a runtime shader-compile probe, in practice
   an **M5** — plus `ninja` to build, so on M1–M4 or older macOS they normally
-  don't engage. Any env var below can force a patch on or off regardless of the
-  probe.
+  don't engage. Any env var below can force a patch off, or force it past the
+  capability probe (`=1`). Forcing on only gets you a *build attempt* — the
+  callers still apply their own eligibility checks (dtype, layout, size
+  thresholds), so a forced kernel that builds may still never be reached.
 
 ## Quick start — by machine
 
@@ -294,7 +296,7 @@ your machine), then only the patch lines relevant to it:
   | Env var | Behaviour |
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
-  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. Doubles as the age after which an abandoned build lock is treated as stale and cleared. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
+  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. An abandoned build lock is cleared once it is **twice** this old (twice the 600 s default when set to `0`), so a build that is merely slow is never disturbed. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
 
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
   `compile_shader`** — no Metal 4.1 / M5 needed. Patch #18 fuses the DiT adaLN tail

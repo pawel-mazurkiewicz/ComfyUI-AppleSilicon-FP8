@@ -255,9 +255,16 @@ def install():
     have_ck = True
     try:
         import comfy_kitchen.backends.eager  # noqa: F401
-    except Exception:
+    except ModuleNotFoundError:
         have_ck = False
         print(f"{TAG} comfy_kitchen not installed; eager-rope retarget off.", flush=True)
+    except Exception as e:
+        # Installed but unimportable (broken dep, partial install) is a different
+        # story from absent, and reporting it as "not installed" sends people
+        # looking in the wrong place.
+        have_ck = False
+        print(f"{TAG} comfy_kitchen present but failed to import ({e!r}); "
+              f"eager-rope retarget off.", flush=True)
     if not have_ck:
         return
     try:

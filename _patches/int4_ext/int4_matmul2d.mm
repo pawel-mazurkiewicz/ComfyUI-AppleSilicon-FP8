@@ -12,6 +12,7 @@
 // NT layout (transpose_right=true) to match nn.Linear: A[M,K] @ Wᵀ, W=[N,K].
 
 #include <torch/extension.h>
+#include <sstream>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/mps/MPSDevice.h>
 #import <Metal/Metal.h>
@@ -180,6 +181,20 @@ static id<MTLComputePipelineState> g_pso_i8i4_fused = nil;
 static std::string g_compile_error;
 static bool g_compile_failed = false;
 
+// Latch every deterministic failure, not just the library compile. A missing
+// function or a rejected pipeline state repeats identically on the next call, so
+// leaving them bare would just move issue #13's retry storm one stage later.
+#define ASFP8_LATCH_CHECK(cond, ...)                    \
+  do {                                                  \
+    if (!(cond)) {                                      \
+      std::ostringstream _oss;                          \
+      _oss << __VA_ARGS__;                              \
+      g_compile_error = _oss.str();                     \
+      g_compile_failed = true;                          \
+      TORCH_CHECK(false, g_compile_error);              \
+    }                                                   \
+  } while (0)
+
 static id<MTLLibrary> get_lib() {
     if (g_lib) return g_lib;
     TORCH_CHECK(!g_compile_failed,
@@ -201,13 +216,15 @@ static id<MTLLibrary> get_lib() {
 static id<MTLComputePipelineState> get_pso(const char* name,
                                            id<MTLComputePipelineState>* slot) {
     if (*slot) return *slot;
+    TORCH_CHECK(!g_compile_failed,
+                "int4 Metal kernel unavailable (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     NSError* err = nil;
     id<MTLFunction> fn = [get_lib() newFunctionWithName:[NSString stringWithUTF8String:name]];
-    TORCH_CHECK(fn, name, " not found in compiled library");
+    ASFP8_LATCH_CHECK(fn, name << " not found in compiled library");
     *slot = [dev newComputePipelineStateWithFunction:fn error:&err];
-    TORCH_CHECK(*slot, name, " pipeline state creation failed: ",
-                err ? err.localizedDescription.UTF8String : "unknown");
+    ASFP8_LATCH_CHECK(*slot, name << " pipeline state creation failed: "
+                << (err ? err.localizedDescription.UTF8String : "unknown"));
     return *slot;
 }
 

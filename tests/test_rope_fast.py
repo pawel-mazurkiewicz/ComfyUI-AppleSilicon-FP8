@@ -250,16 +250,30 @@ def test_table_mutation_invalidates_cache():
     assert torch.allclose(out2.float(), ref2.float(), atol=2e-5, rtol=2e-5)
 
 
+@mps
 def test_install_does_not_claim_active_when_the_reroute_failed(monkeypatch, capsys):
     """The banner is the only signal a user gets; it must not claim success
-    when comfy_kitchen is missing or the eager reroute raised."""
+    when comfy_kitchen is missing or the eager reroute raised.
+
+    install() has three early returns ahead of _do_install, so assert the stub
+    actually ran. Without that this passes on any machine that trips a gate --
+    proving nothing about the banner.
+    """
+    pytest.importorskip("comfy_kitchen.backends.eager")
+    from _patches import _caps
     from _patches import rope_fast_mps as m
 
+    called = []
+
     def boom():
+        called.append(True)
         raise RuntimeError("no eager backend")
 
+    monkeypatch.delenv("ASFP8_ROPE_FAST", raising=False)
+    monkeypatch.setattr(_caps, "has_compile_shader", lambda: True)
     monkeypatch.setattr(m, "_do_install", boom)
     m.install()
 
+    assert called, "install() returned before reaching _do_install; test proves nothing"
     out = capsys.readouterr().out
     assert "fused RoPE active" not in out, out
