@@ -78,7 +78,16 @@ def _load_kernel():
     except Exception as e:  # pragma: no cover - import wiring
         print(f"{TAG} loader import failed: {e!r}")
         return None
-    return loader.module()
+    mod = loader.module()
+    if mod is not None:
+        try:
+            # warmup() dispatches for real, so it is where a library that BUILT
+            # but whose Metal source the runtime rejects actually fails (#13).
+            mod.warmup()
+        except Exception as e:
+            print(f"{TAG} warmup failed; disabling: {e!r}")
+            return None
+    return mod
 
 
 def _ensure_kernel():
@@ -127,6 +136,15 @@ def _self_check():
         _self_ok = False
         print(f"{TAG} self-check raised; using comfy's int8 path: {e!r}")
     return _self_ok
+
+
+def _verify():
+    """The contract _caps.kernel_ready expects: build, warmup, then numerics.
+
+    Nothing short of this proves the kernel works — tier_b_ready() only compiles
+    na_gemm's bf16 shader, which shares no operand types with ours (#14).
+    """
+    return _ensure_kernel() is not None and _self_check()
 
 
 def _int8_linear_kernel(
@@ -299,9 +317,8 @@ def _try_int8_kernel_forward(self, input):
         if getattr(params, "transposed", False):
             return None
 
-        if _ensure_kernel() is None:
-            return None
-        if not _self_check():
+        from . import _caps
+        if not _caps.kernel_ready("int8", _verify):
             return None
 
         qdata = w._qdata

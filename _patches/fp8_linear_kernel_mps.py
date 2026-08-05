@@ -112,6 +112,11 @@ def _self_check():
     return _self_ok
 
 
+def _verify():
+    """The contract _caps.kernel_ready expects: build, warmup, then numerics."""
+    return _ensure_kernel() is not None and _self_check()
+
+
 def _fp8_linear_kernel(input, qdata, scale_weight, bias):
     """half(input) x fp8 weight bytes -> f32, * scale (scalar or [N]), + bias, -> input.dtype.
     Callers MUST have validated shapes/dtype/scale via _try_fp8_kernel_forward first."""
@@ -194,9 +199,8 @@ def _try_fp8_kernel_forward(self, input):
 
         # --- BLOCKER: build + self-check only AFTER all gates pass, never on
         # ineligible layers (the build is a full ninja/clang extension compile) ---
-        if _ensure_kernel() is None:
-            return None
-        if not _self_check():
+        from . import _caps
+        if not _caps.kernel_ready("fp8", _verify):
             return None
 
         return _fp8_linear_kernel(input, qdata, scale, bias)

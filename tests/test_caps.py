@@ -83,3 +83,74 @@ def test_summary_is_a_string():
     assert isinstance(s, str)
     assert "mps=" in s
     assert "ninja=" in s
+
+
+# --- per-kernel verification (issue #14) -----------------------------------
+
+
+def test_kernel_ready_runs_verify_once_and_memoises_success():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return True
+
+    assert _caps.kernel_ready("probe-ok", verify) is True
+    assert _caps.kernel_ready("probe-ok", verify) is True
+    assert len(calls) == 1, "verify_fn must not re-run once the answer is known"
+
+
+def test_kernel_ready_memoises_failure_too():
+    """The point of the primitive: a known-bad kernel must not rebuild per call.
+
+    Re-running verify on every eligible layer is what made issue #13 cost 1.46x
+    instead of merely disabling int8.
+    """
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return False
+
+    assert _caps.kernel_ready("probe-bad", verify) is False
+    assert _caps.kernel_ready("probe-bad", verify) is False
+    assert len(calls) == 1, "a failed kernel was re-verified"
+
+
+def test_kernel_ready_treats_a_raising_verify_as_failure():
+    _caps.reset_cache()
+
+    def verify():
+        raise RuntimeError("toolchain rejected the shader")
+
+    assert _caps.kernel_ready("probe-raise", verify) is False
+
+
+def test_kernel_ready_is_per_name():
+    _caps.reset_cache()
+    assert _caps.kernel_ready("a", lambda: True) is True
+    assert _caps.kernel_ready("b", lambda: False) is False
+    assert _caps.kernel_ready("a", lambda: False) is True, "names must not share state"
+
+
+def test_reset_cache_clears_the_kernel_results():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return True
+
+    _caps.kernel_ready("probe-reset", verify)
+    _caps.reset_cache()
+    _caps.kernel_ready("probe-reset", verify)
+    assert len(calls) == 2, "reset_cache() must force a re-probe"
+
+
+def test_summary_banner_substrings_are_unchanged():
+    """Other tests (and users' bug reports) match on these exact substrings."""
+    s = _caps.summary()
+    for token in ("mps=", "tensor_ops(M5/Metal4)=", "ninja="):
+        assert token in s, f"{token!r} missing from banner: {s}"

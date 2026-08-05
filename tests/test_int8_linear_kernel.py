@@ -47,6 +47,20 @@ requires_int8_ext = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_int8_kernel_memo():
+    """_caps.kernel_ready memoises per process.
+
+    Without this, whichever test verifies the kernel first decides the answer for
+    every later test, and a test that installs a deliberately broken kernel is
+    silently skipped past its own gate.
+    """
+    from _patches import _caps
+    _caps._kernel_ready.pop("int8", None)
+    yield
+    _caps._kernel_ready.pop("int8", None)
+
+
 def test_install_noop_when_explicitly_off(monkeypatch):
     """ASFP8_INT8_EXT=off force-disables even on capable hardware."""
     from _patches import _caps
@@ -535,3 +549,43 @@ def test_int8_kernel_compiles_when_enabled():
         "int8 Metal library does not compile on this machine — the kernel is "
         "inert and every eligible Linear falls back to comfy's int8 path"
     )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
+    """A kernel that fails verification must cost one attempt, not one per layer.
+
+    This is the #14 gap: tier_b_ready() green-lights int8 off na_gemm's bf16
+    probe, so a kernel that cannot build still reaches the forward path. The
+    per-kernel memo is what stops that becoming a per-call rebuild.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    attempts = []
+
+    def failing_verify():
+        attempts.append(1)
+        return False
+
+    monkeypatch.setattr(patch, "_verify", failing_verify)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    for _ in range(3):
+        assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(attempts) == 1, f"verification retried per forward ({len(attempts)}x)"
+    assert _caps._kernel_ready["int8"] is False

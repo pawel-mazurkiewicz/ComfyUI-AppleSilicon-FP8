@@ -87,13 +87,61 @@ def _unpack_int4_signed_fast(packed: torch.Tensor, dtype: torch.dtype) -> torch.
     return out.reshape(*packed.shape[:-1], packed.shape[-1] * 2)
 
 
+_self_checked = False
+_self_ok = False
+
+
+def _self_check():
+    """One-time numeric gate on the real W4A8 kernel.
+
+    warmup() only proves the shader compiles. It says nothing about whether the
+    int4b nibble order still matches kitchen's packing or whether the fused
+    dequant epilogue is right, and either could change under a toolchain update
+    the same way #13's operand constraint did. Cached both ways, so a broken
+    kernel costs one bool per call rather than a retry.
+    """
+    global _self_checked, _self_ok
+    if _self_checked:
+        return _self_ok
+    _self_checked = True
+    try:
+        M, N, K = 32, 64, 128
+        g = torch.Generator().manual_seed(0)
+        qx = torch.randint(-127, 128, (M, K), generator=g, dtype=torch.int8)
+        packed = torch.randint(-128, 128, (N, K // 2), generator=g, dtype=torch.int8)
+        x_scale = torch.rand(M, generator=g, dtype=torch.float32) * 0.01 + 0.001
+        wscales = torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001
+
+        w = _unpack_int4_signed_fast(packed, torch.float32)
+        ref = (qx.float() @ w.t()) * x_scale.unsqueeze(-1) * wscales.unsqueeze(0)
+
+        out = _kernel.i8i4_linear_fused_nt(
+            qx.to("mps").contiguous(), packed.to("mps").contiguous(),
+            x_scale.to("mps").contiguous(), wscales.to("mps").contiguous(),
+            None, K, N)
+        # The epilogue stores bf16, so compare at bf16 precision, not exactly.
+        _self_ok = torch.allclose(out.cpu().float(), ref, rtol=3e-2, atol=3e-2)
+        if not _self_ok:
+            print(f"{TAG} int4 self-check mismatch; using the W4A16 path.")
+    except Exception as e:
+        _self_ok = False
+        print(f"{TAG} int4 self-check raised; using the W4A16 path: {e!r}")
+    return _self_ok
+
+
+def _verify():
+    """The contract _caps.kernel_ready expects: build + warmup, then numerics."""
+    return _load_kernel() is not None and _self_check()
+
+
 def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1])
     h = mod._build_hadamard(convrot_groupsize, device=x2d.device, dtype=x2d.dtype)
     x_rot = mod._rotate_activation(x2d, h, convrot_groupsize)
 
-    kernel = _load_kernel()
+    from . import _caps
+    kernel = _load_kernel() if _caps.kernel_ready("int4", _verify) else None
     if kernel is not None:
         try:
             y = _w4a8_kernel_linear(x_rot, qweight, wscales, bias, kernel)

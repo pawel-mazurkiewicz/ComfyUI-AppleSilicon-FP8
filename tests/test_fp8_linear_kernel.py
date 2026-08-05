@@ -53,6 +53,16 @@ def test_loader_memo_resets_between_flag_states(monkeypatch):
 from _patches import fp8_linear_kernel_mps as patch
 
 
+@pytest.fixture(autouse=True)
+def _clear_fp8_kernel_memo():
+    """_caps.kernel_ready memoises per process, so one test's verdict would
+    otherwise decide every later test's gate."""
+    from _patches import _caps
+    _caps._kernel_ready.pop("fp8", None)
+    yield
+    _caps._kernel_ready.pop("fp8", None)
+
+
 def test_install_noop_when_explicitly_off(monkeypatch):
     # ASFP8_FP8_NATIVE=off force-disables even on capable hardware.
     from _patches import _caps

@@ -145,3 +145,58 @@ def test_install_routes_mps_only():
         assert torch.equal(y_mps.cpu(), y_fast.cpu())
     finally:
         int4_linear_mps.uninstall()
+
+
+# --- per-kernel verification (issue #14) -----------------------------------
+
+
+@requires_mps
+def test_int4_self_check_passes_on_a_working_kernel(monkeypatch):
+    """warmup() only proves the shader compiles.
+
+    The nibble order and the fused dequant epilogue are separate claims, and
+    either could break under a toolchain update the way #13's operand constraint
+    did. Opt-in, so this skips unless int4 is actually enabled.
+    """
+    _kernel_or_skip()   # opts in and builds the extension, but not into _kernel
+    monkeypatch.setattr(int4_linear_mps, "_kernel", None)
+    monkeypatch.setattr(int4_linear_mps, "_kernel_tried", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_checked", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_ok", False)
+
+    assert int4_linear_mps._load_kernel() is not None
+    assert int4_linear_mps._self_check() is True
+
+
+@requires_mps
+def test_int4_self_check_rejects_a_wrong_kernel(monkeypatch):
+    """Guards the guard: a self-check that cannot fail is worse than none."""
+    _kernel_or_skip()
+
+    class Wrong:
+        def i8i4_linear_fused_nt(self, qx, w, xs, ws, b, K, N):
+            return torch.zeros(qx.shape[0], N, dtype=torch.bfloat16, device="mps")
+
+    monkeypatch.setattr(int4_linear_mps, "_kernel", Wrong())
+    monkeypatch.setattr(int4_linear_mps, "_self_checked", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_ok", False)
+    assert int4_linear_mps._self_check() is False
+
+
+def test_int4_verification_is_memoised(monkeypatch):
+    """A broken int4 kernel must not be re-verified on every ConvRot layer."""
+    from _patches import _caps
+
+    _caps._kernel_ready.pop("int4", None)
+    attempts = []
+
+    def failing_verify():
+        attempts.append(1)
+        return False
+
+    try:
+        for _ in range(3):
+            assert _caps.kernel_ready("int4", failing_verify) is False
+        assert len(attempts) == 1, f"int4 re-verified {len(attempts)}x"
+    finally:
+        _caps._kernel_ready.pop("int4", None)
