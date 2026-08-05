@@ -44,6 +44,22 @@ constant constexpr short kElemsPerFrag = 8;
 constant constexpr short kElemCols = 4;
 constant constexpr short kElemRowsJump = 8;
 
+// ── matmul2d op type, at program scope ──────────────────────────
+// Deliberately not function-local. `decltype()` on a local cooperative tensor
+// yields a `thread`-qualified type, and macOS 26A5388g tightened
+// get_destination_cooperative_tensor with an __is_cooperative_tensor_type_v
+// constraint that address-space-qualified types fail -- so the operand types
+// have to come from the op's own unqualified member aliases instead (issue
+// #13). Those aliases can't be spelled from a function-local descriptor (an
+// alias template may not take a local as a template argument), and Metal
+// requires a program-scope variable to live in the constant address space.
+constant constexpr auto kMMDesc = mpp::tensor_ops::matmul2d_descriptor(
+    16, 32, 16, false, true, true,
+    mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+using gemm_t = mpp::tensor_ops::matmul2d<kMMDesc, metal::execution_simdgroup>;
+using ct_a_t = gemm_t::cooperative_tensor_left_input_t<int8_t, int8_t, int32_t>;
+using ct_b_t = gemm_t::cooperative_tensor_right_input_t<int8_t, int8_t, int32_t>;
+
 // ── NAXFrag coordinate mapping ──────────────────────────────────
 inline short2 nax_get_coord(ushort lid) {
   short qid = short(lid >> 2);
@@ -211,18 +227,14 @@ bool w8a8_gemm_compute(
   const device int8_t *sg_A = A + m_base * K;
   const device int8_t *sg_B = B + n_base * K;
 
-  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-      16, 32, 16, false, true, true,
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+  gemm_t gemm_op;
 
   auto ct_a =
       gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
   auto ct_b =
       gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
   auto ct_c =
-      gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b),
-                                                 int32_t>();
+      gemm_op.get_destination_cooperative_tensor<ct_a_t, ct_b_t, int32_t>();
 
   for (int f = 0; f < TM * TN; f++) {
     for (int i = 0; i < kElemsPerFrag; i++) {
