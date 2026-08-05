@@ -23,10 +23,13 @@
   kernels compile against **Metal 4.1** (developed on **macOS 27**) and need
   Metal-4 tensor ops — established by a runtime shader-compile probe, in practice
   an **M5** — plus `ninja` to build, so on M1–M4 or older macOS they normally
-  don't engage. Any env var below can force a patch off, or force it past the
-  capability probe (`=1`). Forcing on only gets you a *build attempt* — the
-  callers still apply their own eligibility checks (dtype, layout, size
-  thresholds), so a forced kernel that builds may still never be reached.
+  don't engage. The per-patch switches below (`ASFP8_FP8_EXT`, `ASFP8_INT8_EXT`
+  and friends) take `off` to force a patch off and `1` to force it past the
+  capability probe; forcing on buys only a *build attempt*, since callers still
+  apply their own eligibility checks (dtype, layout, size thresholds), so a
+  forced kernel that builds may still never be reached. The numeric settings
+  (`ASFP8_EXT_BUILD_TIMEOUT`, `ASFP8_FP8_EXT_MIN_DIM`) tune behaviour and
+  bypass nothing.
 
 ## Quick start — by machine
 

@@ -255,9 +255,16 @@ def install():
     have_ck = True
     try:
         import comfy_kitchen.backends.eager  # noqa: F401
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
         have_ck = False
-        print(f"{TAG} comfy_kitchen not installed; eager-rope retarget off.", flush=True)
+        if e.name == "comfy_kitchen":
+            print(f"{TAG} comfy_kitchen not installed; eager-rope retarget off.",
+                  flush=True)
+        else:
+            # A missing submodule or transitive dependency is not an absent
+            # package; naming it saves people from reinstalling the wrong thing.
+            print(f"{TAG} comfy_kitchen is installed but {e.name} is missing; "
+                  f"eager-rope retarget off.", flush=True)
     except Exception as e:
         # Installed but unimportable (broken dep, partial install) is a different
         # story from absent, and reporting it as "not installed" sends people

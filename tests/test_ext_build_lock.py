@@ -138,30 +138,45 @@ def test_concurrent_builds_do_not_corrupt_the_prepared_global(loader, monkeypatc
     """
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "30")
     state = {"path": "ORIGINAL"}
-    in_prepare = threading.Event()
+    # Released only once both threads are in place, so this is a real overlap
+    # attempt rather than two runs that happened to serialise on timing.
+    both_ready = threading.Barrier(2, timeout=30)
+    tally = threading.Lock()
+    active = {"now": 0, "max": 0}
 
     def prepare():
         saved = state["path"]
         state["path"] = "TEMP"
-        in_prepare.set()
+        with tally:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
         time.sleep(0.05)          # widen the window both workers race through
-        return lambda: state.__setitem__("path", saved)
+
+        def undo():
+            with tally:
+                active["now"] -= 1
+            state["path"] = saved
+
+        return undo
 
     def slow_load(**kwargs):
         time.sleep(0.05)
 
-    threads = [
-        threading.Thread(
-            target=lambda: loader._cpp_load_guarded(slow_load, prepare=prepare),
-            daemon=True,
-        )
-        for _ in range(2)
-    ]
+    def worker():
+        both_ready.wait()         # must be outside the build lock, or we deadlock
+        loader._cpp_load_guarded(slow_load, prepare=prepare)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
     for t in threads:
         t.start()
     for t in threads:
         t.join(30)
 
+    assert not any(t.is_alive() for t in threads), "a build worker never finished"
+    assert active["max"] == 1, (
+        f"{active['max']} workers held the prepared global at once; prepare, "
+        "load and undo must be mutually exclusive"
+    )
     assert state["path"] == "ORIGINAL", (
         f"TORCH_LIB_PATH left as {state['path']!r}; a worker restored another "
         "worker's temporary value"
