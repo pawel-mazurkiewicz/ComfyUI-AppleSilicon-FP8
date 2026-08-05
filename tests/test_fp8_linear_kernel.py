@@ -170,10 +170,40 @@ def test_self_check_not_run_on_ineligible(monkeypatch):
 
 # --- Task 4: REAL spy tests (kernel really ran AND wrapper dispatched native) -----
 # Gated on ASFP8_FP8_NATIVE=1 + MPS (builds the Metal lib).
-_run = os.environ.get("ASFP8_FP8_NATIVE") == "1"
+from _patches import _caps
+from _patches import fp8_linear_kernel_mps as _fp8patch
+
+# Run whenever the node ITSELF would use the kernel here -- same gate production
+# uses, so a kernel that stops compiling surfaces as a failure rather than a
+# silent skip (issue #13). ASFP8_FP8_NATIVE=0 turns them off with the feature.
+_fp8_enabled = torch.backends.mps.is_available() and _caps.resolve(
+    "ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready
+)
+
+
+def _fp8_kernel_works():
+    if not _fp8_enabled:
+        return False
+    try:
+        return _fp8patch._ensure_kernel() is not None and _fp8patch._self_check()
+    except Exception:
+        return False
+
+
+_fp8_ok = _fp8_kernel_works()
+
 requires_fp8_native = pytest.mark.skipif(
-    not (_run and torch.backends.mps.is_available()),
-    reason="set ASFP8_FP8_NATIVE=1 on an MPS device to build + test the fp8 kernel")
+    not _fp8_ok,
+    reason="fp8 kernel unavailable here — see test_fp8_kernel_compiles_when_enabled")
+
+
+@pytest.mark.skipif(not _fp8_enabled, reason="fp8 kernel not enabled on this machine")
+def test_fp8_kernel_compiles_when_enabled():
+    """Canary: if the node turns the fp8 kernel on, it must actually work."""
+    assert _fp8patch._ensure_kernel() is not None, "fp8 cpp_extension failed to build"
+    assert _fp8patch._self_check(), (
+        "fp8 Metal library does not compile on this machine — the kernel is inert"
+    )
 
 # MPS cannot cast bf16->fp8, so real fp8 QuantizedTensors are built on CPU then moved.
 # This comfy_kitchen registers the e4m3 layout as "TensorCoreFP8Layout".

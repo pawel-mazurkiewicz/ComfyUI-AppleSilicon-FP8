@@ -18,10 +18,32 @@ from conftest import requires_mps
 
 from _patches import int8_linear_kernel_mps as patch
 
-_run_integration = os.environ.get("ASFP8_INT8_EXT") == "1"
+from _patches import _caps
+
+# Run whenever the node ITSELF would use the kernel here -- same gate production
+# uses. Hiding these behind an opt-in env var meant a kernel that stopped
+# compiling (issue #13) showed up as 34 silent skips. ASFP8_INT8_EXT=0 still turns
+# them off, exactly as it turns the feature off.
+_int8_enabled = torch.backends.mps.is_available() and _caps.resolve(
+    "ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready
+)
+
+
+def _int8_kernel_works():
+    """Build the extension and run its self-check once, at collection time."""
+    if not _int8_enabled:
+        return False
+    try:
+        return patch._ensure_kernel() is not None and patch._self_check()
+    except Exception:
+        return False
+
+
+_int8_ok = _int8_kernel_works()
+
 requires_int8_ext = pytest.mark.skipif(
-    not (_run_integration and torch.backends.mps.is_available()),
-    reason="set ASFP8_INT8_EXT=1 on an MPS device to build + test the int8 kernel",
+    not _int8_ok,
+    reason="int8 kernel unavailable here — see test_int8_kernel_compiles_when_enabled",
 )
 
 
@@ -497,3 +519,19 @@ def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
     assert patch._try_int8_kernel_forward(Holder(), x) is None
 
     assert len(calls) == 1, f"Metal library compile retried per forward ({len(calls)}x)"
+
+
+@pytest.mark.skipif(not _int8_enabled, reason="int8 kernel not enabled on this machine")
+def test_int8_kernel_compiles_when_enabled():
+    """Canary: if the node turns the int8 kernel on, it must actually work.
+
+    The Metal library is compiled on first dispatch, so a macOS or toolchain
+    update can kill it while the cpp_extension still builds and the capability
+    banner stays green (issue #13). Without this the rest of the kernel tests
+    just skip and the breakage is invisible.
+    """
+    assert patch._ensure_kernel() is not None, "int8 cpp_extension failed to build"
+    assert patch._self_check(), (
+        "int8 Metal library does not compile on this machine — the kernel is "
+        "inert and every eligible Linear falls back to comfy's int8 path"
+    )

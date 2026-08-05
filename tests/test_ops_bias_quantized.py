@@ -147,7 +147,10 @@ def test_int8_embedding_dequantizes_without_backend_error(patched):
     """
     MP = ops.mixed_precision_ops(compute_dtype=torch.bfloat16)
     layer = MP.Embedding(16, 32, device="cpu", dtype=torch.bfloat16)
-    if "int8_tensorwise" not in inspect.getsource(ops.mixed_precision_ops):
+    # Read the MODULE source, not mixed_precision_ops: our own kernel patches wrap
+    # that function, so once they install this probe would see their wrapper and
+    # silently skip the regression test it guards.
+    if "int8_tensorwise" not in inspect.getsource(ops):
         pytest.skip("comfy too old for the int8_tensorwise embedding path")
 
     src = torch.randn(16, 32, dtype=torch.bfloat16)
