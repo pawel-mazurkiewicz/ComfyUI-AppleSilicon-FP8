@@ -295,6 +295,7 @@ your machine), then only the patch lines relevant to it:
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
   | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. Doubles as the age after which an abandoned build lock is treated as stale and cleared. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
+
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
   `compile_shader`** — no Metal 4.1 / M5 needed. Patch #18 fuses the DiT adaLN tail
   (rmsnorm + `(1+scale)·x+shift` + residual) into one `compile_shader` pass and

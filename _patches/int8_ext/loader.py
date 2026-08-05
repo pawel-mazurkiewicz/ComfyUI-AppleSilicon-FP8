@@ -95,11 +95,15 @@ def module():
           "minutes depending on the toolchain) — not frozen, this resumes when the "
           "build ends.", flush=True)
 
-    saved = cpp.TORCH_LIB_PATH
-    try:
+    def _prepare():
+        saved = cpp.TORCH_LIB_PATH
         cpp.TORCH_LIB_PATH = _nospace_torch_lib()
+        return lambda: setattr(cpp, "TORCH_LIB_PATH", saved)
+
+    try:
         _mod = _cpp_load_guarded(
             cpp_load,
+            prepare=_prepare,
             name="asfp8_int8_gemm",
             sources=[src],
             extra_cflags=["-std=c++17", "-ObjC++"],
@@ -110,8 +114,6 @@ def module():
     except Exception as e:
         print(f"[int8_ext] build failed; int8-native disabled: {e!r}")
         _mod = None
-    finally:
-        cpp.TORCH_LIB_PATH = saved
     return _mod
 
 

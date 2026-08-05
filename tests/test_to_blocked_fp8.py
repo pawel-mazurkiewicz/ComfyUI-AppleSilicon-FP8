@@ -106,7 +106,7 @@ def test_nvfp4_quantize_block_scales_match_cpu():
 try:
     import comfy_kitchen as _ck  # noqa: F401
     _HAS_CK = True
-except Exception:
+except ImportError:
     _HAS_CK = False
 
 requires_ck = pytest.mark.skipif(not _HAS_CK, reason="comfy_kitchen not installed in this env")

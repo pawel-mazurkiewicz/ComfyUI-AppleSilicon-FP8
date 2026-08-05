@@ -78,16 +78,25 @@ def _abandoned_lock_cleanup(build_dir, thread, owned=True):
     return cleanup
 
 
-def _cpp_load_guarded(cpp_load, **kwargs):
+def _cpp_load_guarded(cpp_load, prepare=None, **kwargs):
     """`torch.utils.cpp_extension.load` with a wall-clock ceiling.
 
     There is no safe way to cancel torch's loader, so on expiry we raise and leave
     the build on a daemon thread; the caller degrades to "kernel unavailable" for
     this session.
+
+    `prepare` runs on the build thread and returns an undo callable. Globals the
+    build needs (torch's TORCH_LIB_PATH) must be set and restored there: doing it
+    around this call would restore them while an abandoned build is still linking.
     """
     timeout = _build_timeout()
     if timeout <= 0:
-        return cpp_load(**kwargs)
+        undo = prepare() if prepare is not None else None
+        try:
+            return cpp_load(**kwargs)
+        finally:
+            if undo is not None:
+                undo()
 
     build_dir = kwargs.get("build_directory")
     # A lock already present isn't ours: our thread will be waiting on it, not
@@ -96,10 +105,19 @@ def _cpp_load_guarded(cpp_load, **kwargs):
     result = {}
 
     def run():
+        undo = None
         try:
+            if prepare is not None:
+                undo = prepare()
             result["mod"] = cpp_load(**kwargs)
         except BaseException as e:  # re-raised on the calling thread
             result["err"] = e
+        finally:
+            if undo is not None:
+                try:
+                    undo()
+                except Exception:
+                    pass
 
     label = os.path.basename(build_dir or "") or "ext"
     t = threading.Thread(target=run, name=f"asfp8-{label}-build", daemon=True)

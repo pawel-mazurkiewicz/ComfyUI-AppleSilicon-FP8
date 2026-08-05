@@ -248,3 +248,18 @@ def test_table_mutation_invalidates_cache():
     ref2 = _orig_interleaved(x, fr)
     assert not torch.allclose(out1.float(), out2.float()), "cache returned stale table"
     assert torch.allclose(out2.float(), ref2.float(), atol=2e-5, rtol=2e-5)
+
+
+def test_install_does_not_claim_active_when_the_reroute_failed(monkeypatch, capsys):
+    """The banner is the only signal a user gets; it must not claim success
+    when comfy_kitchen is missing or the eager reroute raised."""
+    from _patches import rope_fast_mps as m
+
+    def boom():
+        raise RuntimeError("no eager backend")
+
+    monkeypatch.setattr(m, "_do_install", boom)
+    m.install()
+
+    out = capsys.readouterr().out
+    assert "fused RoPE active" not in out, out

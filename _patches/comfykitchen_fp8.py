@@ -85,8 +85,8 @@ def install():
     # comfy_kitchen build without it still gets the fp8 fix this patch exists for.
     try:
         import comfy_kitchen.float_utils as fumod
-    except Exception:
-        fumod = None
+    except ImportError:
+        fumod = None  # predates the module; the fp8 fix above still applies
 
     eager = registry._backends.get("eager")
     if eager is None:

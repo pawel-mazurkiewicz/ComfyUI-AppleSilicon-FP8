@@ -258,11 +258,13 @@ def install():
     except Exception:
         have_ck = False
         print(f"{TAG} comfy_kitchen not installed; eager-rope retarget off.", flush=True)
-    if have_ck:
-        try:
-            _do_install()
-        except Exception as e:                 # never fatal
-            print(f"{TAG} eager install failed ({e}); leaving eager rope untouched.", flush=True)
+    if not have_ck:
+        return
+    try:
+        _do_install()
+    except Exception as e:                 # never fatal
+        print(f"{TAG} eager install failed ({e}); leaving eager rope untouched.", flush=True)
+        return
     print(f"{TAG} fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; "
           f"interleaved + split-half; fp32 math, no Metal-4.1/M5 requirement).", flush=True)
 
