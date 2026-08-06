@@ -223,6 +223,17 @@ your machine), then only the patch lines relevant to it:
 
 ## Notes & caveats
 
+- **Every Metal kernel proves itself before it is used.** The capability probe
+  says the machine has Metal-4 tensor ops; it does not say a *particular* kernel
+  builds, and those are different questions — a macOS update once tightened a
+  template constraint that broke only the int8 shader while the probe stayed
+  green ([#13](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/13),
+  [#14](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/14)).
+  So on first eligible layer each kernel builds its own extension, runs a warmup
+  dispatch, and checks its numerics against a reference; only then is it enabled.
+  The verdict — including failure — is remembered for the session, so a kernel
+  that cannot run costs one attempt and then falls back silently, rather than
+  retrying per layer and ending up **slower than not having it**.
 - **Accuracy:** the FP8 decode is bit-exact; results match a CUDA/CPU FP8 run
   within normal quantization noise.
 - **Speed:** FP8 operands decode (bit-exact) to **bf16**, so the matmul runs on the
@@ -230,6 +241,15 @@ your machine), then only the patch lines relevant to it:
   scalar f32 path. FP8 itself is not matrix-accelerated on Metal (emulated), so
   bf16 decode is the fast route — measured ~4× faster than f32 on M5 Max across
   diffusion-shaped GEMMs.
+- **If a kernel stops compiling after an OS update, that is expected-ish — and
+  it will not slow you down.** The MPP tensor-ops headers ship with **macOS**,
+  not Xcode, so a point release can reject a shader that built yesterday with no
+  toolchain change on your side. The node degrades to comfy's own path (correct
+  results, just slower) and says so once. Worth knowing if you go looking:
+  `xcrun metal` compiles against the **Xcode SDK**, while the runtime compiles
+  against **`/System`**, so an offline check is only trustworthy when your Xcode
+  SDK is at least as new as the OS headers — otherwise it can compile a shader
+  the runtime will refuse. (Thanks to @rsamerica for pinning that down.)
 - **The psutil fix is macOS-only and self-disabling.** It only activates if
   `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
   calls) on your machine — which only happens on the affected macOS betas. On any
@@ -395,6 +415,10 @@ preferred way to toggle a single acceleration.
   cooperative-TensorOps `matmul2d` kernel that patch #17's bit-exact
   INT8×INT8→INT32 GEMM (and its fused `w8a8_matmul_fused_dequant` epilogue) is
   ported from.
+- [@rsamerica](https://github.com/rsamerica) — the INT8 retry-storm report
+  ([#13](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/13)),
+  independently root-causing the address-space qualifier behind it, and
+  confirming the fix on their own rig.
 
 ## License
 
