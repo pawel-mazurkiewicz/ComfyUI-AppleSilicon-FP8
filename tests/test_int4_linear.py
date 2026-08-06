@@ -200,3 +200,38 @@ def test_int4_verification_is_memoised(monkeypatch):
         assert len(attempts) == 1, f"int4 re-verified {len(attempts)}x"
     finally:
         _caps._kernel_ready.pop("int4", None)
+
+
+@requires_mps
+def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
+    """A W4A8 dispatch that blows up must not be retried on every ConvRot layer.
+
+    Verification already passed by this point, so the failure recurs; without a
+    latch each layer pays the exception and logs a line (issue #13's 822).
+    """
+    from _patches import _caps
+
+    calls = []
+
+    def exploding(*a, **k):
+        calls.append(1)
+        raise RuntimeError("W4A8 dispatch blew up")
+
+    _caps._kernel_ready.pop("int4", None)
+    monkeypatch.setattr(int4_linear_mps, "_verify", lambda: True)
+    monkeypatch.setattr(int4_linear_mps, "_load_kernel", lambda: object())
+    monkeypatch.setattr(int4_linear_mps, "_w4a8_kernel_linear", exploding)
+
+    _, qdata, wscales = _quantized_weight()
+    x = torch.randn(8, K, dtype=torch.bfloat16, device="mps")
+
+    try:
+        for _ in range(4):
+            out = int4_linear_mps._w4a16_linear_mps(
+                x, qdata.to("mps"), wscales.to("mps"), None, 256, ck_eager
+            )
+            assert out.shape == (8, N)
+        assert len(calls) == 1, f"W4A8 retried after a dispatch failure ({len(calls)}x)"
+        assert _caps._kernel_ready["int4"] is False
+    finally:
+        _caps._kernel_ready.pop("int4", None)

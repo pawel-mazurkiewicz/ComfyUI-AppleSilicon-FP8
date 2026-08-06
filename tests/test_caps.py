@@ -5,6 +5,8 @@ capability predicate, so they run identically on CI (no MPS) and on an M5 box.
 The gate is the mechanism every default-on perf patch now shares, so its contract
 is worth pinning independently of any one kernel.
 """
+import time
+
 import pytest
 
 from _patches import _caps
@@ -154,3 +156,52 @@ def test_summary_banner_substrings_are_unchanged():
     s = _caps.summary()
     for token in ("mps=", "tensor_ops(M5/Metal4)=", "ninja="):
         assert token in s, f"{token!r} missing from banner: {s}"
+
+
+def test_kernel_ready_verifies_once_under_concurrency():
+    """Two layers hitting an unverified kernel at the same time must not each
+    start their own extension build.
+
+    The whole sequence -- lookup, verify, store -- has to be inside the lock; a
+    bare dict check leaves both callers seeing None and both building.
+    """
+    import threading
+
+    _caps.reset_cache()
+    calls = []
+    both_ready = threading.Barrier(2, timeout=30)
+
+    def verify():
+        calls.append(1)
+        time.sleep(0.05)          # widen the window a racing caller slips through
+        return True
+
+    results = []
+
+    def worker():
+        both_ready.wait()
+        results.append(_caps.kernel_ready("concurrent", verify))
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+
+    assert not any(t.is_alive() for t in threads)
+    assert results == [True, True]
+    assert len(calls) == 1, f"verify_fn ran {len(calls)}x for concurrent callers"
+
+
+def test_mark_kernel_failed_disables_without_reverifying():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(1)
+        return True
+
+    assert _caps.kernel_ready("latch", verify) is True
+    _caps.mark_kernel_failed("latch")
+    assert _caps.kernel_ready("latch", verify) is False
+    assert len(calls) == 1, "a latched-off kernel was re-verified"

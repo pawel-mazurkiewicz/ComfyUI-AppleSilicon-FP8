@@ -23,6 +23,7 @@ Capability tiers:
 
 import os
 import platform
+import threading
 
 import torch
 
@@ -110,6 +111,12 @@ def tier_b_ready():
 # name -> None (untried) | True (verified working) | False (verified broken)
 _kernel_ready = {}
 
+# Held across the whole check-run-store sequence, so concurrent callers verify a
+# kernel once rather than each starting their own extension build. Reentrant
+# because a verify_fn is arbitrary caller code; the lock order is always this
+# lock then _extbuild._BUILD_LOCK, never the reverse, so the two cannot deadlock.
+_kernel_lock = threading.RLock()
+
 
 def kernel_ready(name, verify_fn):
     """Has THIS kernel been proven to work end to end on THIS machine?
@@ -123,17 +130,18 @@ def kernel_ready(name, verify_fn):
     itself: without a remembered failure every eligible layer retries the build,
     which is what made issue #13 cost 1.46x rather than merely disabling int8.
     """
-    cached = _kernel_ready.get(name)
-    if cached is not None:
-        return cached
-    try:
-        ok = bool(verify_fn())
-    except Exception as e:
-        print(f"[AppleSilicon-FP8] {name} kernel verification raised; "
-              f"disabling it for this session: {e!r}", flush=True)
-        ok = False
-    _kernel_ready[name] = ok
-    return ok
+    with _kernel_lock:
+        cached = _kernel_ready.get(name)
+        if cached is not None:
+            return cached
+        try:
+            ok = bool(verify_fn())
+        except Exception as e:
+            print(f"[AppleSilicon-FP8] {name} kernel verification raised; "
+                  f"disabling it for this session: {e!r}", flush=True)
+            ok = False
+        _kernel_ready[name] = ok
+        return ok
 
 
 def resolve(env_name, default_on, cap):
@@ -162,14 +170,16 @@ def mark_kernel_failed(name):
     remainder of the render and buys back a per-layer exception plus its log
     line -- the 822 fallback lines in issue #13. Falling back is always correct.
     """
-    _kernel_ready[name] = False
+    with _kernel_lock:
+        _kernel_ready[name] = False
 
 
 def reset_cache():
     """Test hook: forget memoised probe results so a test can re-probe."""
     global _compile_shader, _tensor_ops, _ninja
     _compile_shader = _tensor_ops = _ninja = None
-    _kernel_ready.clear()
+    with _kernel_lock:
+        _kernel_ready.clear()
 
 
 def summary():

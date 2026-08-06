@@ -147,8 +147,13 @@ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
             y = _w4a8_kernel_linear(x_rot, qweight, wscales, bias, kernel)
             return y.reshape(*orig_shape[:-1], qweight.shape[0])
         except Exception as e:
-            # Never abort a render on a kernel hiccup — drop to the W4A16 unpack path.
-            print(f"{TAG} W4A8 kernel call failed ({e!r}); falling back to W4A16.")
+            # Never abort a render on a kernel hiccup — drop to the W4A16 unpack
+            # path, and latch the kernel off: warmup() and the numeric self-check
+            # both passed, so a dispatch failure recurs on every later ConvRot
+            # layer (and logs) if we keep retrying it.
+            print(f"{TAG} W4A8 kernel call failed ({e!r}); using W4A16 for the "
+                  f"rest of this session.")
+            _caps.mark_kernel_failed("int4")
 
     w = _unpack_int4_signed_fast(qweight, x2d.dtype)
     w = w * wscales.to(device=w.device, dtype=x2d.dtype).reshape(-1, 1)
