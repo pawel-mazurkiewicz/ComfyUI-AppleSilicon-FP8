@@ -145,3 +145,93 @@ def test_install_routes_mps_only():
         assert torch.equal(y_mps.cpu(), y_fast.cpu())
     finally:
         int4_linear_mps.uninstall()
+
+
+# --- per-kernel verification (issue #14) -----------------------------------
+
+
+@requires_mps
+def test_int4_self_check_passes_on_a_working_kernel(monkeypatch):
+    """warmup() only proves the shader compiles.
+
+    The nibble order and the fused dequant epilogue are separate claims, and
+    either could break under a toolchain update the way #13's operand constraint
+    did. Opt-in, so this skips unless int4 is actually enabled.
+    """
+    _kernel_or_skip()   # opts in and builds the extension, but not into _kernel
+    monkeypatch.setattr(int4_linear_mps, "_kernel", None)
+    monkeypatch.setattr(int4_linear_mps, "_kernel_tried", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_checked", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_ok", False)
+
+    assert int4_linear_mps._load_kernel() is not None
+    assert int4_linear_mps._self_check() is True
+
+
+@requires_mps
+def test_int4_self_check_rejects_a_wrong_kernel(monkeypatch):
+    """Guards the guard: a self-check that cannot fail is worse than none."""
+    _kernel_or_skip()
+
+    class Wrong:
+        def i8i4_linear_fused_nt(self, qx, w, xs, ws, b, K, N):
+            return torch.zeros(qx.shape[0], N, dtype=torch.bfloat16, device="mps")
+
+    monkeypatch.setattr(int4_linear_mps, "_kernel", Wrong())
+    monkeypatch.setattr(int4_linear_mps, "_self_checked", False)
+    monkeypatch.setattr(int4_linear_mps, "_self_ok", False)
+    assert int4_linear_mps._self_check() is False
+
+
+def test_int4_verification_is_memoised(monkeypatch):
+    """A broken int4 kernel must not be re-verified on every ConvRot layer."""
+    from _patches import _caps
+
+    _caps._kernel_ready.pop("int4", None)
+    attempts = []
+
+    def failing_verify():
+        attempts.append(1)
+        return False
+
+    try:
+        for _ in range(3):
+            assert _caps.kernel_ready("int4", failing_verify) is False
+        assert len(attempts) == 1, f"int4 re-verified {len(attempts)}x"
+    finally:
+        _caps._kernel_ready.pop("int4", None)
+
+
+@requires_mps
+def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
+    """A W4A8 dispatch that blows up must not be retried on every ConvRot layer.
+
+    Verification already passed by this point, so the failure recurs; without a
+    latch each layer pays the exception and logs a line (issue #13's 822).
+    """
+    from _patches import _caps
+
+    calls = []
+
+    def exploding(*a, **k):
+        calls.append(1)
+        raise RuntimeError("W4A8 dispatch blew up")
+
+    _caps._kernel_ready.pop("int4", None)
+    monkeypatch.setattr(int4_linear_mps, "_verify", lambda: True)
+    monkeypatch.setattr(int4_linear_mps, "_load_kernel", lambda: object())
+    monkeypatch.setattr(int4_linear_mps, "_w4a8_kernel_linear", exploding)
+
+    _, qdata, wscales = _quantized_weight()
+    x = torch.randn(8, K, dtype=torch.bfloat16, device="mps")
+
+    try:
+        for _ in range(4):
+            out = int4_linear_mps._w4a16_linear_mps(
+                x, qdata.to("mps"), wscales.to("mps"), None, 256, ck_eager
+            )
+            assert out.shape == (8, N)
+        assert len(calls) == 1, f"W4A8 retried after a dispatch failure ({len(calls)}x)"
+        assert _caps._kernel_ready["int4"] is False
+    finally:
+        _caps._kernel_ready.pop("int4", None)

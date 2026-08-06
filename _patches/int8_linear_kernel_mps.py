@@ -44,6 +44,9 @@ TAG = "[AppleSilicon-FP8/int8_kernel]"
 _installed = False
 _orig_int8_linear = None
 _kernel = None
+_kernel_tried = False
+_self_checked = False
+_self_ok = False
 
 # Supported fused activations. P0 verdict (M5 Max / macOS 27 / Metal 4.1):
 # Metal `erf` is unavailable, so act=3 (gelu-erf) is dropped entirely; only
@@ -75,7 +78,73 @@ def _load_kernel():
     except Exception as e:  # pragma: no cover - import wiring
         print(f"{TAG} loader import failed: {e!r}")
         return None
-    return loader.module()
+    mod = loader.module()
+    if mod is not None:
+        try:
+            # warmup() dispatches for real, so it is where a library that BUILT
+            # but whose Metal source the runtime rejects actually fails (#13).
+            mod.warmup()
+        except Exception as e:
+            print(f"{TAG} warmup failed; disabling: {e!r}")
+            return None
+    return mod
+
+
+def _ensure_kernel():
+    """Build the Metal extension lazily, on the FIRST layer that can actually use it.
+
+    Building inside install() blocked ComfyUI's startup import on a synchronous
+    ninja+clang build (issue: "hangs forever at startup when ninja is installed").
+    Deferring it here matches scaled_mm_fp8._get_backend / int4_linear_mps._load_kernel
+    and keeps startup non-blocking; a failed build is remembered so we retry once only.
+    """
+    global _kernel, _kernel_tried
+    if _kernel is not None or _kernel_tried:
+        return _kernel
+    _kernel_tried = True
+    _kernel = _load_kernel()
+    if _kernel is None:
+        print(f"{TAG} INT8 Metal kernel unavailable; using comfy's int8 path.")
+    return _kernel
+
+
+def _self_check():
+    """One-time correctness gate on a tiny int8 matmul.
+
+    The .so loading is not proof the kernel works: the Metal library is compiled
+    by newLibraryWithSource on the FIRST dispatch, so a toolchain that rejects it
+    fails here rather than at build time. Without this latch that compile is
+    retried on every eligible Linear (issue #13) — slower than not having the
+    kernel at all. Mirrors fp8_linear_kernel_mps._self_check.
+
+    MUST be called only AFTER a layer passes every eligibility gate.
+    """
+    global _self_checked, _self_ok
+    if _self_checked:
+        return _self_ok
+    _self_checked = True
+    try:
+        g = torch.Generator().manual_seed(0)
+        a = torch.randint(-127, 128, (32, 128), generator=g, dtype=torch.int8)
+        w = torch.randint(-127, 128, (64, 128), generator=g, dtype=torch.int8)
+        ref = a.int() @ w.int().t()
+        out = _kernel.i8_matmul2d_nt(a.to("mps").contiguous(), w.to("mps").contiguous())
+        _self_ok = torch.equal(out.cpu(), ref)
+        if not _self_ok:
+            print(f"{TAG} self-check mismatch; using comfy's int8 path.")
+    except Exception as e:
+        _self_ok = False
+        print(f"{TAG} self-check raised; using comfy's int8 path: {e!r}")
+    return _self_ok
+
+
+def _verify():
+    """The contract _caps.kernel_ready expects: build, warmup, then numerics.
+
+    Nothing short of this proves the kernel works — tier_b_ready() only compiles
+    na_gemm's bf16 shader, which shares no operand types with ours (#14).
+    """
+    return _ensure_kernel() is not None and _self_check()
 
 
 def _int8_linear_kernel(
@@ -220,12 +289,12 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
 def _try_int8_kernel_forward(self, input):
     """Return the layer output via the kernel W8A8 path, or None to fall back.
 
-    Eligible iff: kernel built; input is a plain MPS Tensor (not a QuantizedTensor);
-    weight is a TensorWiseINT8Layout QuantizedTensor; not full-precision-mm; no
-    force-cast; no LoRA weight/bias functions; weight not logically transposed.
+    Eligible iff: input is a plain MPS Tensor (not a QuantizedTensor); weight is a
+    TensorWiseINT8Layout QuantizedTensor; not full-precision-mm; no force-cast; no
+    LoRA weight/bias functions; weight not logically transposed; and the Metal
+    kernel builds. The build is attempted only AFTER every cheap eligibility gate
+    passes, so a model with no int8 convrot layers never pays for it.
     """
-    if _kernel is None:
-        return None
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
@@ -248,6 +317,10 @@ def _try_int8_kernel_forward(self, input):
         if getattr(params, "transposed", False):
             return None
 
+        from . import _caps
+        if not _caps.kernel_ready("int8", _verify):
+            return None
+
         qdata = w._qdata
         scale = params.scale
         convrot = getattr(params, "convrot", False)
@@ -256,13 +329,19 @@ def _try_int8_kernel_forward(self, input):
 
         return _int8_linear_kernel(input, qdata, scale, bias, input.dtype, convrot, gs)
     except Exception as e:
-        # Never take down a render; fall back to comfy's original forward.
-        print(f"{TAG} kernel forward fell back ({e!r})")
+        # Never take down a render; fall back to comfy's original forward, and
+        # stop using the kernel for the rest of the session -- verification
+        # already passed, so this repeats on every later layer if we don't.
+        from . import _caps
+        if _caps._kernel_ready.get("int8"):
+            print(f"{TAG} kernel forward failed ({e!r}); using comfy's int8 path "
+                  f"for the rest of this session.")
+        _caps.mark_kernel_failed("int8")
         return None
 
 
 def install():
-    global _installed, _orig_int8_linear, _kernel
+    global _installed, _orig_int8_linear
     if _installed:
         return
     if sys.platform != "darwin":
@@ -275,10 +354,6 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-
-    _kernel = _load_kernel()
-    if _kernel is None:
-        return  # loader already explained why
 
     # Capture the original eager int8_linear for the fallback inside the wrapper.
     try:
@@ -325,5 +400,5 @@ def install():
     print(
         f"{TAG} INT8 convrot Linear routed through bit-exact Metal kernel on MPS "
         f"(clean W8A8: rotate->per-row quant->int8 matmul; weight-only fp32 "
-        f"dequant/un-rotation bypassed)."
+        f"dequant/un-rotation bypassed). Kernel builds on first int8 layer, not now."
     )

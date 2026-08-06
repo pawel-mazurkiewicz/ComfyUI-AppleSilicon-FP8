@@ -20,9 +20,16 @@
   activates where it's supported; everywhere else it stays inert (nothing to
   configure, nothing breaks). The startup log prints a one-line capability summary
   so you can see exactly which tier is active on your machine. The heavier matmul
-  kernels compile against **Metal 4.1** (developed on **macOS 27**) and need an
-  **M5** GPU plus `ninja` to build — so on M1–M4 or older macOS they simply don't
-  engage. Any env var below can force a patch on or off regardless of the probe.
+  kernels compile against **Metal 4.1** (developed on **macOS 27**) and need
+  Metal-4 tensor ops — established by a runtime shader-compile probe, in practice
+  an **M5** — plus `ninja` to build, so on M1–M4 or older macOS they normally
+  don't engage. The per-patch switches below (`ASFP8_FP8_EXT`, `ASFP8_INT8_EXT`
+  and friends) take `off` to force a patch off and `1` to force it past the
+  capability probe; forcing on buys only a *build attempt*, since callers still
+  apply their own eligibility checks (dtype, layout, size thresholds), so a
+  forced kernel that builds may still never be reached. The numeric settings
+  (`ASFP8_EXT_BUILD_TIMEOUT`, `ASFP8_FP8_EXT_MIN_DIM`) tune behaviour and
+  bypass nothing.
 
 ## Quick start — by machine
 
@@ -41,16 +48,24 @@ are satisfied:
   version; developed on **macOS 27**). Older macOS → the capability probe fails
   and the kernel stays inert. Needs Xcode command-line tools (the Metal compiler)
   and `ninja` to build the ObjC++ extension.
-- **GPU:** the **int8** kernel needs an **M5** (Metal 4 cooperative TensorOps);
-  the **fp8** kernel needs Metal 4.1's fp8 format type. Anything unsupported is
-  detected up front and skipped.
+- **GPU:** the **int8** kernel needs Metal 4 cooperative TensorOps; the **fp8**
+  kernel needs Metal 4.1's fp8 format type — in practice an **M5**.
 
-**M1 / M2 / M3 / M4 — nothing to do.** The M5-class matmul kernels self-detect as
-unsupported and never build, so there's no failed-compile noise and no config.
-You still get the full compatibility layer plus the compile_shader speedups that
-*don't* need Metal 4.1 (fused RMSNorm #18, fused RoPE #21): FP8 matmuls run
-accelerated via bf16 decode on `simdgroup_matrix`, and int8 runs comfy's (fixed)
-weight-only path.
+**How the probe actually decides.** There is no chip-model check anywhere in the
+code. The gate is `tier_b_ready()`: it (a) tries to compile a small
+`mpp::tensor_ops::matmul2d` Metal shader via `torch.mps.compile_shader` and (b)
+looks for `ninja`. Both must succeed. Because (a) depends on your macOS, Metal
+SDK and PyTorch build as much as on the GPU, the answer is not strictly "M5 =
+yes, M1–M4 = no": an M5 on some stacks probes `tensor_ops=no`, and an M4 on a
+recent macOS + PyTorch nightly has probed `tensor_ops=yes`. The startup log's
+`capabilities:` line prints exactly what your machine resolved to — trust that
+over the chip name.
+
+**M1 / M2 / M3 / M4 — nothing to do.** These normally fail the tensor-ops probe,
+so the M5-class matmul kernels stay inert and never build. You still get the full
+compatibility layer plus the compile_shader speedups that *don't* need Metal 4.1
+(fused RMSNorm #18, fused RoPE #21): FP8 matmuls run accelerated via bf16 decode
+on `simdgroup_matrix`, and int8 runs comfy's (fixed) weight-only path.
 
 **M5 / M5 Pro / M5 Max on a recent macOS — just install the build toolchain and
 the kernels turn themselves on:**
@@ -62,11 +77,17 @@ pip install ninja                      # or:  pip install 'comfyui-applesilicon-
 # M5 + Metal 4.1 + ninja and activate automatically — no env vars required.
 ```
 
-Each kernel builds on first use (watch the startup log for the capability summary
-and the `int8_kernel` / fp8 lines) and silently stays inert on any failure —
-including too-old macOS or missing `ninja` — so the defaults are safe everywhere.
-To force a kernel off on a supported machine, set its env var to `off` (e.g.
-`ASFP8_INT8_EXT=off`); to force a build attempt anyway, set it to `1`.
+Each kernel is compiled lazily, on the **first model layer that can use it** —
+never during ComfyUI's startup import. The build prints a `compiling the ... Metal
+kernel` line first so it can't be mistaken for a freeze, and is abandoned after
+`ASFP8_EXT_BUILD_TIMEOUT` seconds (default 600) so a wedged toolchain degrades to
+"kernel unavailable" instead of hanging. A build lock left behind by a killed
+ComfyUI is cleared automatically once it is older than that timeout, so a
+force-quit mid-build can't wedge later runs. Any failure —
+too-old macOS, missing `ninja`, build error — silently falls back, so the defaults
+are safe everywhere. To force a kernel off on a supported machine, set its env var
+to `off` (e.g. `ASFP8_INT8_EXT=off`); to force a build attempt anyway, set it
+to `1`.
 
 It started as an FP8 compatibility layer and has grown into a broader Apple
 Silicon quantization layer: it keeps FP8 **and INT8** diffusion models running on
@@ -135,8 +156,9 @@ speedup is gated on a startup capability probe (see the banner in
 | 18 | **DiT adaLN tail (RMSNorm + modulation + residual) is several separate MPS passes** | Each of rmsnorm, the `(1+scale)·x+shift` affine, and the residual add is its own kernel launch + full read/write of the activation | **On by default where supported (any MPS with `compile_shader`; `ASFP8_FUSED_NORM=off` to disable):** fuse the whole tail into **one** `compile_shader` pass (fp32 reduction, 64-bit indexing — also supersedes patch #4's >2²¹-row correctness fallback). No Metal 4.1 / M5 needed |
 | 19 | **VAE / SeedVR2 conv3d decode is slow (or OOMs non-tiled) on MPS** | Stock MPS `conv3d` doesn't use the tensor units and materialises large intermediates | **On by default where supported (M5 / Metal 4.1; `ASFP8_CONV_IM2COL=off` to disable):** run conv3d as im2col + `matmul2d` on the tensor units (~2.7× vs stock conv3d, ~31% faster SeedVR2), with the patch buffer capped at `ASFP8_CONV_TILE_MB`. conv2d stays off unless opted in (`=2d`/`=2d,3d`); falls back per-conv on any unsupported shape |
 | 20 | **FP8 `mixed_precision_ops` Linear decodes fp8→bf16 every step** (Ideogram-4-style eager fp8 checkpoints) | The weight is stored fp8 but each forward LUT-decodes it to bf16 before the matmul | **On by default where supported (M5 + Metal 4.1 + `ninja`; `ASFP8_FP8_NATIVE=off` to disable):** route wide fp8 Linears (min_dim ≥ 8192) through a native fp8-e4m3 `matmul2d` — half activation × fp8 weight on the tensor units — bypassing the per-step decode. Seam confirmed via a live Flux-2 probe; falls back per-call otherwise |
-| 21 | **Rotary position embedding is a chain of small MPS ops per attention block** | `apply_rope` / `apply_rope_split_half` do the interleave/rotate as several elementwise kernels | **On by default where supported (any MPS with `compile_shader`; `ASFP8_ROPE_FAST=off` to disable):** fuse `comfy_kitchen`'s `apply_rope` / `apply_rope_split_half` into **one** `compile_shader` kernel (~6–17×/call over eager; fp32 math, no Metal 4.1/M5). **#21b** additionally retargets the *real* `comfy.ldm.flux` / `llama` rope on live models — higher-risk, so **opt-in** via `ASFP8_ROPE_COMFY_RETARGET=1` |
+| 21 | **Rotary position embedding is a chain of small MPS ops per attention block** | `apply_rope` / `apply_rope_split_half` do the interleave/rotate as several elementwise kernels | **On by default where supported (any MPS with `compile_shader`; `ASFP8_ROPE_FAST=off` to disable):** fuse `comfy_kitchen`'s `apply_rope` / `apply_rope_split_half` into **one** `compile_shader` kernel (~6–17×/call over eager; fp32 math, no Metal 4.1/M5). |
 | 22 | **INT4 ConvRot models run ~2× slower than INT8 on MPS** (e.g. Krea2 int4 convrot — GitHub [#3](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/3)) | comfy_kitchen's eager `convrot_w4a4` quantizes + packs the *activation* to int4, then unpacks **both** operands back to bf16 for a float GEMM — the int4 activation quant only ever fed a CUDA int4 MMA, so on MPS it's pure wasted work (measured **2.24× int8**) | On MPS, reroute ConvRot W4A4 Linears to a **W4A16 fast path** (default, `compile_shader`-free, comfy_kitchen-gated): skip the wasted activation quant, dequantize the packed int4 weight and run MPS's bf16 GEMM — faster *and* more accurate (15.8% vs 22.5% rel err). Brings int4 to **parity with int8** — see the caveat below: **int4's benefit is memory, not speed**. Opt-in W4A8 fused Metal kernel via `ASFP8_INT4_EXT=1` (M5 / Metal 4.1 + `ninja`) |
+| 23 | `RuntimeError: Undefined type Float8_e4m3fn` while **loading an NVFP4 checkpoint** (e.g. LTX-2.3 — GitHub [#8](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/8)) | The NVFP4 *quantize* direction swizzles its fp8 block-scales through `to_blocked`, which pads with `padded[:rows, :cols] = input_matrix` — a strided fp8 copy MPS has no kernel for. Fires when `in_features % 64 != 0`, on any path that re-quantizes (LoRA/patch application, lowvram-streamed layers). Patch #2 covered only the *dequantize* direction | Route fp8 `to_blocked` through the CPU and return the result to the device — pure data movement, so bit-exact. Applied to both copies: `comfy.float` (the `stochastic_rounding > 0` path) and `comfy_kitchen.float_utils` (the default branch, since `comfy.quant_ops` passes `stochastic_rounding=0`) |
 
 ### How the FP8 trick works
 
@@ -185,7 +207,7 @@ your machine), then only the patch lines relevant to it:
 [AppleSilicon-FP8/int8_kernel] INT8 convrot Linear routed through bit-exact Metal kernel on MPS (clean W8A8; weight-only fp32 dequant/un-rotation bypassed).
 [AppleSilicon-FP8/int4_linear] ConvRot W4A4 (int4) Linear on MPS -> W4A16 rotated-basis fast path.
 [AppleSilicon-FP8/conv] conv im2col+matmul2d active on MPS (ranks=[3], tile=384MB).
-[AppleSilicon-FP8/rope-fast] fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; ...; comfy-retarget OFF).
+[AppleSilicon-FP8/rope-fast] fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; interleaved + split-half; fp32 math, no Metal-4.1/M5 requirement).
 [AppleSilicon-FP8/mlx_textgen] TextGenerate routed through MLX on Apple Silicon (qwen3vl_4b -> mlx-community/Qwen3-VL-4B-Instruct-4bit; gemma3_12b -> mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit).
 ```
 
@@ -201,6 +223,17 @@ your machine), then only the patch lines relevant to it:
 
 ## Notes & caveats
 
+- **Every Metal kernel proves itself before it is used.** The capability probe
+  says the machine has Metal-4 tensor ops; it does not say a *particular* kernel
+  builds, and those are different questions — a macOS update once tightened a
+  template constraint that broke only the int8 shader while the probe stayed
+  green ([#13](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/13),
+  [#14](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/14)).
+  So on first eligible layer each kernel builds its own extension, runs a warmup
+  dispatch, and checks its numerics against a reference; only then is it enabled.
+  The verdict — including failure — is remembered for the session, so a kernel
+  that cannot run costs one attempt and then falls back silently, rather than
+  retrying per layer and ending up **slower than not having it**.
 - **Accuracy:** the FP8 decode is bit-exact; results match a CUDA/CPU FP8 run
   within normal quantization noise.
 - **Speed:** FP8 operands decode (bit-exact) to **bf16**, so the matmul runs on the
@@ -208,6 +241,15 @@ your machine), then only the patch lines relevant to it:
   scalar f32 path. FP8 itself is not matrix-accelerated on Metal (emulated), so
   bf16 decode is the fast route — measured ~4× faster than f32 on M5 Max across
   diffusion-shaped GEMMs.
+- **If a kernel stops compiling after an OS update, that is expected-ish — and
+  it will not slow you down.** The MPP tensor-ops headers ship with **macOS**,
+  not Xcode, so a point release can reject a shader that built yesterday with no
+  toolchain change on your side. The node degrades to comfy's own path (correct
+  results, just slower) and says so once. Worth knowing if you go looking:
+  `xcrun metal` compiles against the **Xcode SDK**, while the runtime compiles
+  against **`/System`**, so an offline check is only trustworthy when your Xcode
+  SDK is at least as new as the OS headers — otherwise it can compile a shader
+  the runtime will refuse. (Thanks to @rsamerica for pinning that down.)
 - **The psutil fix is macOS-only and self-disabling.** It only activates if
   `psutil.virtual_memory()` actually fails a startup probe (a clear majority of
   calls) on your machine — which only happens on the affected macOS betas. On any
@@ -277,6 +319,8 @@ your machine), then only the patch lines relevant to it:
   | Env var | Behaviour |
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
+  | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. An abandoned build lock is cleared once it is **twice** this old (twice the 600 s default when set to `0`), so a build that is merely slow is never disturbed. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
+
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
   `compile_shader`** — no Metal 4.1 / M5 needed. Patch #18 fuses the DiT adaLN tail
   (rmsnorm + `(1+scale)·x+shift` + residual) into one `compile_shader` pass and
@@ -288,7 +332,6 @@ your machine), then only the patch lines relevant to it:
   |---|---|
   | `ASFP8_FUSED_NORM` (default on where capable) | Fused rmsnorm+modulation+residual kernel (#18). `off`/`0` → disable; `1` → force on. |
   | `ASFP8_ROPE_FAST` (default on where capable) | Fused standalone RoPE kernel (#21). `off`/`0` → disable; `1` → force on. |
-  | `ASFP8_ROPE_COMFY_RETARGET` (default **off**) | **Opt-in** #21b: additionally retarget the real `comfy.ldm.flux` / `llama` rope on live models (higher-risk). `1`/`on` → enable. |
 - **conv im2col (#19) is ON by default for conv3d on M5 / Metal 4.1.** VAE / SeedVR2
   conv3d runs as im2col + `matmul2d` on the tensor units (~2.7× vs stock).
 
@@ -372,6 +415,10 @@ preferred way to toggle a single acceleration.
   cooperative-TensorOps `matmul2d` kernel that patch #17's bit-exact
   INT8×INT8→INT32 GEMM (and its fused `w8a8_matmul_fused_dequant` epilogue) is
   ported from.
+- [@rsamerica](https://github.com/rsamerica) — the INT8 retry-storm report
+  ([#13](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/13)),
+  independently root-causing the address-space qualifier behind it, and
+  confirming the fix on their own rig.
 
 ## License
 

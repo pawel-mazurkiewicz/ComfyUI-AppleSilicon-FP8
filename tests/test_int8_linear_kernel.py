@@ -7,17 +7,58 @@ Integration test (opt-in, ASFP8_INT8_EXT=1 on an MPS box): the kernel-backed
 int8_linear is bit-identical to comfy_kitchen's original across convrot/bias/3D/M=1.
 """
 import os
+import shutil
+import threading
+import time
 
 import pytest
 import torch
 
+from conftest import requires_mps
+
 from _patches import int8_linear_kernel_mps as patch
 
-_run_integration = os.environ.get("ASFP8_INT8_EXT") == "1"
-requires_int8_ext = pytest.mark.skipif(
-    not (_run_integration and torch.backends.mps.is_available()),
-    reason="set ASFP8_INT8_EXT=1 on an MPS device to build + test the int8 kernel",
+from _patches import _caps
+
+# Run whenever the node ITSELF would use the kernel here -- same gate production
+# uses. Hiding these behind an opt-in env var meant a kernel that stopped
+# compiling (issue #13) showed up as 34 silent skips. ASFP8_INT8_EXT=0 still turns
+# them off, exactly as it turns the feature off.
+_int8_enabled = torch.backends.mps.is_available() and _caps.resolve(
+    "ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready
 )
+
+
+def _int8_kernel_works():
+    """Build the extension and run its self-check once, at collection time."""
+    if not _int8_enabled:
+        return False
+    try:
+        return patch._ensure_kernel() is not None and patch._self_check()
+    except Exception:
+        return False
+
+
+_int8_ok = _int8_kernel_works()
+
+requires_int8_ext = pytest.mark.skipif(
+    not _int8_ok,
+    reason="int8 kernel unavailable here — see test_int8_kernel_compiles_when_enabled",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_int8_kernel_memo():
+    """_caps.kernel_ready memoises per process.
+
+    Without this, whichever test verifies the kernel first decides the answer for
+    every later test, and a test that installs a deliberately broken kernel is
+    silently skipped past its own gate.
+    """
+    from _patches import _caps
+    _caps._kernel_ready.pop("int8", None)
+    yield
+    _caps._kernel_ready.pop("int8", None)
 
 
 def test_install_noop_when_explicitly_off(monkeypatch):
@@ -38,6 +79,122 @@ def test_install_noop_when_not_capable(monkeypatch):
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
+
+
+# --- the Metal build must never run on the ComfyUI startup thread ---------------
+# Regression guard for "ComfyUI hangs forever at startup when `ninja` is installed":
+# install() used to run a synchronous ninja+clang build of the ObjC++/Metal source
+# while ComfyUI was still importing custom nodes, with no timeout and no message.
+
+
+@requires_mps
+def test_install_does_not_build_the_extension(monkeypatch):
+    """install() runs at import time: it may wire the seam, never build the kernel."""
+    from _patches import _caps
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+
+    builds = []
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    patch.install()
+    assert builds == [], "install() built the Metal extension on the startup thread"
+
+
+@requires_mps
+def test_kernel_builds_on_first_eligible_forward(monkeypatch):
+    """The build is deferred to the first int8 layer that really needs it, once."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    builds = []
+    fake_kernel = object()
+
+    def fake_build():
+        builds.append(1)
+        return fake_kernel
+
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", fake_build, raising=False)
+    # this test is about build deferral, not kernel correctness
+    monkeypatch.setattr(patch, "_self_checked", True, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", True, raising=False)
+
+    out = torch.full((1,), 7.0)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: out, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    assert patch._try_int8_kernel_forward(Holder(), x) is out
+    assert builds == [1], "first eligible forward did not build the kernel"
+    assert patch._try_int8_kernel_forward(Holder(), x) is out
+    assert builds == [1], "kernel was rebuilt on a later forward"
+
+
+@requires_mps
+def test_ineligible_layer_does_not_trigger_a_build(monkeypatch):
+    """A non-int8 Linear must not drag in the multi-minute Metal build."""
+    builds = []
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    class Holder:
+        weight = torch.zeros(8, 8)  # plain tensor, not a QuantizedTensor
+        bias = None
+
+    got = patch._try_int8_kernel_forward(Holder(), torch.zeros(4, 8, device="mps"))
+    assert got is None
+    assert builds == [], "an ineligible layer triggered the Metal build"
+
+
+def test_loader_gives_up_when_the_build_stalls(monkeypatch):
+    """A stalled toolchain must degrade to 'kernel unavailable', not block forever."""
+    import torch.utils.cpp_extension as cpp
+
+    from _patches import _caps
+    from _patches.int8_ext import loader
+
+    if shutil.which("xcrun") is None or not _caps.ninja_available():
+        pytest.skip("needs the Metal toolchain + ninja to reach the build call")
+
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
+    monkeypatch.setattr(loader, "_tried", False, raising=False)
+    monkeypatch.setattr(loader, "_mod", None, raising=False)
+
+    started = threading.Event()
+    never = object()
+
+    def stalled_build(*a, **k):
+        started.set()
+        time.sleep(5.0)
+        return never
+
+    monkeypatch.setattr(cpp, "load", stalled_build)
+
+    t0 = time.monotonic()
+    mod = loader.module()
+    elapsed = time.monotonic() - t0
+
+    assert started.is_set(), "the build was never attempted"
+    assert mod is None, "a stalled build must report the kernel as unavailable"
+    assert elapsed < 3.0, f"loader blocked {elapsed:.1f}s on a stalled build"
 
 
 def test_wrapper_falls_back_off_mps(monkeypatch):
@@ -330,3 +487,144 @@ def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
     assert out.shape == ref.shape
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
         f"nonscalar: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
+
+
+@requires_mps
+def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
+    """The Metal library compiles on first kernel USE, not at extension build time.
+
+    A toolchain that rejects it (issue #13) otherwise recompiles on every eligible
+    Linear -- measured at 1.46x slower than not having the kernel at all, with 822
+    fallback lines in one run. The cpp_extension build succeeds, so _kernel_tried
+    never short-circuits this.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    calls = []
+
+    class FailingKernel:
+        def i8_matmul2d_nt(self, *args, **kwargs):
+            calls.append(1)
+            raise RuntimeError(
+                "int8 Metal library compile failed: no matching member function "
+                "for call to 'get_destination_cooperative_tensor'"
+            )
+
+    monkeypatch.setattr(patch, "_kernel", FailingKernel(), raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+    monkeypatch.setattr(patch, "_self_checked", False, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", False, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(calls) == 1, f"Metal library compile retried per forward ({len(calls)}x)"
+
+
+@pytest.mark.skipif(not _int8_enabled, reason="int8 kernel not enabled on this machine")
+def test_int8_kernel_compiles_when_enabled():
+    """Canary: if the node turns the int8 kernel on, it must actually work.
+
+    The Metal library is compiled on first dispatch, so a macOS or toolchain
+    update can kill it while the cpp_extension still builds and the capability
+    banner stays green (issue #13). Without this the rest of the kernel tests
+    just skip and the breakage is invisible.
+    """
+    assert patch._ensure_kernel() is not None, "int8 cpp_extension failed to build"
+    assert patch._self_check(), (
+        "int8 Metal library does not compile on this machine — the kernel is "
+        "inert and every eligible Linear falls back to comfy's int8 path"
+    )
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
+    """A kernel that fails verification must cost one attempt, not one per layer.
+
+    This is the #14 gap: tier_b_ready() green-lights int8 off na_gemm's bf16
+    probe, so a kernel that cannot build still reaches the forward path. The
+    per-kernel memo is what stops that becoming a per-call rebuild.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    attempts = []
+
+    def failing_verify():
+        attempts.append(1)
+        return False
+
+    monkeypatch.setattr(patch, "_verify", failing_verify)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    for _ in range(3):
+        assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(attempts) == 1, f"verification retried per forward ({len(attempts)}x)"
+    assert _caps._kernel_ready["int8"] is False
+
+
+@requires_mps
+def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
+    """warmup() and the self-check passed, then dispatch failed anyway.
+
+    That repeats on every later layer if it is not latched -- the 822 fallback
+    log lines in issue #13. One line, then comfy's path for the session.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    calls = []
+
+    def exploding_kernel(*a, **k):
+        calls.append(1)
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(patch, "_verify", lambda: True)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", exploding_kernel)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    for _ in range(4):
+        assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(calls) == 1, f"kernel re-entered after a dispatch failure ({len(calls)}x)"
+    assert _caps._kernel_ready["int8"] is False

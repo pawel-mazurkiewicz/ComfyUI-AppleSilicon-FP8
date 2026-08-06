@@ -23,6 +23,7 @@ TAG = "[AppleSilicon-FP8/fp8_kernel]"
 
 _installed = False
 _kernel = None
+_kernel_tried = False
 _self_checked = False
 _self_ok = True
 _MIN_DIM_DEFAULT = 8192
@@ -65,6 +66,24 @@ def _load_kernel():
     return mod
 
 
+def _ensure_kernel():
+    """Build the Metal extension lazily, on the FIRST layer that can actually use it.
+
+    Building inside install() blocked ComfyUI's startup import on a synchronous
+    ninja+clang build (issue: "hangs forever at startup when ninja is installed").
+    Deferring it here matches scaled_mm_fp8._get_backend and keeps startup
+    non-blocking; a failed build is remembered so we retry once only.
+    """
+    global _kernel, _kernel_tried
+    if _kernel is not None or _kernel_tried:
+        return _kernel
+    _kernel_tried = True
+    _kernel = _load_kernel()
+    if _kernel is None:
+        print(f"{TAG} fp8 Metal kernel unavailable; using the LUT decode path.")
+    return _kernel
+
+
 def _self_check():
     """One-time parity gate: native half x fp8 == decoded-fp32 within 5e-2, else disable.
     MUST be called only AFTER a layer passes every eligibility/shape/scale gate."""
@@ -93,6 +112,11 @@ def _self_check():
     return _self_ok
 
 
+def _verify():
+    """The contract _caps.kernel_ready expects: build, warmup, then numerics."""
+    return _ensure_kernel() is not None and _self_check()
+
+
 def _fp8_linear_kernel(input, qdata, scale_weight, bias):
     """half(input) x fp8 weight bytes -> f32, * scale (scalar or [N]), + bias, -> input.dtype.
     Callers MUST have validated shapes/dtype/scale via _try_fp8_kernel_forward first."""
@@ -116,10 +140,13 @@ def _fp8_linear_kernel(input, qdata, scale_weight, bias):
 
 
 def _try_fp8_kernel_forward(self, input):
-    if _kernel is None:
-        return None
     try:
         from comfy_kitchen.tensor import QuantizedTensor
+
+        # Build already attempted and failed: bail before the range guard below,
+        # which costs a full-tensor amax plus a device sync on every forward.
+        if _kernel_tried and _kernel is None:
+            return None
 
         # --- cheap rejects first (so non-fp8 / int8 / plain layers fall through fast) ---
         if not isinstance(input, torch.Tensor) or input.device.type != "mps":
@@ -170,18 +197,26 @@ def _try_fp8_kernel_forward(self, input):
             if bool((input.detach().abs().amax() > 65504).item()):
                 return None
 
-        # --- BLOCKER: self-check only AFTER all gates pass, never on ineligible layers ---
-        if not _self_check():
+        # --- BLOCKER: build + self-check only AFTER all gates pass, never on
+        # ineligible layers (the build is a full ninja/clang extension compile) ---
+        from . import _caps
+        if not _caps.kernel_ready("fp8", _verify):
             return None
 
         return _fp8_linear_kernel(input, qdata, scale, bias)
     except Exception as e:
-        print(f"{TAG} kernel forward fell back ({e!r})")
+        # Same latch as int8: verification passed, so a dispatch failure here
+        # would otherwise recur (and log) on every later fp8 layer.
+        from . import _caps
+        if _caps._kernel_ready.get("fp8"):
+            print(f"{TAG} kernel forward failed ({e!r}); using comfy's fp8 path "
+                  f"for the rest of this session.")
+        _caps.mark_kernel_failed("fp8")
         return None
 
 
 def install():
-    global _installed, _kernel
+    global _installed
     if _installed:
         return
     if sys.platform != "darwin":
@@ -194,10 +229,6 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-
-    _kernel = _load_kernel()
-    if _kernel is None:
-        return  # loader already explained why
 
     try:
         import comfy.ops as ops
@@ -234,4 +265,4 @@ def install():
     _installed = True
     print(f"{TAG} fp8 e4m3 Linear routed through native fp8 matmul2d on MPS "
           f"(half act x fp8 weight; LUT->bf16 weight decode bypassed; min_dim={_min_dim()}; "
-          f"range_guard={_range_guard_on()}).")
+          f"range_guard={_range_guard_on()}). Kernel builds on first fp8 layer, not now.")

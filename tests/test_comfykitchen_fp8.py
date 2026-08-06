@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -68,3 +70,76 @@ def test_dequantize_nvfp4_mps_matches_cpu():
     assert out.device.type == "mps"
     rel = ((out.cpu().float() - ref.float()).abs().max() / (ref.float().abs().max() + 1e-9)).item()
     assert rel < 1e-3, f"NVFP4 MPS dequant rel error {rel:.4e}"
+
+
+# --- install() robustness -------------------------------------------------
+
+_PATCHED_NAMES = (
+    "dequantize_per_tensor_fp8",
+    "quantize_per_tensor_fp8",
+    "dequantize_nvfp4",
+    "dequantize_mxfp8",
+    "to_blocked",
+)
+
+
+@pytest.fixture
+def ck_state():
+    """Snapshot/restore every attribute install() rebinds on the live modules."""
+    import comfy_kitchen
+    from comfy_kitchen.registry import registry
+    import comfy_kitchen.backends.eager.quantization as qmod
+
+    mods = [registry._backends.get("eager"), qmod, comfy_kitchen]
+    try:
+        import comfy_kitchen.float_utils as fumod
+        mods.append(fumod)
+    except Exception:
+        pass
+    saved = [
+        (m, n, getattr(m, n))
+        for m in mods if m is not None
+        for n in _PATCHED_NAMES if hasattr(m, n)
+    ]
+    was_installed = getattr(ck, "_installed", False)
+    yield
+    for m, n, v in saved:
+        setattr(m, n, v)
+    ck._installed = was_installed
+
+
+@requires_mps
+@requires_ck
+def test_install_does_not_stack_wrappers(ck_state):
+    from comfy_kitchen.registry import registry
+
+    eager = registry._backends.get("eager")
+    ck._installed = False
+    ck.install()
+    first = eager.dequantize_per_tensor_fp8
+
+    ck.install()
+
+    assert eager.dequantize_per_tensor_fp8 is first, "re-wrapped an already-patched fn"
+
+
+@requires_mps
+@requires_ck
+def test_core_fp8_patch_survives_a_missing_float_utils(ck_state, monkeypatch):
+    """float_utils only backs the NVFP4 to_blocked reroute.
+
+    A comfy_kitchen build without it must still get the fp8 dequant/quantize fix
+    -- the reason this patch exists -- rather than silently no-opping wholesale.
+    """
+    from comfy_kitchen.registry import registry
+
+    eager = registry._backends.get("eager")
+    before = eager.dequantize_per_tensor_fp8
+    monkeypatch.setitem(sys.modules, "comfy_kitchen.float_utils", None)
+    ck._installed = False
+
+    ck.install()
+
+    assert eager.dequantize_per_tensor_fp8 is not before, (
+        "the whole patch no-opped because float_utils was unimportable"
+    )

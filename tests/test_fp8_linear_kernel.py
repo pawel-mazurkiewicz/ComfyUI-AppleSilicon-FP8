@@ -1,4 +1,7 @@
 import os
+import shutil
+import threading
+import time
 
 import pytest
 import torch
@@ -50,6 +53,16 @@ def test_loader_memo_resets_between_flag_states(monkeypatch):
 from _patches import fp8_linear_kernel_mps as patch
 
 
+@pytest.fixture(autouse=True)
+def _clear_fp8_kernel_memo():
+    """_caps.kernel_ready memoises per process, so one test's verdict would
+    otherwise decide every later test's gate."""
+    from _patches import _caps
+    _caps._kernel_ready.pop("fp8", None)
+    yield
+    _caps._kernel_ready.pop("fp8", None)
+
+
 def test_install_noop_when_explicitly_off(monkeypatch):
     # ASFP8_FP8_NATIVE=off force-disables even on capable hardware.
     from _patches import _caps
@@ -68,6 +81,74 @@ def test_install_noop_when_not_capable(monkeypatch):
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
+
+
+# --- the Metal build must never run on the ComfyUI startup thread ---------------
+
+
+def test_install_does_not_build_the_extension(monkeypatch):
+    """install() runs at import time: it may wire the seam, never build the kernel."""
+    from _patches import _caps
+    monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+
+    builds = []
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    patch.install()
+    assert builds == [], "install() built the Metal extension on the startup thread"
+
+
+def test_ineligible_layer_does_not_trigger_a_build(monkeypatch):
+    """A non-fp8 Linear must not drag in the multi-minute Metal build."""
+    builds = []
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: builds.append(1), raising=False)
+
+    class Holder:
+        weight = torch.zeros(8, 8)  # plain tensor, not a QuantizedTensor
+        bias = None
+
+    assert patch._try_fp8_kernel_forward(Holder(), torch.zeros(4, 8)) is None
+    assert builds == [], "an ineligible layer triggered the Metal build"
+
+
+def test_loader_gives_up_when_the_build_stalls(monkeypatch):
+    """A stalled toolchain must degrade to 'kernel unavailable', not block forever."""
+    import torch.utils.cpp_extension as cpp
+
+    from _patches import _caps
+
+    if shutil.which("xcrun") is None or not _caps.ninja_available():
+        pytest.skip("needs the Metal toolchain + ninja to reach the build call")
+
+    monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
+    monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
+    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
+    _reset_loader(monkeypatch)
+
+    started = threading.Event()
+    never = object()
+
+    def stalled_build(*a, **k):
+        started.set()
+        time.sleep(5.0)
+        return never
+
+    monkeypatch.setattr(cpp, "load", stalled_build)
+
+    t0 = time.monotonic()
+    mod = loader.module()
+    elapsed = time.monotonic() - t0
+
+    assert started.is_set(), "the build was never attempted"
+    assert mod is None, "a stalled build must report the kernel as unavailable"
+    assert elapsed < 3.0, f"loader blocked {elapsed:.1f}s on a stalled build"
 
 
 def test_eligibility_returns_none_no_kernel(monkeypatch):
@@ -99,10 +180,40 @@ def test_self_check_not_run_on_ineligible(monkeypatch):
 
 # --- Task 4: REAL spy tests (kernel really ran AND wrapper dispatched native) -----
 # Gated on ASFP8_FP8_NATIVE=1 + MPS (builds the Metal lib).
-_run = os.environ.get("ASFP8_FP8_NATIVE") == "1"
+from _patches import _caps
+from _patches import fp8_linear_kernel_mps as _fp8patch
+
+# Run whenever the node ITSELF would use the kernel here -- same gate production
+# uses, so a kernel that stops compiling surfaces as a failure rather than a
+# silent skip (issue #13). ASFP8_FP8_NATIVE=0 turns them off with the feature.
+_fp8_enabled = torch.backends.mps.is_available() and _caps.resolve(
+    "ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready
+)
+
+
+def _fp8_kernel_works():
+    if not _fp8_enabled:
+        return False
+    try:
+        return _fp8patch._ensure_kernel() is not None and _fp8patch._self_check()
+    except Exception:
+        return False
+
+
+_fp8_ok = _fp8_kernel_works()
+
 requires_fp8_native = pytest.mark.skipif(
-    not (_run and torch.backends.mps.is_available()),
-    reason="set ASFP8_FP8_NATIVE=1 on an MPS device to build + test the fp8 kernel")
+    not _fp8_ok,
+    reason="fp8 kernel unavailable here — see test_fp8_kernel_compiles_when_enabled")
+
+
+@pytest.mark.skipif(not _fp8_enabled, reason="fp8 kernel not enabled on this machine")
+def test_fp8_kernel_compiles_when_enabled():
+    """Canary: if the node turns the fp8 kernel on, it must actually work."""
+    assert _fp8patch._ensure_kernel() is not None, "fp8 cpp_extension failed to build"
+    assert _fp8patch._self_check(), (
+        "fp8 Metal library does not compile on this machine — the kernel is inert"
+    )
 
 # MPS cannot cast bf16->fp8, so real fp8 QuantizedTensors are built on CPU then moved.
 # This comfy_kitchen registers the e4m3 layout as "TensorCoreFP8Layout".
@@ -195,3 +306,43 @@ def test_wrapper_dispatches_native_not_fallback(monkeypatch):
     inp = (torch.randn(64, K) * 0.3).to(torch.bfloat16).to("mps")
     out = forward(holder, inp)
     assert torch.equal(out, SENTINEL), "wrapper did not dispatch the native sentinel path"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_failed_build_short_circuits_before_the_range_guard(monkeypatch):
+    """Once the build is known to have failed, an eligible layer must bail early.
+
+    The fp16 range guard is a full-tensor amax plus a device sync, and it sits
+    ahead of _ensure_kernel(), so without a top-level short circuit every
+    eligible fp8 Linear pays it on every step for the rest of the session.
+    """
+    QuantizedTensor = pytest.importorskip("comfy_kitchen.tensor").QuantizedTensor
+    from _patches import fp8_linear_kernel_mps as patch
+
+    monkeypatch.setenv("ASFP8_FP8_NATIVE_MIN_DIM", "8")
+    monkeypatch.setattr(patch, "_kernel", None, raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+
+    wf = torch.randn(32, 32, dtype=torch.bfloat16)
+    qw = QuantizedTensor.from_float(
+        wf, "TensorCoreFP8Layout", scale=torch.tensor(1.0)
+    ).to(device="mps")
+
+    class Layer:
+        weight = qw
+        bias = None
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 32, dtype=torch.bfloat16, device="mps")
+
+    seen = []
+    real_amax = torch.Tensor.amax
+    monkeypatch.setattr(
+        torch.Tensor,
+        "amax",
+        lambda self, *a, **k: (seen.append(1), real_amax(self, *a, **k))[1],
+    )
+
+    assert patch._try_fp8_kernel_forward(Layer(), x) is None
+    assert seen == [], "range guard ran though the kernel is known unavailable"

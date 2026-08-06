@@ -16,6 +16,13 @@ and build under a no-space directory. Both are best-effort and reverted on failu
 import os
 import shutil
 
+from .._extbuild import (  # noqa: F401  (re-exported for the build-lock tests)
+    _abandoned_lock_cleanup,
+    _build_timeout,
+    _clear_stale_lock,
+    _cpp_load_guarded,
+)
+
 _mod = None
 _tried = False
 
@@ -87,11 +94,21 @@ def module():
     src = os.path.join(here, "fp8_matmul2d.mm")
     build_dir = os.path.join(_NOSPACE_ROOT, "ext")
     os.makedirs(build_dir, exist_ok=True)
+    _clear_stale_lock(build_dir, "[fp8_ext]")
 
-    saved = cpp.TORCH_LIB_PATH
-    try:
+    print("[fp8_ext] compiling the FP8 Metal kernel (first use; seconds to a few "
+          "minutes depending on the toolchain) — not frozen, this resumes when the "
+          "build ends.", flush=True)
+
+    def _prepare():
+        saved = cpp.TORCH_LIB_PATH
         cpp.TORCH_LIB_PATH = _nospace_torch_lib()
-        _mod = cpp_load(
+        return lambda: setattr(cpp, "TORCH_LIB_PATH", saved)
+
+    try:
+        _mod = _cpp_load_guarded(
+            cpp_load,
+            prepare=_prepare,
             name="asfp8_fp8_matmul2d",
             sources=[src],
             extra_cflags=["-std=c++17", "-ObjC++"],
@@ -102,8 +119,6 @@ def module():
     except Exception as e:
         print(f"[fp8_ext] build failed; fp8-native disabled: {e!r}")
         _mod = None
-    finally:
-        cpp.TORCH_LIB_PATH = saved
     return _mod
 
 

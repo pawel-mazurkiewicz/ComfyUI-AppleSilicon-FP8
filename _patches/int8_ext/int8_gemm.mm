@@ -27,6 +27,7 @@
 // ============================================================
 
 #include <torch/extension.h>
+#include <sstream>
 #include <ATen/mps/MPSStream.h>
 #include <ATen/mps/MPSDevice.h>
 #import <Metal/Metal.h>
@@ -220,9 +221,15 @@ bool w8a8_gemm_compute(
       gemm_op.get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
   auto ct_b =
       gemm_op.get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+  // decltype of a local carries the implicit `thread` address space, and MPP's
+  // enable_if traits strip cv/ref but NOT addrspace, so the qualified type fails
+  // the cooperative_tensor match and the sole candidate is discarded (issue #13).
+  // Same idiom as na_gemm and Apple's own example in MPPTensorOpsMatMul2d.h.
+  // Fully qualified: kSrc only opens `using namespace metal;`.
+  using AT = mpp::tensor_ops::__tensor_ops_detail::__remove_addrspace_t<decltype(ct_a)>;
+  using BT = mpp::tensor_ops::__tensor_ops_detail::__remove_addrspace_t<decltype(ct_b)>;
   auto ct_c =
-      gemm_op.get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b),
-                                                 int32_t>();
+      gemm_op.get_destination_cooperative_tensor<AT, BT, int32_t>();
 
   for (int f = 0; f < TM * TN; f++) {
     for (int i = 0; i < kElemsPerFrag; i++) {
@@ -528,9 +535,28 @@ static id<MTLComputePipelineState> g_pso_swiglu = nil;
 static id<MTLComputePipelineState> g_pso_swiglu_small = nil;
 static id<MTLLibrary> g_lib = nil;
 static std::string g_compile_error;
+// Latch failure too, not just success: the library is compiled on first dispatch,
+// so a toolchain that rejects it would otherwise recompile on every call (issue #13).
+static bool g_compile_failed = false;
+
+// Latch every deterministic failure, not just the library compile. A missing
+// function or a rejected pipeline state repeats identically on the next call, so
+// leaving them bare would just move issue #13's retry storm one stage later.
+#define ASFP8_LATCH_CHECK(cond, ...)                    \
+  do {                                                  \
+    if (!(cond)) {                                      \
+      std::ostringstream _oss;                          \
+      _oss << __VA_ARGS__;                              \
+      g_compile_error = _oss.str();                     \
+      g_compile_failed = true;                          \
+      TORCH_CHECK(false, g_compile_error);              \
+    }                                                   \
+  } while (0)
 
 static id<MTLLibrary> build_library() {
   if (g_lib) return g_lib;
+  TORCH_CHECK(!g_compile_failed,
+              "int8 Metal library compile failed (cached): ", g_compile_error);
   id<MTLDevice> dev = MPSDevice::getInstance()->device();
   MTLCompileOptions* opts = [MTLCompileOptions new];
   opts.languageVersion = MTLLanguageVersion4_1;
@@ -539,6 +565,7 @@ static id<MTLLibrary> build_library() {
                                          options:opts error:&err];
   if (!lib) {
     g_compile_error = err ? std::string(err.localizedDescription.UTF8String) : "unknown";
+    g_compile_failed = true;
     TORCH_CHECK(false, "int8 Metal library compile failed: ", g_compile_error);
   }
   g_lib = lib;
@@ -549,12 +576,12 @@ static id<MTLComputePipelineState> pso_for_name(NSString* name) {
   id<MTLDevice> dev = MPSDevice::getInstance()->device();
   id<MTLLibrary> lib = build_library();
   id<MTLFunction> fn = [lib newFunctionWithName:name];
-  TORCH_CHECK(fn, "kernel function not found: ", name.UTF8String);
+  ASFP8_LATCH_CHECK(fn, "kernel function not found: " << name.UTF8String);
   NSError* err = nil;
   id<MTLComputePipelineState> pso =
       [dev newComputePipelineStateWithFunction:fn error:&err];
-  TORCH_CHECK(pso, "pipeline state creation failed: ",
-              err ? err.localizedDescription.UTF8String : "unknown");
+  ASFP8_LATCH_CHECK(pso, "pipeline state creation failed: "
+              << (err ? err.localizedDescription.UTF8String : "unknown"));
   return pso;
 }
 

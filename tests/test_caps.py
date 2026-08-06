@@ -5,6 +5,8 @@ capability predicate, so they run identically on CI (no MPS) and on an M5 box.
 The gate is the mechanism every default-on perf patch now shares, so its contract
 is worth pinning independently of any one kernel.
 """
+import time
+
 import pytest
 
 from _patches import _caps
@@ -83,3 +85,123 @@ def test_summary_is_a_string():
     assert isinstance(s, str)
     assert "mps=" in s
     assert "ninja=" in s
+
+
+# --- per-kernel verification (issue #14) -----------------------------------
+
+
+def test_kernel_ready_runs_verify_once_and_memoises_success():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return True
+
+    assert _caps.kernel_ready("probe-ok", verify) is True
+    assert _caps.kernel_ready("probe-ok", verify) is True
+    assert len(calls) == 1, "verify_fn must not re-run once the answer is known"
+
+
+def test_kernel_ready_memoises_failure_too():
+    """The point of the primitive: a known-bad kernel must not rebuild per call.
+
+    Re-running verify on every eligible layer is what made issue #13 cost 1.46x
+    instead of merely disabling int8.
+    """
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return False
+
+    assert _caps.kernel_ready("probe-bad", verify) is False
+    assert _caps.kernel_ready("probe-bad", verify) is False
+    assert len(calls) == 1, "a failed kernel was re-verified"
+
+
+def test_kernel_ready_treats_a_raising_verify_as_failure():
+    _caps.reset_cache()
+
+    def verify():
+        raise RuntimeError("toolchain rejected the shader")
+
+    assert _caps.kernel_ready("probe-raise", verify) is False
+
+
+def test_kernel_ready_is_per_name():
+    _caps.reset_cache()
+    assert _caps.kernel_ready("a", lambda: True) is True
+    assert _caps.kernel_ready("b", lambda: False) is False
+    assert _caps.kernel_ready("a", lambda: False) is True, "names must not share state"
+
+
+def test_reset_cache_clears_the_kernel_results():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(True)
+        return True
+
+    _caps.kernel_ready("probe-reset", verify)
+    _caps.reset_cache()
+    _caps.kernel_ready("probe-reset", verify)
+    assert len(calls) == 2, "reset_cache() must force a re-probe"
+
+
+def test_summary_banner_substrings_are_unchanged():
+    """Other tests (and users' bug reports) match on these exact substrings."""
+    s = _caps.summary()
+    for token in ("mps=", "tensor_ops(M5/Metal4)=", "ninja="):
+        assert token in s, f"{token!r} missing from banner: {s}"
+
+
+def test_kernel_ready_verifies_once_under_concurrency():
+    """Two layers hitting an unverified kernel at the same time must not each
+    start their own extension build.
+
+    The whole sequence -- lookup, verify, store -- has to be inside the lock; a
+    bare dict check leaves both callers seeing None and both building.
+    """
+    import threading
+
+    _caps.reset_cache()
+    calls = []
+    both_ready = threading.Barrier(2, timeout=30)
+
+    def verify():
+        calls.append(1)
+        time.sleep(0.05)          # widen the window a racing caller slips through
+        return True
+
+    results = []
+
+    def worker():
+        both_ready.wait()
+        results.append(_caps.kernel_ready("concurrent", verify))
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+
+    assert not any(t.is_alive() for t in threads)
+    assert results == [True, True]
+    assert len(calls) == 1, f"verify_fn ran {len(calls)}x for concurrent callers"
+
+
+def test_mark_kernel_failed_disables_without_reverifying():
+    _caps.reset_cache()
+    calls = []
+
+    def verify():
+        calls.append(1)
+        return True
+
+    assert _caps.kernel_ready("latch", verify) is True
+    _caps.mark_kernel_failed("latch")
+    assert _caps.kernel_ready("latch", verify) is False
+    assert len(calls) == 1, "a latched-off kernel was re-verified"
