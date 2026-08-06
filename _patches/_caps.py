@@ -153,6 +153,18 @@ def resolve(env_name, default_on, cap):
     return bool(default_on and cap())
 
 
+def mark_kernel_failed(name):
+    """Disable a kernel that passed verification but then failed in use.
+
+    warmup() and the numeric self-check both passed before it was enabled, so a
+    failure at dispatch is unexpected rather than routine, and it will almost
+    certainly repeat on the next layer. Latching it costs some speed on the
+    remainder of the render and buys back a per-layer exception plus its log
+    line -- the 822 fallback lines in issue #13. Falling back is always correct.
+    """
+    _kernel_ready[name] = False
+
+
 def reset_cache():
     """Test hook: forget memoised probe results so a test can re-probe."""
     global _compile_shader, _tensor_ops, _ninja

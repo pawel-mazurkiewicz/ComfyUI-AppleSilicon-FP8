@@ -205,7 +205,13 @@ def _try_fp8_kernel_forward(self, input):
 
         return _fp8_linear_kernel(input, qdata, scale, bias)
     except Exception as e:
-        print(f"{TAG} kernel forward fell back ({e!r})")
+        # Same latch as int8: verification passed, so a dispatch failure here
+        # would otherwise recur (and log) on every later fp8 layer.
+        from . import _caps
+        if _caps._kernel_ready.get("fp8"):
+            print(f"{TAG} kernel forward failed ({e!r}); using comfy's fp8 path "
+                  f"for the rest of this session.")
+        _caps.mark_kernel_failed("fp8")
         return None
 
 

@@ -589,3 +589,42 @@ def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch)
 
     assert len(attempts) == 1, f"verification retried per forward ({len(attempts)}x)"
     assert _caps._kernel_ready["int8"] is False
+
+
+@requires_mps
+def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
+    """warmup() and the self-check passed, then dispatch failed anyway.
+
+    That repeats on every later layer if it is not latched -- the 822 fallback
+    log lines in issue #13. One line, then comfy's path for the session.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    calls = []
+
+    def exploding_kernel(*a, **k):
+        calls.append(1)
+        raise RuntimeError("dispatch blew up")
+
+    monkeypatch.setattr(patch, "_verify", lambda: True)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", exploding_kernel)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    for _ in range(4):
+        assert patch._try_int8_kernel_forward(Holder(), x) is None
+
+    assert len(calls) == 1, f"kernel re-entered after a dispatch failure ({len(calls)}x)"
+    assert _caps._kernel_ready["int8"] is False

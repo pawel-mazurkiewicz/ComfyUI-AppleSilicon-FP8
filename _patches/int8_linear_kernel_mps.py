@@ -329,8 +329,14 @@ def _try_int8_kernel_forward(self, input):
 
         return _int8_linear_kernel(input, qdata, scale, bias, input.dtype, convrot, gs)
     except Exception as e:
-        # Never take down a render; fall back to comfy's original forward.
-        print(f"{TAG} kernel forward fell back ({e!r})")
+        # Never take down a render; fall back to comfy's original forward, and
+        # stop using the kernel for the rest of the session -- verification
+        # already passed, so this repeats on every later layer if we don't.
+        from . import _caps
+        if _caps._kernel_ready.get("int8"):
+            print(f"{TAG} kernel forward failed ({e!r}); using comfy's int8 path "
+                  f"for the rest of this session.")
+        _caps.mark_kernel_failed("int8")
         return None
 
 
