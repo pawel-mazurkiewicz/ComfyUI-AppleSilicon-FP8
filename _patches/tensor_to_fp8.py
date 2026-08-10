@@ -141,10 +141,13 @@ def install():
     torch.Tensor.to = _patched_to
 
     def _make_shortcut(orig, dtype):
-        def _patched(self, *args, **kwargs):
+        # No *args: these take memory_format keyword-only, so a positional call
+        # must stay a TypeError rather than reaching .to(), where the second
+        # positional is non_blocking.
+        def _patched(self, **kwargs):
             if self.dtype in _FP8_SET and self.device.type == "mps":
-                return decode_fp8(self).to(dtype, *args, **kwargs)
-            return orig(self, *args, **kwargs)
+                return decode_fp8(self).to(dtype, **kwargs)
+            return orig(self, **kwargs)
         return _patched
 
     for _name, _dtype in _DTYPE_SHORTCUTS.items():

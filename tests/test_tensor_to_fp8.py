@@ -105,3 +105,25 @@ def test_w4a8_grouped_dequant_with_fp8_group_scales():
     assert got.dtype == torch.int8 and got.shape == (n, k)
     want = dequant(qdata.cpu(), s_rel.cpu(), group_size)
     assert torch.equal(got.cpu(), want)
+
+
+@requires_mps
+@pytest.mark.parametrize("method", ["float", "half", "bfloat16"])
+def test_memory_format_keyword_is_honoured(method):
+    """memory_format is keyword-only on these shortcuts; the fp8 path must
+    forward it rather than dropping it on the floor."""
+    t = (torch.randn(2, 3, 4, 5) * 0.5).to(torch.float8_e4m3fn).to("mps")
+    got = getattr(t, method)(memory_format=torch.channels_last)
+    assert got.is_contiguous(memory_format=torch.channels_last)
+
+
+@requires_mps
+@pytest.mark.parametrize("method", ["float", "half", "bfloat16"])
+def test_positional_memory_format_rejected_like_stock_torch(method):
+    """Stock torch raises `takes 0 positional arguments`; the fp8 path must not
+    quietly accept it and feed it to .to() as non_blocking."""
+    t8 = (torch.randn(2, 3, 4, 5) * 0.5).to(torch.float8_e4m3fn).to("mps")
+    t32 = torch.randn(2, 3, 4, 5, device="mps")
+    for t in (t8, t32):
+        with pytest.raises(TypeError):
+            getattr(t, method)(torch.channels_last)

@@ -298,7 +298,7 @@ your machine), then only the patch lines relevant to it:
   | `ASFP8_FP8_EXT` (default on where capable) | fp8-native kernel at the `_scaled_mm` seam. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
   | `ASFP8_FP8_EXT_MIN_DIM` (8192) | Route to the fp8 kernel only if `max(K, N)` (weight dims) ≥ this. |
   | `ASFP8_FP8_NATIVE` (default on where capable) | Same gating, for the fp8 `mixed_precision_ops` Linear seam (patch #20, min_dim ≥ 8192). `off` to disable. |
-- **int8 W8A8 native matmul (patch #17) is ON by default, gated on M5 + Metal 4.1
+- **int8 W8A8 native matmul (patch #17) is ON by default, gated on M5 + Metal 4.0
   + `ninja`.** Where supported, int8 convrot
   Linears (e.g. **Krea2 convrot int8mixed**) run the W8A8 path the format intends:
   rotate the activation online, per-row quantize it, then a **bit-exact
@@ -320,7 +320,7 @@ your machine), then only the patch lines relevant to it:
 
   | Env var | Behaviour |
   |---|---|
-  | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.1 + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
+  | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.0 (macOS 26+) + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
   | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. An abandoned build lock is cleared once it is **twice** this old (twice the 600 s default when set to `0`), so a build that is merely slow is never disturbed. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
 
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
@@ -361,7 +361,7 @@ your machine), then only the patch lines relevant to it:
 
   | Env var | Behaviour |
   |---|---|
-  | `ASFP8_INT4_EXT` (default **off**) | Opt-in W4A8 fused int4 Metal kernel (M5 / Metal 4.1 + `ninja`). Off → the default W4A16 reroute handles int4. The default reroute itself has no switch (it's a compatibility path, like patch #13); disable everything int4 with `ASFP8_DISABLE=int4_linear_mps`. |
+  | `ASFP8_INT4_EXT` (default **off**) | Opt-in W4A8 fused int4 Metal kernel (M5 / Metal 4.0, macOS 26+ + `ninja`). Off → the default W4A16 reroute handles int4. The default reroute itself has no switch (it's a compatibility path, like patch #13); disable everything int4 with `ASFP8_DISABLE=int4_linear_mps`. |
 - **WanVideo block swap is neutralized on MPS (patch #9).** Block swap exists to
   fit models into scarce NVIDIA VRAM; Apple Silicon memory is unified, so it saves
   nothing and its CUDA-event-synced streaming breaks on MPS. The patch makes the
