@@ -60,9 +60,14 @@ def test_non_fp8_shortcuts_are_untouched():
 @requires_mps
 def test_double_still_raises_on_mps():
     """MPS has no float64, so .double() has nothing to rescue — it must keep
-    raising torch's own error rather than being silently rerouted."""
+    raising torch's own error rather than being silently rerouted.
+
+    The exception type moves between torch versions (fp8 casts raise TypeError on
+    2.11 and RuntimeError on 2.14-dev), so match on the message instead to pin
+    that this is still the float64-unsupported path.
+    """
     t = (torch.randn(8) * 0.5).to(torch.float8_e4m3fn).to("mps")
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, RuntimeError), match="float64"):
         t.double()
 
 
