@@ -559,7 +559,11 @@ static id<MTLLibrary> build_library() {
               "int8 Metal library compile failed (cached): ", g_compile_error);
   id<MTLDevice> dev = MPSDevice::getInstance()->device();
   MTLCompileOptions* opts = [MTLCompileOptions new];
-  opts.languageVersion = MTLLanguageVersion4_1;
+  // MSL 4.0, not 4.1: these kernels use only bfloat/int8/packed-int4 and
+  // mpp::tensor_ops::matmul2d, all of which exist in 4.0. Pinning 4.1 broke the
+  // host compile outright on the macOS 26 SDK, where the enum is undeclared, so
+  // int8-native was dead for every pre-macOS-27 machine (issue #17).
+  opts.languageVersion = MTLLanguageVersion4_0;
   NSError* err = nil;
   id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc]
                                          options:opts error:&err];
