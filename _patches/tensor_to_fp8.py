@@ -38,6 +38,20 @@ TAG = "[AppleSilicon-FP8/tensor_to]"
 _FP8_SET = frozenset(FP8_DTYPES)
 _installed = False
 
+# `.float()` and friends are not sugar for `.to(dtype)` at the Python level —
+# they bind straight to their own aten ops, so wrapping torch.Tensor.to leaves
+# them unpatched. comfy_kitchen's W4A8 dequant calls `s_rel.float()` on group
+# scales that W4A8-mixed checkpoints store as fp8, which is how issue #16
+# surfaced (RuntimeError: Undefined type Float8_e4m3fn on newer torch, TypeError
+# "cannot convert Float8_e4m3fn to the MPS backend" on older).
+# `.double()` is deliberately absent: MPS has no float64 at all, so there is no
+# result to rescue — it must keep raising torch's own message.
+_DTYPE_SHORTCUTS = {
+    "float": torch.float32,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
 
 def _scan_target(args, kwargs, self_dtype):
     """Resolve (target_dtype, target_device) from .to() args without touching tensors unsafely."""
@@ -125,5 +139,18 @@ def install():
         return _orig_to(self, *args, **kwargs)
 
     torch.Tensor.to = _patched_to
+
+    def _make_shortcut(orig, dtype):
+        def _patched(self, *args, **kwargs):
+            if self.dtype in _FP8_SET and self.device.type == "mps":
+                return decode_fp8(self).to(dtype, *args, **kwargs)
+            return orig(self, *args, **kwargs)
+        return _patched
+
+    for _name, _dtype in _DTYPE_SHORTCUTS.items():
+        _orig = getattr(torch.Tensor, _name)
+        setattr(torch.Tensor, _name, _make_shortcut(_orig, _dtype))
+
     _installed = True
-    print(f"{TAG} torch.Tensor.to FP8<->float routed via LUT/CPU on MPS.")
+    print(f"{TAG} torch.Tensor.to (+ .float()/.half()/.bfloat16()) "
+          f"FP8<->float routed via LUT/CPU on MPS.")
