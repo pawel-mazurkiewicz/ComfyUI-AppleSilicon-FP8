@@ -366,3 +366,14 @@ def test_comfy_kitchen_plain_fp8_entry_point_routes(v2_installed):
     out = ck_fp8._fp8_scaled_mm(a, w, s, s, out_dtype=torch.bfloat16)
     assert out.device.type == "mps" and out.shape == (64, 32)
     assert not v2_installed, "plain fp8 must not reach the original"
+
+
+@requires_v2
+def test_v2_without_an_original_raises_clearly(monkeypatch):
+    """Bound without install(), the pass-through branch must say so rather than
+    failing with 'NoneType' object is not callable."""
+    monkeypatch.setattr(scaled_mm_fp8, "_original_v2", None)
+    ST = torch.nn.functional.ScalingType
+    a = torch.randn(4, 4)
+    with pytest.raises(RuntimeError, match="install\\(\\) did not complete"):
+        scaled_mm_fp8._mps_scaled_mm_v2(a, a, None, ST.TensorWise, None, ST.TensorWise)

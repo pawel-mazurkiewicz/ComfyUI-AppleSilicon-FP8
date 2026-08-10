@@ -34,6 +34,18 @@ _original = None
 _original_v2 = None
 _installed = False
 
+# torch >= 2.11 only; resolved once here rather than per call, since the v2
+# predicates sit on the per-matmul hot path. `import torch` above has already
+# pulled in torch.nn.functional, so there is no import-order window to lose.
+try:
+    from torch.nn.functional import ScalingType as _ScalingType
+except Exception:
+    _ScalingType = None
+try:
+    from torch.nn.functional import SwizzleType as _SwizzleType
+except Exception:
+    _SwizzleType = None
+
 # fp8-native fast path (DEFAULT ON where capable; ASFP8_FP8_EXT=off disables). When the gate is
 # unset/0 this whole path is inert and torch._scaled_mm behaves exactly as the decode
 # implementation below — same numerics, zero extra work, no extension build.
@@ -208,28 +220,19 @@ def _mps_scaled_mm(
 
 
 def _is_tensorwise(recipe):
-    """True only for the plain TensorWise recipe. Compared against torch's enum
-    lazily so import order can't bite, and False for the list-valued microscaling
-    recipes (NVFP4/MXFP8 pass a [BlockWise, TensorWise] pair)."""
-    if isinstance(recipe, (list, tuple)):
+    """True only for the plain TensorWise recipe, and False for the list-valued
+    microscaling recipes (NVFP4/MXFP8 pass a [BlockWise, TensorWise] pair)."""
+    if _ScalingType is None or isinstance(recipe, (list, tuple)):
         return False
-    try:
-        from torch.nn.functional import ScalingType
-    except Exception:
-        return False
-    return recipe == ScalingType.TensorWise
+    return recipe == _ScalingType.TensorWise
 
 
 def _no_swizzle(swizzle):
     if swizzle is None:
         return True
-    if isinstance(swizzle, (list, tuple)):
+    if _SwizzleType is None or isinstance(swizzle, (list, tuple)):
         return False
-    try:
-        from torch.nn.functional import SwizzleType
-    except Exception:
-        return False
-    return swizzle == SwizzleType.NO_SWIZZLE
+    return swizzle == _SwizzleType.NO_SWIZZLE
 
 
 def _mps_scaled_mm_v2(
@@ -292,6 +295,15 @@ def _mps_scaled_mm_v2(
             scale_a=scale_a,
             scale_b=scale_b,
             bias=bias,
+        )
+
+    if _original_v2 is None:
+        # Only reachable if this wrapper was bound onto F.scaled_mm without
+        # going through install(); without the original there is nothing to
+        # delegate to, and a bare NoneType call would bury that.
+        raise RuntimeError(
+            f"{TAG} F.scaled_mm wrapper is installed but has no original to "
+            "delegate to — install() did not complete."
         )
 
     return _original_v2(
