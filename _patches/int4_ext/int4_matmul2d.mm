@@ -201,7 +201,9 @@ static id<MTLLibrary> get_lib() {
                 "int4 Metal library compile failed (cached): ", g_compile_error);
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    opts.languageVersion = MTLLanguageVersion4_1;
+    // MSL 4.0 — see int8_gemm.mm: 4.1 is undeclared in the macOS 26 SDK and
+    // nothing here needs it (issue #17).
+    opts.languageVersion = MTLLanguageVersion4_0;
     NSError* err = nil;
     g_lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:kSrc]
                               options:opts error:&err];
