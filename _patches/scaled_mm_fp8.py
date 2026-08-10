@@ -31,6 +31,7 @@ from ._common import FP8_DTYPES, decode_fp8
 TAG = "[AppleSilicon-FP8/scaled_mm]"
 
 _original = None
+_original_v2 = None
 _installed = False
 
 # fp8-native fast path (DEFAULT ON where capable; ASFP8_FP8_EXT=off disables). When the gate is
@@ -206,13 +207,124 @@ def _mps_scaled_mm(
     return out
 
 
+def _is_tensorwise(recipe):
+    """True only for the plain TensorWise recipe. Compared against torch's enum
+    lazily so import order can't bite, and False for the list-valued microscaling
+    recipes (NVFP4/MXFP8 pass a [BlockWise, TensorWise] pair)."""
+    if isinstance(recipe, (list, tuple)):
+        return False
+    try:
+        from torch.nn.functional import ScalingType
+    except Exception:
+        return False
+    return recipe == ScalingType.TensorWise
+
+
+def _no_swizzle(swizzle):
+    if swizzle is None:
+        return True
+    if isinstance(swizzle, (list, tuple)):
+        return False
+    try:
+        from torch.nn.functional import SwizzleType
+    except Exception:
+        return False
+    return swizzle == SwizzleType.NO_SWIZZLE
+
+
+def _mps_scaled_mm_v2(
+    mat_a,
+    mat_b,
+    scale_a,
+    scale_recipe_a,
+    scale_b,
+    scale_recipe_b,
+    swizzle_a=None,
+    swizzle_b=None,
+    bias=None,
+    output_dtype=torch.bfloat16,
+    contraction_dim=(),
+    use_fast_accum=False,
+):
+    """Wrapper for torch.nn.functional.scaled_mm — the `aten::_scaled_mm_v2` seam.
+
+    torch >= 2.11 ships this public API, and comfy_kitchen prefers it on a bare
+    `hasattr` with no backend check (`scaled_mm_v2.py`), so `tensor/fp8.py`'s
+    `_fp8_scaled_mm` sends every plain-fp8 Linear here instead of through
+    `torch._scaled_mm` — leaving the patch below attached to a function nothing
+    calls.
+
+    `aten::_scaled_mm_v2` is a dead end on this platform: no MPS kernel, and no
+    CPU kernel for fp8 operands either, so ComfyUI's PYTORCH_ENABLE_MPS_FALLBACK
+    bounce raises too. `NotImplementedError` subclasses `RuntimeError`, so
+    comfy_kitchen's `except (RuntimeError, TypeError)` swallows it and quietly
+    re-runs the layer as a dequantize + bf16 linear — correct output, ~3x slower,
+    and only a logger.warning to show for it.
+
+    Plain TensorWise fp8 on MPS therefore delegates to the same machinery as the
+    legacy seam (fp8-native Metal kernel where eligible, LUT decode + bf16 matmul
+    otherwise). Microscaling recipes (NVFP4/MXFP8 BlockWise + swizzled scales),
+    list-valued scales, contraction_dim and every non-MPS or non-fp8 call fall
+    through to the original untouched.
+    """
+    is_mps = isinstance(mat_a, torch.Tensor) and mat_a.device.type == "mps"
+    is_fp8 = (
+        isinstance(mat_a, torch.Tensor) and mat_a.dtype in FP8_DTYPES
+    ) or (
+        isinstance(mat_b, torch.Tensor) and mat_b.dtype in FP8_DTYPES
+    )
+    plain_scales = isinstance(scale_a, torch.Tensor) and isinstance(scale_b, torch.Tensor)
+
+    if (
+        is_mps
+        and is_fp8
+        and plain_scales
+        and _is_tensorwise(scale_recipe_a)
+        and _is_tensorwise(scale_recipe_b)
+        and _no_swizzle(swizzle_a)
+        and _no_swizzle(swizzle_b)
+        and not contraction_dim
+    ):
+        return _mps_scaled_mm(
+            mat_a,
+            mat_b,
+            out_dtype=output_dtype,
+            scale_a=scale_a,
+            scale_b=scale_b,
+            bias=bias,
+        )
+
+    return _original_v2(
+        mat_a,
+        mat_b,
+        scale_a,
+        scale_recipe_a,
+        scale_b,
+        scale_recipe_b,
+        swizzle_a=swizzle_a,
+        swizzle_b=swizzle_b,
+        bias=bias,
+        output_dtype=output_dtype,
+        contraction_dim=contraction_dim,
+        use_fast_accum=use_fast_accum,
+    )
+
+
 def install():
-    global _original, _installed
+    global _original, _original_v2, _installed
     if _installed:
         return
     if not hasattr(torch, "_scaled_mm"):
         return  # requires PyTorch 2.4+
     _original = torch._scaled_mm
     torch._scaled_mm = _mps_scaled_mm
+    msg = f"{TAG} torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul."
+    # torch >= 2.11 adds the public F.scaled_mm (aten::_scaled_mm_v2), which
+    # comfy_kitchen prefers whenever it exists — wrap it too or the seam above
+    # goes dark and fp8 silently falls back to dequant (issue #19).
+    if hasattr(torch.nn.functional, "scaled_mm"):
+        _original_v2 = torch.nn.functional.scaled_mm
+        torch.nn.functional.scaled_mm = _mps_scaled_mm_v2
+        msg += " F.scaled_mm (v2 seam) wrapped too."
     _installed = True
-    print(f"{TAG} torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul.")
+    print(msg)
