@@ -154,7 +154,7 @@ static id<MTLComputePipelineState> get_pso(int BM, int BN, int NSG, int BK, int 
 
     id<MTLDevice> dev = MPSDevice::getInstance()->device();
     MTLCompileOptions* opts = [MTLCompileOptions new];
-    opts.languageVersion = MTLLanguageVersion4_1;
+    opts.languageVersion = MTLLanguageVersion4_0;  // see int8_gemm.mm (issue #17)
     NSError* err = nil;
     std::string src = substitute(BM, BN, NSG, BK, use_tg);
     id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
