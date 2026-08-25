@@ -237,21 +237,28 @@ def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
         _caps._kernel_ready.pop("int4", None)
 
 
-def test_int4_does_not_build_on_a_pre_m5_chip(monkeypatch):
-    """#25 applies to int4 too, and harder: it has no env gate at all, so every
-    ConvRot layer on an M1-M4 box reaches kernel_ready() and pays the build before
-    the self-check rejects it. W4A16 must still return the right answer."""
+@requires_mps
+def test_int4_explicit_opt_in_is_honoured_on_pre_m5_hardware(monkeypatch):
+    """int4 is opt-in (README: `ASFP8_INT4_EXT` default **off**) and its loader
+    returns None before building whenever the var is unset -- so a chip pre-filter
+    here would save no build at all, and would only be reachable in the one case
+    where the user has explicitly asked for the kernel.
+
+    _caps' standing promise is that an explicit env var beats any probe, "so
+    nothing here can lock a user out". Forcing the build on hardware we believe
+    cannot run it is the user's call to make; the self-check still rejects the
+    result, which is the outcome #25 documents.
+    """
     from _patches import _caps
 
-    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
     _caps._kernel_ready.pop("int4", None)
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
     monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
-    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
-    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setenv("ASFP8_INT4_EXT", "1")
 
     verifies = []
     monkeypatch.setattr(int4_linear_mps, "_verify",
-                        lambda: verifies.append(1) or True)
+                        lambda: verifies.append(1) or False)
 
     _, qdata, wscales = _quantized_weight()
     x = torch.randn(8, K, dtype=torch.bfloat16, device="mps")
@@ -260,7 +267,9 @@ def test_int4_does_not_build_on_a_pre_m5_chip(monkeypatch):
         out = int4_linear_mps._w4a16_linear_mps(
             x, qdata.to("mps"), wscales.to("mps"), None, 256, ck_eager
         )
-        assert out.shape == (8, N)
-        assert verifies == [], "int4 attempted a kernel build on pre-M5 hardware"
+        assert out.shape == (8, N), "W4A16 must still answer when the kernel is out"
+        assert verifies == [1], (
+            "an explicit ASFP8_INT4_EXT=1 was overridden by the chip probe"
+        )
     finally:
         _caps._kernel_ready.pop("int4", None)

@@ -18,7 +18,7 @@ Capability tiers:
   A+ na_gemm's tensor-ops shader computes right    -> compile_shader matmul kernels
      (has_tensor_ops_matmul2d)                         (#19 conv im2col)
   B  M5-class matrix units + `ninja`               -> ObjC++ cpp_extension kernels
-     (kernel_gate)                                     (#3 fp8_ext, #17 int8_ext, int4)
+     (kernel_gate)                                     (#3 fp8_ext, #17 int8_ext)
 
 A+ and B are separate ladders, not steps of one. A+ asks what
 `torch.mps.compile_shader` can build; B's kernels compile through
@@ -156,7 +156,8 @@ def has_neural_accelerators():
 
 def kernel_gate():
     """Default-on pre-filter for the ObjC++ tensor-ops extensions (#3 fp8_ext,
-    #17 int8_ext, int4): M5-class matrix units on MPS, plus a build toolchain.
+    #17 int8_ext): M5-class matrix units on MPS, plus a build toolchain. int4 is
+    opt-in and gates itself in its loader, so it does not use this.
 
     Deliberately does NOT consult has_tensor_ops_matmul2d(). That probe compiles
     a bf16 shader through `torch.mps.compile_shader`, which cannot request an MSL
