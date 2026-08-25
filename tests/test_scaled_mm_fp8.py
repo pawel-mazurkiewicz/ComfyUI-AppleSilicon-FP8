@@ -134,17 +134,17 @@ def test_fast_ineligible_non_mps(monkeypatch):
 def test_fast_ineligible_when_explicitly_off(monkeypatch):
     # Explicit opt-out wins over capability + shape, even on supported hardware.
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_FP8_EXT", "off")
     inp, other = _operands(K=12288, N=3072)
     assert scaled_mm_fp8._fast_eligible(inp, other) is False
 
 
 def test_default_on_when_capable(monkeypatch):
-    # DEFAULT ON: unset + Tier-B capable -> eligible (no explicit flag needed).
+    # DEFAULT ON: unset + capable hardware -> eligible (no explicit flag needed).
     from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     inp, other = _operands(K=12288, N=3072)
     assert scaled_mm_fp8._fast_eligible(inp, other) is True
 
@@ -153,7 +153,7 @@ def test_default_off_when_not_capable(monkeypatch):
     # DEFAULT gated: unset + unsupported hardware -> inert (the promise).
     from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     inp, other = _operands(K=12288, N=3072)
     assert scaled_mm_fp8._fast_eligible(inp, other) is False
 

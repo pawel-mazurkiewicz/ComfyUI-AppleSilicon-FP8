@@ -235,3 +235,32 @@ def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
         assert _caps._kernel_ready["int4"] is False
     finally:
         _caps._kernel_ready.pop("int4", None)
+
+
+def test_int4_does_not_build_on_a_pre_m5_chip(monkeypatch):
+    """#25 applies to int4 too, and harder: it has no env gate at all, so every
+    ConvRot layer on an M1-M4 box reaches kernel_ready() and pays the build before
+    the self-check rejects it. W4A16 must still return the right answer."""
+    from _patches import _caps
+
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    _caps._kernel_ready.pop("int4", None)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+
+    verifies = []
+    monkeypatch.setattr(int4_linear_mps, "_verify",
+                        lambda: verifies.append(1) or True)
+
+    _, qdata, wscales = _quantized_weight()
+    x = torch.randn(8, K, dtype=torch.bfloat16, device="mps")
+
+    try:
+        out = int4_linear_mps._w4a16_linear_mps(
+            x, qdata.to("mps"), wscales.to("mps"), None, 256, ck_eager
+        )
+        assert out.shape == (8, N)
+        assert verifies == [], "int4 attempted a kernel build on pre-M5 hardware"
+    finally:
+        _caps._kernel_ready.pop("int4", None)

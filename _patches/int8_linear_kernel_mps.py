@@ -141,7 +141,7 @@ def _self_check():
 def _verify():
     """The contract _caps.kernel_ready expects: build, warmup, then numerics.
 
-    Nothing short of this proves the kernel works — tier_b_ready() only compiles
+    Nothing short of this proves the kernel works — kernel_gate() only checks
     na_gemm's bf16 shader, which shares no operand types with ours (#14).
     """
     return _ensure_kernel() is not None and _self_check()
@@ -346,11 +346,11 @@ def install():
         return
     if sys.platform != "darwin":
         return
-    # DEFAULT ON, gated on Tier B (Metal-4 tensor ops + ninja to build the ObjC++
+    # DEFAULT ON, gated on M5-class matrix units + ninja to build the ObjC++
     # extension). On unsupported HW the default resolves to OFF so we never attempt a
     # build; ASFP8_INT8_EXT=off force-disables, =1 forces the build attempt anyway.
     from . import _caps
-    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready):
+    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate):
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
@@ -398,7 +398,8 @@ def install():
 
     _installed = True
     print(
-        f"{TAG} INT8 convrot Linear routed through bit-exact Metal kernel on MPS "
-        f"(clean W8A8: rotate->per-row quant->int8 matmul; weight-only fp32 "
-        f"dequant/un-rotation bypassed). Kernel builds on first int8 layer, not now."
+        f"{TAG} INT8 convrot Linear seam installed on MPS (clean W8A8: "
+        f"rotate->per-row quant->int8 matmul; weight-only fp32 dequant/un-rotation "
+        f"bypassed). The kernel builds and runs its bit-exact self-check on the "
+        f"first int8 layer, and only routes if that passes."
     )

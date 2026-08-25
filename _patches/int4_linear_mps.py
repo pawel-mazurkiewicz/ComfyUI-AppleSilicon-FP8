@@ -141,7 +141,12 @@ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
     x_rot = mod._rotate_activation(x2d, h, convrot_groupsize)
 
     from . import _caps
-    kernel = _load_kernel() if _caps.kernel_ready("int4", _verify) else None
+    # kernel_gate() first: on hardware without M5-class matrix units the build
+    # can only ever end in a self-check rejection, and int4 has no env gate in
+    # front of it, so every ConvRot layer would pay for that discovery (#25).
+    kernel = (_load_kernel()
+              if _caps.kernel_gate() and _caps.kernel_ready("int4", _verify)
+              else None)
     if kernel is not None:
         try:
             y = _w4a8_kernel_linear(x_rot, qweight, wscales, bias, kernel)

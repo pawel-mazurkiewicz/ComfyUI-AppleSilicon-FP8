@@ -52,18 +52,24 @@ are satisfied:
 - **GPU:** the **int8** kernel needs Metal 4 cooperative TensorOps; the **fp8**
   kernel needs Metal 4.1's fp8 format type — in practice an **M5**.
 
-**How the probe actually decides.** There is no chip-model check anywhere in the
-code. The gate is `tier_b_ready()`: it (a) tries to compile a small
-`mpp::tensor_ops::matmul2d` Metal shader via `torch.mps.compile_shader` and (b)
-looks for `ninja`. Both must succeed. Because (a) depends on your macOS, Metal
-SDK and PyTorch build as much as on the GPU, the answer is not strictly "M5 =
-yes, M1–M4 = no": an M5 on some stacks probes `tensor_ops=no`, and an M4 on a
-recent macOS + PyTorch nightly has probed `tensor_ops=yes`. The startup log's
-`capabilities:` line prints exactly what your machine resolved to — trust that
-over the chip name.
+**How the gate actually decides.** Two cheap checks, then a real one. The gate
+(`kernel_gate()`) reads the chip name from `sysctl machdep.cpu.brand_string` and
+requires an **M5 or newer** plus `ninja`; a chip it cannot identify is allowed
+through rather than blocked. That only decides whether a build is *worth
+attempting*. What actually enables a kernel is the kernel itself: it builds, runs
+`warmup()`, and checks its output against a reference matmul, and the answer —
+including a failure — is remembered for the session.
 
-**M1 / M2 / M3 / M4 — nothing to do.** These normally fail the tensor-ops probe,
-so the M5-class matmul kernels stay inert and never build. You still get the full
+Until v1.3.2 the gate instead compiled a Metal shader through
+`torch.mps.compile_shader`. That call cannot request an MSL language version, so
+its result tracked your PyTorch build rather than your GPU, and it was wrong in
+both directions: `yes` on an M4 Pro where the int8 kernel computes garbage
+([#25](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/25)),
+`no` on an M5 Max where the same kernel is bit-exact and 3.17x faster
+([#27](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/issues/27)).
+
+**M1 / M2 / M3 / M4 — nothing to do.** These have no Neural Accelerators, so the
+M5-class matmul kernels stay inert and never build. You still get the full
 compatibility layer plus the compile_shader speedups that *don't* need Metal 4.1
 (fused RMSNorm #18, fused RoPE #21): FP8 matmuls run accelerated via bf16 decode
 on `simdgroup_matrix`, and int8 runs comfy's (fixed) weight-only path.
@@ -190,7 +196,7 @@ At startup you'll see a capability summary (which acceleration tier is active on
 your machine), then only the patch lines relevant to it:
 
 ```
-[AppleSilicon-FP8] capabilities: macOS=27.0, torch=2.11.0, mps=yes, compile_shader=yes, tensor_ops(M5/Metal4)=yes, ninja=yes
+[AppleSilicon-FP8] capabilities: macOS=27.0, torch=2.11.0, mps=yes, compile_shader=yes, chip=Apple M5 Max, matrix_units(M5+)=yes, ninja=yes
 [AppleSilicon-FP8/psutil] psutil.virtual_memory() is broken on this OS — installed vm_stat fallback (...).
 [AppleSilicon-FP8/comfy_kitchen] patched comfy_kitchen eager FP8 dequantize/quantize for MPS.
 [AppleSilicon-FP8/scaled_mm] torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul. F.scaled_mm (v2 seam) wrapped too.
@@ -205,20 +211,21 @@ your machine), then only the patch lines relevant to it:
 [AppleSilicon-FP8/te_device] text_encoder_device redirected CPU->MPS on Apple Silicon (LLM/CLIP encoders run on GPU).
 [AppleSilicon-FP8/int_mm] torch._int_mm runs on GPU (float32) on MPS instead of falling back to CPU (INT8 models).
 [AppleSilicon-FP8/int8_linear] int8-fast wide-batch matmul routed via MPS native bf16 GEMM (was fp32 _int_mm).
-[AppleSilicon-FP8/int8_kernel] INT8 convrot Linear routed through bit-exact Metal kernel on MPS (clean W8A8; weight-only fp32 dequant/un-rotation bypassed).
+[AppleSilicon-FP8/int8_kernel] INT8 convrot Linear seam installed on MPS (clean W8A8; weight-only fp32 dequant/un-rotation bypassed). The kernel builds and runs its bit-exact self-check on the first int8 layer, and only routes if that passes.
 [AppleSilicon-FP8/int4_linear] ConvRot W4A4 (int4) Linear on MPS -> W4A16 rotated-basis fast path.
 [AppleSilicon-FP8/conv] conv im2col+matmul2d active on MPS (ranks=[3], tile=384MB).
 [AppleSilicon-FP8/rope-fast] fused RoPE active on MPS (eager apply_rope/apply_rope_split_half rerouted; interleaved + split-half; fp32 math, no Metal-4.1/M5 requirement).
 [AppleSilicon-FP8/mlx_textgen] TextGenerate routed through MLX on Apple Silicon (qwen3vl_4b -> mlx-community/Qwen3-VL-4B-Instruct-4bit; gemma3_12b -> mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit).
 ```
 
-> **Note:** the first line is the capability probe — `tensor_ops(M5/Metal4)` and
-> `ninja` both `yes` is what unlocks the fp8/int8 matmul kernels (#3/#17/#20). The
-> `conv` / `fused-norm` / `rope-fast` lines appear wherever their tier is
-> supported (conv needs Metal 4; fused-norm and rope-fast need only
-> `compile_shader`). The `int8_kernel` / fp8-native lines appear on an M5 with the
-> toolchain + `ninja`; elsewhere those patches silently stay inert and int8 stays
-> on comfy's weight-only path. The `mlx_textgen` line appears only when `mlx-vlm`
+> **Note:** the first line is the capability summary — `matrix_units(M5+)` and
+> `ninja` both `yes` is what lets the fp8/int8 matmul kernels (#3/#17/#20) attempt
+> their build; each still has to pass its own self-check before it routes
+> anything. The `conv` / `fused-norm` / `rope-fast` lines appear wherever their
+> tier is supported (conv needs a working `compile_shader` tensor-ops shader;
+> fused-norm and rope-fast need only `compile_shader`). The `int8_kernel` /
+> fp8-native lines appear on an M5 with the toolchain + `ninja`; elsewhere those
+> patches silently stay inert and int8 stays on comfy's weight-only path. The `mlx_textgen` line appears only when `mlx-vlm`
 > is installed (`pip install 'comfyui-applesilicon-fp8[mlx]'`); otherwise patch #14
 > no-ops.
 

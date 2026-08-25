@@ -78,11 +78,11 @@ def _min_dim():
 
 def _fast_eligible(input, other):
     """Shape/dtype/capability predicate (no per-call device work). The fp8_ext fast
-    path is DEFAULT ON, gated on Tier B (Metal-4 tensor ops + ninja for the ObjC++
-    extension). ASFP8_FP8_EXT=off force-disables; =1 forces it on. The capability
+    path is DEFAULT ON, gated on M5-class matrix units + ninja for the ObjC++
+    extension. ASFP8_FP8_EXT=off force-disables; =1 forces it on. The capability
     probes are memoised, so this stays cheap on the hot matmul path."""
     from . import _caps
-    if not _caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.tier_b_ready):
+    if not _caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.kernel_gate):
         return False
     # The kernel decodes both operands as e4m3; only route when that's exact.
     if input.dtype != torch.float8_e4m3fn or other.dtype != torch.float8_e4m3fn:

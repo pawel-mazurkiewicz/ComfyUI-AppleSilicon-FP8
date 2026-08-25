@@ -221,11 +221,11 @@ def install():
         return
     if sys.platform != "darwin":
         return
-    # DEFAULT ON (seam confirmed via live Flux-2 probe), gated on Tier B (Metal-4 tensor
-    # ops + ninja for the ObjC++ fp8 extension). Unsupported HW -> default OFF (no build
+    # DEFAULT ON (seam confirmed via live Flux-2 probe), gated on M5-class matrix units
+    # + ninja for the ObjC++ fp8 extension. Unsupported HW -> default OFF (no build
     # attempt); ASFP8_FP8_NATIVE=off force-disables, =1 forces the build attempt anyway.
     from . import _caps
-    if not _caps.resolve("ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready):
+    if not _caps.resolve("ASFP8_FP8_NATIVE", default_on=True, cap=_caps.kernel_gate):
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
