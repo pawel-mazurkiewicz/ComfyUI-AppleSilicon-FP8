@@ -111,9 +111,12 @@ def _get_backend():
     if not _self_checked:
         _self_checked = True
         try:
-            torch.manual_seed(0)
-            a = (torch.randn(64, 8192) * 0.3).to(torch.float8_e4m3fn)
-            w = (torch.randn(8192, 8192) * 0.3).to(torch.float8_e4m3fn)   # [N,K]
+            # Local generator, never torch.manual_seed: this self-check runs
+            # lazily on the FIRST fp8 matmul, i.e. mid-render, where reseeding
+            # the process RNG would land in the middle of a user's sampling.
+            g = torch.Generator().manual_seed(0)
+            a = (torch.randn(64, 8192, generator=g) * 0.3).to(torch.float8_e4m3fn)
+            w = (torch.randn(8192, 8192, generator=g) * 0.3).to(torch.float8_e4m3fn)   # [N,K]
             a_u8 = a.view(torch.uint8).to("mps").contiguous()
             w_u8 = w.view(torch.uint8).to("mps").contiguous()
             ref = decode_fp8(a.to("mps"), torch.float32) @ decode_fp8(w.to("mps"), torch.float32).t()

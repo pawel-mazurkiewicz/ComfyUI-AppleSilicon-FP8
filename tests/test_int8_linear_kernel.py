@@ -555,9 +555,9 @@ def test_int8_kernel_compiles_when_enabled():
 def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
     """A kernel that fails verification must cost one attempt, not one per layer.
 
-    This is the #14 gap: kernel_gate() green-lights int8 off na_gemm's bf16
-    probe, so a kernel that cannot build still reaches the forward path. The
-    per-kernel memo is what stops that becoming a per-call rebuild.
+    This is the #14 gap: kernel_gate() clears int8 on chip + toolchain alone, so
+    a kernel that cannot build still reaches the forward path. The per-kernel
+    memo is what stops that becoming a per-call rebuild.
     """
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps

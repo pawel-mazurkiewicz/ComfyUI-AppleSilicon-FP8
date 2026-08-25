@@ -243,6 +243,13 @@ def reset_cache():
     global _compile_shader, _tensor_ops, _ninja, _chip_gen
     _compile_shader = _tensor_ops = _ninja = None
     _chip_gen = _UNPROBED
+    # has_tensor_ops_matmul2d() reads through to na_gemm's own memo, so clearing
+    # ours alone would hand back the stale verdict and re-probe nothing.
+    try:
+        from . import na_gemm
+        na_gemm.reset_cache()
+    except Exception:
+        pass
     with _kernel_lock:
         _kernel_ready.clear()
 

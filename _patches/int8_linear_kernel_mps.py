@@ -141,8 +141,9 @@ def _self_check():
 def _verify():
     """The contract _caps.kernel_ready expects: build, warmup, then numerics.
 
-    Nothing short of this proves the kernel works — kernel_gate() only checks
-    na_gemm's bf16 shader, which shares no operand types with ours (#14).
+    Nothing short of this proves the kernel works. kernel_gate() only checks that
+    the chip has matrix units and that ninja exists; it says nothing about whether
+    int8_gemm.mm builds here or what it computes (#14, #25, #27).
     """
     return _ensure_kernel() is not None and _self_check()
 

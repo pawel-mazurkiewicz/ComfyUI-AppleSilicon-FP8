@@ -357,3 +357,21 @@ def test_tensor_ops_probe_requires_a_passing_numeric_self_check(monkeypatch):
     monkeypatch.setattr(_patches, "na_gemm", fake, raising=False)
 
     assert _caps.has_tensor_ops_matmul2d() is False
+
+
+def test_no_patch_seeds_the_global_rng():
+    """`torch.manual_seed()` inside a library is never right: it reseeds every
+    device for the whole host process. The capability probes and kernel
+    self-checks all need deterministic operands, which is what a local
+    torch.Generator is for -- scaled_mm_fp8's fp8 self-check runs lazily on the
+    *first fp8 matmul*, so seeding there lands in the middle of a render."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "_patches"
+    offenders = [
+        f"{p.relative_to(root.parent)}:{i}"
+        for p in sorted(root.rglob("*.py"))
+        for i, line in enumerate(p.read_text().splitlines(), 1)
+        if "torch.manual_seed(" in line and not line.lstrip().startswith("#")
+    ]
+    assert offenders == [], f"global RNG seeded by: {offenders}"

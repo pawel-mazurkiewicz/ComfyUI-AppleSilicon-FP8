@@ -20,9 +20,9 @@
   activates where it's supported; everywhere else it stays inert (nothing to
   configure, nothing breaks). The startup log prints a one-line capability summary
   so you can see exactly which tier is active on your machine. The heavier matmul
-  kernels need Metal-4 tensor ops — established by a runtime shader-compile probe,
-  in practice an **M5** — plus `ninja` to build, so on M1–M4 they normally don't
-  engage. The **int8/int4** kernels compile against **Metal 4.0** (macOS 26+); only
+  kernels need the **M5**'s matrix units plus `ninja` to build, and each one then
+  has to pass its own numeric self-check before it routes anything, so on M1–M4
+  they don't engage. The **int8/int4** kernels compile against **Metal 4.0** (macOS 26+); only
   the **fp8** kernel requires **Metal 4.1** (**macOS 27**), for its fp8 format type. The per-patch switches below (`ASFP8_FP8_EXT`, `ASFP8_INT8_EXT`
   and friends) take `off` to force a patch off and `1` to force it past the
   capability probe; forcing on buys only a *build attempt*, since callers still
