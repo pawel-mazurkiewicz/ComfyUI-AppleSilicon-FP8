@@ -19,7 +19,7 @@ __all__ = [
     "int8_linear_mps",      # patch #13 — int8-fast wide-batch Linear via MPS native bf16 GEMM
     "mlx_textgen",          # patch #14 — MLX-backed Qwen3-VL TextGenerate (prompt expansion)
     "fused_norm_mps",       # patch #18 — fused rmsnorm+modulation+residual MPS kernel (DEFAULT ON, compile_shader-gated)
-    "fp8_linear_kernel_mps", # patch #20 — fp8 e4m3 Linear via native Metal matmul2d (DEFAULT ON, Tier-B gated; ASFP8_FP8_NATIVE=off to disable)
+    "fp8_linear_kernel_mps", # patch #20 — fp8 e4m3 Linear via native Metal matmul2d (DEFAULT ON, gated on M5+ & ninja; ASFP8_FP8_NATIVE=off to disable)
     # patch #15 (fp8_linear_mps, opt-in fp8-native *F.linear*) RETIRED — wrong seam:
     #   real ComfyUI fp8 routes through torch._scaled_mm (QuantizedTensor hides the fp8
     #   dtype so the F.linear gate never fired), and weight-only fp8 only won at tiny M.
@@ -28,7 +28,7 @@ __all__ = [
     #   mixed_precision_ops.Linear.forward (the same factory seam patch #17 uses for int8),
     #   intercepting BEFORE the activation is fp8-quantized, so the F.linear-gate problem
     #   that retired #15 does not apply. DEFAULT ON (seam confirmed via a live Flux-2 probe),
-    #   gated on Tier B (M5/Metal-4.1 + ninja); ASFP8_FP8_NATIVE=off disables.
+    #   gated on M5-class matrix units + ninja; ASFP8_FP8_NATIVE=off disables.
     # Internal helpers (not patches):
     # "_common"             — decode_fp8, fp8_to_float_lut, FP8_DTYPES
     # "na_gemm"             — optional NA matmul2d backend (not wired into hot path)

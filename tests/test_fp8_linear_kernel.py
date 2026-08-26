@@ -19,7 +19,7 @@ def test_loader_gated_off_when_unsupported(monkeypatch):
     from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
     monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     _reset_loader(monkeypatch)
     assert loader.module() is None
 
@@ -27,7 +27,7 @@ def test_loader_gated_off_when_unsupported(monkeypatch):
 def test_loader_forced_off_beats_capability(monkeypatch):
     # Explicit off on both flags wins even on capable HW -> no build.
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_FP8_EXT", "off")
     monkeypatch.setenv("ASFP8_FP8_NATIVE", "off")
     _reset_loader(monkeypatch)
@@ -37,7 +37,7 @@ def test_loader_forced_off_beats_capability(monkeypatch):
 def test_loader_memo_resets_between_flag_states(monkeypatch):
     # Off -> None, then flip NATIVE on with a fresh reset; the gate must re-evaluate.
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
     monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
     _reset_loader(monkeypatch)
@@ -66,7 +66,7 @@ def _clear_fp8_kernel_memo():
 def test_install_noop_when_explicitly_off(monkeypatch):
     # ASFP8_FP8_NATIVE=off force-disables even on capable hardware.
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_FP8_NATIVE", "off")
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
@@ -74,10 +74,10 @@ def test_install_noop_when_explicitly_off(monkeypatch):
 
 
 def test_install_noop_when_not_capable(monkeypatch):
-    # DEFAULT ON but Tier-B gated: unsupported hardware -> no build, stays inert.
+    # DEFAULT ON but hardware-gated: unsupported hardware -> no build, stays inert.
     from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
@@ -90,7 +90,7 @@ def test_install_does_not_build_the_extension(monkeypatch):
     """install() runs at import time: it may wire the seam, never build the kernel."""
     from _patches import _caps
     monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     monkeypatch.setattr(patch, "_kernel", None, raising=False)
     monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
@@ -128,7 +128,7 @@ def test_loader_gives_up_when_the_build_stalls(monkeypatch):
 
     monkeypatch.delenv("ASFP8_FP8_EXT", raising=False)
     monkeypatch.delenv("ASFP8_FP8_NATIVE", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
     _reset_loader(monkeypatch)
 
@@ -187,7 +187,7 @@ from _patches import fp8_linear_kernel_mps as _fp8patch
 # uses, so a kernel that stops compiling surfaces as a failure rather than a
 # silent skip (issue #13). ASFP8_FP8_NATIVE=0 turns them off with the feature.
 _fp8_enabled = torch.backends.mps.is_available() and _caps.resolve(
-    "ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready
+    "ASFP8_FP8_NATIVE", default_on=True, cap=_caps.kernel_gate
 )
 
 

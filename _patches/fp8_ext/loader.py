@@ -53,12 +53,12 @@ def module():
     _tried = True
 
     # DEFAULT ON where capable: build when EITHER seam wants it. Each flag resolves
-    # via the shared three-state gate (unset -> on iff Tier B; off -> off; 1 -> force).
+    # via the shared three-state gate (unset -> on iff kernel_gate; off -> off; 1 -> force).
     # The callers (#3 _fast_eligible, #20 install) independently decide whether to USE
     # the built module; this only decides whether to attempt the (cached) build.
     from .. import _caps
-    if not (_caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.tier_b_ready) or
-            _caps.resolve("ASFP8_FP8_NATIVE", default_on=True, cap=_caps.tier_b_ready)):
+    if not (_caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.kernel_gate) or
+            _caps.resolve("ASFP8_FP8_NATIVE", default_on=True, cap=_caps.kernel_gate)):
         return None
     if shutil.which("xcrun") is None:
         print("[fp8_ext] no Metal toolchain (xcrun); fp8-native disabled.")

@@ -25,7 +25,7 @@ from _patches import _caps
 # compiling (issue #13) showed up as 34 silent skips. ASFP8_INT8_EXT=0 still turns
 # them off, exactly as it turns the feature off.
 _int8_enabled = torch.backends.mps.is_available() and _caps.resolve(
-    "ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready
+    "ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate
 )
 
 
@@ -64,7 +64,7 @@ def _clear_int8_kernel_memo():
 def test_install_noop_when_explicitly_off(monkeypatch):
     """ASFP8_INT8_EXT=off force-disables even on capable hardware."""
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_INT8_EXT", "off")
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
@@ -75,7 +75,7 @@ def test_install_noop_when_not_capable(monkeypatch):
     """DEFAULT ON but gated: unsupported hardware -> no build attempt, stays inert."""
     from _patches import _caps
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
@@ -92,7 +92,7 @@ def test_install_does_not_build_the_extension(monkeypatch):
     """install() runs at import time: it may wire the seam, never build the kernel."""
     from _patches import _caps
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     monkeypatch.setattr(patch, "_kernel", None, raising=False)
     monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
@@ -173,7 +173,7 @@ def test_loader_gives_up_when_the_build_stalls(monkeypatch):
         pytest.skip("needs the Metal toolchain + ninja to reach the build call")
 
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
     monkeypatch.setattr(loader, "_tried", False, raising=False)
     monkeypatch.setattr(loader, "_mod", None, raising=False)
@@ -555,9 +555,9 @@ def test_int8_kernel_compiles_when_enabled():
 def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
     """A kernel that fails verification must cost one attempt, not one per layer.
 
-    This is the #14 gap: tier_b_ready() green-lights int8 off na_gemm's bf16
-    probe, so a kernel that cannot build still reaches the forward path. The
-    per-kernel memo is what stops that becoming a per-call rebuild.
+    This is the #14 gap: kernel_gate() clears int8 on chip + toolchain alone, so
+    a kernel that cannot build still reaches the forward path. The per-kernel
+    memo is what stops that becoming a per-call rebuild.
     """
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps
@@ -628,3 +628,98 @@ def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
 
     assert len(calls) == 1, f"kernel re-entered after a dispatch failure ({len(calls)}x)"
     assert _caps._kernel_ready["int8"] is False
+
+
+# --- the hardware gate: issues #25 and #27 ----------------------------------
+#
+# One defect, reported from both ends. The old gate (kernel_gate) asked
+# torch.mps.compile_shader to build na_gemm's bf16 shader, which measures the
+# torch build's default MSL rather than the GPU. It answered yes on the M4 Pro of
+# #25, where int8_gemm.mm builds and returns garbage, and no on the M5 Max of
+# #27, where the very same kernel is bit-exact and 3.17x faster.
+
+
+def test_install_is_inert_on_a_pre_m5_chip(monkeypatch):
+    """#25: on M1-M4 there are no Neural Accelerators, so the tensor-ops kernel
+    dispatches and computes garbage. _self_check() catches it -- but only after
+    every cold start has paid a ~7s ninja+clang build for a kernel that is then
+    discarded. A chip we can positively name as pre-M5 must not reach the seam.
+    """
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+
+    patch.install()
+
+    assert patch._installed is False
+
+
+def _stub_comfy_ops(monkeypatch):
+    """Stand in for `comfy.ops`, which isn't importable from the repo root.
+
+    install() wraps ops.mixed_precision_ops, so without this the gate tests can
+    never observe a completed install -- install() bails on the import first.
+    """
+    import sys
+    import types
+
+    class _Linear:
+        def forward(self, x):
+            return x
+
+    def mixed_precision_ops(*a, **k):
+        return type("Ops", (), {"Linear": type("Linear", (_Linear,), {})})
+
+    comfy = types.ModuleType("comfy")
+    ops = types.ModuleType("comfy.ops")
+    ops.mixed_precision_ops = mixed_precision_ops
+    comfy.ops = ops
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.ops", ops)
+    return ops
+
+
+def test_install_survives_a_failing_compile_shader_probe(monkeypatch):
+    """#27: macOS 26.6 + torch 2.10 on an M5 Max cannot compile na_gemm through
+    compile_shader ("use of undeclared identifier 'mpp'"), while int8_gemm.mm
+    builds fine via newLibraryWithSource at MSL 4.0 and passes its bit-exact
+    self-check. The probe's verdict must not disable the kernel."""
+    _stub_comfy_ops(monkeypatch)
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "has_tensor_ops_matmul2d", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: None, raising=False)
+
+    patch.install()
+
+    assert patch._installed is True
+
+
+def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys):
+    """#25's second cost: the startup line announced the kernel as routing before
+    anything had been built or numerically checked, and the retraction landed one
+    line deep in the sampling log. The banner must promise a check, not a result.
+    """
+    _stub_comfy_ops(monkeypatch)
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: None, raising=False)
+
+    patch.install()
+
+    out = capsys.readouterr().out
+    assert "routed through" not in out, f"banner claims a result it hasn't got: {out}"
+    assert "self-check" in out.lower(), f"banner doesn't mention verification: {out}"

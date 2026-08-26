@@ -175,9 +175,9 @@ def self_check_ok():
         _self_check = False
         return False
     try:
-        torch.manual_seed(0)
-        a = (torch.randn(64, 256) * 0.5).to(torch.bfloat16).to("mps").contiguous()
-        b = (torch.randn(256, 96) * 0.5).to(torch.bfloat16).to("mps").contiguous()
+        g = torch.Generator().manual_seed(0)   # never seed the host's RNG
+        a = (torch.randn(64, 256, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()
+        b = (torch.randn(256, 96, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()
         ref = a.float() @ b.float()
         out = sg_matmul(a, b)
         rel = (out - ref).abs().max() / (ref.abs().max() + 1e-9)
