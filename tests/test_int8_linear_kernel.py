@@ -723,3 +723,121 @@ def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "routed through" not in out, f"banner claims a result it hasn't got: {out}"
     assert "self-check" in out.lower(), f"banner doesn't mention verification: {out}"
+
+
+@requires_mps
+def test_force_cast_weights_does_not_disqualify_the_kernel(monkeypatch):
+    """comfy sets comfy_force_cast_weights on int8 layers where storage dtype !=
+    compute dtype; for a QuantizedTensor that cast is the per-call W8A16 dequant
+    this kernel bypasses, so the flag must not push the layer off the kernel route
+    (regression: it silently forced MiniMax Music 3's whole TE onto the slow path)."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_kernel", object(), raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+    monkeypatch.setattr(patch, "_self_checked", True, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", True, raising=False)
+
+    out = torch.full((1,), 7.0)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: out, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    assert patch._try_int8_kernel_forward(Holder(), x) is out, (
+        "comfy_force_cast_weights pushed an int8 layer off the kernel route"
+    )
+
+
+@requires_mps
+def test_dequant_retries_after_a_transient_off_mps_call(monkeypatch):
+    """An off-MPS first call must not latch _asfp8_deq_done: the same layer can be
+    called later with MPS input (offload/warmup) and should still dequantise then."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    layer = Holder()
+    layer.weight = qw
+    layer.bias = None
+
+    patch._maybe_dequant_weight(layer, torch.randn(1, 128, dtype=torch.bfloat16))
+    assert isinstance(layer.weight, QuantizedTensor), "dequantised from a CPU-input call"
+    assert not getattr(layer, "_asfp8_deq_done", False), "off-MPS call latched the flag"
+
+    x = torch.randn(1, 128, dtype=torch.bfloat16, device="mps")
+    patch._maybe_dequant_weight(layer, x)
+    assert not isinstance(layer.weight, QuantizedTensor), "MPS call did not dequantise"
+    assert layer.weight.dtype == torch.bfloat16
+    assert layer.weight.device.type == "mps"
+    assert layer._asfp8_deq_done is True
+
+    ref = qw.dequantize().to(torch.bfloat16)
+    assert torch.equal(layer.weight.detach().cpu(), ref.cpu()), (
+        "dequantised weight differs from QuantizedTensor.dequantize()"
+    )
+
+
+# --- the ASFP8_INT8_DEQUANT gate: the switch people actually touch --------------
+
+
+def _resolve_dequant_gate(monkeypatch, env, total_ram):
+    import psutil
+
+    class _VM:
+        total = total_ram
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", None, raising=False)
+    if env is None:
+        monkeypatch.delenv("ASFP8_INT8_DEQUANT", raising=False)
+    else:
+        monkeypatch.setenv("ASFP8_INT8_DEQUANT", env)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _VM())
+    return patch._dequant_enabled()
+
+
+def test_dequant_gate_is_opt_in(monkeypatch):
+    """Unset stays OFF regardless of RAM: the plain copy lands after comfy's
+    model_management has already budgeted around the int8 size."""
+    assert _resolve_dequant_gate(monkeypatch, None, 128 * (1 << 30)) is False
+
+
+def test_dequant_gate_off_stays_off(monkeypatch):
+    assert _resolve_dequant_gate(monkeypatch, "off", 128 * (1 << 30)) is False
+
+
+def test_dequant_gate_on_with_enough_ram(monkeypatch):
+    assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
+
+
+def test_dequant_gate_ram_check_overrides_opt_in(monkeypatch, capsys):
+    """=1 on a small box is refused (safety), and says so."""
+    assert _resolve_dequant_gate(monkeypatch, "1", 16 * (1 << 30)) is False
+    assert "48 GiB" in capsys.readouterr().out
+
+
+def test_dequant_gate_memoises(monkeypatch):
+    """The gate resolves once; later env changes don't flip a live session."""
+    assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
+    monkeypatch.setenv("ASFP8_INT8_DEQUANT", "off")
+    assert patch._dequant_enabled() is True
