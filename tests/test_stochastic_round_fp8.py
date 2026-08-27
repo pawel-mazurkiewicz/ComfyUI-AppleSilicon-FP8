@@ -115,3 +115,33 @@ def test_native_requant_is_bit_exact_vs_the_cpu_round_trip():
     assert torch.equal(
         native.cpu().view(torch.uint8), reference.cpu().view(torch.uint8)
     ), "GPU re-quant differs from the CPU round-trip it replaces"
+
+
+@requires_mps
+@pytest.mark.parametrize("exc", [
+    torch.OutOfMemoryError("MPS backend out of memory (MPS allocated: 90.00 GB)"),
+    RuntimeError("MPS backend out of memory (MPS allocated: 90.00 GB)"),
+])
+def test_a_transient_oom_does_not_condemn_the_session(exc):
+    """Memory pressure is not a missing kernel. Latching the whole session onto
+    the 4.6x-slower path because one weight hit the allocator would be the same
+    silent regression #29 was -- the next weight must try the GPU again."""
+    calls = []
+
+    def original(value, dtype, seed=0):
+        calls.append(value.device.type)
+        if value.device.type == "mps" and len(calls) == 1:
+            raise exc
+        return torch.zeros(value.shape, dtype=dtype, device=value.device)
+
+    x = torch.randn(64, device="mps")
+
+    first = patch._requant(original, x, torch.float8_e4m3fn, 0)
+    second = patch._requant(original, x, torch.float8_e4m3fn, 0)
+
+    assert first.device.type == "mps", "the failed weight must still get a result"
+    assert second.device.type == "mps"
+    assert calls == ["mps", "cpu", "mps"], (
+        f"expected a per-call fallback then a fresh GPU attempt, got {calls}"
+    )
+    assert patch._native_ok is not False, "a transient OOM latched the session off the GPU"

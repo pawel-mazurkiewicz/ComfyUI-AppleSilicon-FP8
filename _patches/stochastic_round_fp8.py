@@ -73,20 +73,40 @@ _installed = False
 _native_ok = None
 
 
+def _is_transient(e):
+    """Memory pressure rather than a missing kernel.
+
+    Worth separating: a missing fp8 kernel is a property of the stack and will
+    fail for every weight, so latching is right. An allocator failure is a
+    property of the moment, and condemning the session to the 4.6x-slower path
+    over one of them would be the same silent regression #29 was.
+    """
+    oom = getattr(torch, "OutOfMemoryError", None)
+    if oom is not None and isinstance(e, oom):
+        return True
+    return "out of memory" in str(e).lower()
+
+
 def _requant(original, value, dtype, seed=0):
     """Re-quantise `value` to an fp8 `dtype`, keeping the maths on the GPU if it can.
 
-    Only ONE step of the re-quant has no MPS kernel -- the final float->fp8 cast.
-    Patch #8 (tensor_to_fp8) already routes that single op via a LUT/CPU hop, so
-    on a stack where it is installed the whole function runs on the GPU and
-    returns byte-identical fp8. Sending the entire tensor to the CPU instead, as
-    this patch did from S1 until #29, costs ~5.6x at per-weight granularity
-    (11.3 -> 2.0 ms/weight on an M5 Max) and is why loading an fp8 DiT with a
-    LoRA took minutes while the same model without one loaded fast.
+    Which operations lack an MPS kernel depends on which implementation comfy
+    calls, and the two differ:
 
-    The CPU round-trip stays reachable because it is still needed: comfy's own
-    fallback implementation writes through ``output[i:].copy_(...)``, a strided
-    fp8 copy that patch #8 does not cover (it wraps ``.to``, not ``copy_``).
+    - comfy_kitchen's ``stochastic_rounding_fp8`` has exactly one, the final
+      float->fp8 cast, and patch #8 (tensor_to_fp8) already routes that single op
+      via a LUT/CPU hop -- so wherever patch #8 is installed the whole function
+      runs on the GPU and returns byte-identical fp8.
+    - comfy's own fallback has a different one: it writes through
+      ``output[i:].copy_(...)``, a strided fp8 copy patch #8 does NOT cover (it
+      wraps ``.to``, not ``copy_``), so that path genuinely needs the CPU.
+
+    Since we cannot tell which one this stack will run, try the GPU once and
+    latch onto the CPU round-trip for the session if it raises. Sending every
+    tensor to the CPU unconditionally, as this patch did from S1 until #29, costs
+    ~4.6x at per-weight granularity (11.1 -> 2.4 ms/weight on an M5 Max) and is
+    why loading an fp8 DiT with a LoRA took minutes while the same model without
+    one loaded fast.
     """
     global _native_ok
     if value.device.type != "mps" or dtype not in FP8_DTYPES:
@@ -98,6 +118,13 @@ def _requant(original, value, dtype, seed=0):
             _native_ok = True
             return out
         except Exception as e:
+            # Deliberately broad. The alternative -- re-raising what we don't
+            # recognise -- turns a logged slowdown into a failed model load, and
+            # every fp8 path in this node is a compatibility shim whose first
+            # duty is not to break the load. The exception is reported, not
+            # swallowed, and the CPU result below is bit-exact either way.
+            if _is_transient(e):
+                return original(value.cpu(), dtype, seed=seed).to(value.device)
             if _native_ok is None:
                 print(f"{TAG} fp8 re-quant cannot run on MPS here ({e!r}); "
                       f"using the CPU round-trip for the rest of this session.")
