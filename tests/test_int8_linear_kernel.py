@@ -841,3 +841,36 @@ def test_dequant_gate_memoises(monkeypatch):
     assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
     monkeypatch.setenv("ASFP8_INT8_DEQUANT", "off")
     assert patch._dequant_enabled() is True
+
+
+@requires_mps
+def test_offloaded_cpu_weight_does_not_latch_the_kernel_off(monkeypatch):
+    """comfy parks weights on CPU between uses and casts them back in via
+    comfy_force_cast_weights. Now that the force-cast bail is gone (#26), such a
+    layer reaches this path -- and if it got as far as _int8_linear_kernel, that
+    function's own fallback would hand an MPS input and a CPU weight to the eager
+    int8_linear, throw, and latch mark_kernel_failed. One offloaded layer would
+    then disable int8 for the rest of the session, over a transient condition.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    qw_cpu = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    )
+    assert qw_cpu.device.type == "cpu", "fixture must stay off-device"
+
+    class Holder:
+        weight = qw_cpu
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+    assert _caps._kernel_ready.get("int8") is not False, (
+        "an offloaded weight latched the int8 kernel off for the session"
+    )

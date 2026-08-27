@@ -328,6 +328,7 @@ your machine), then only the patch lines relevant to it:
   | Env var | Behaviour |
   |---|---|
   | `ASFP8_INT8_EXT` (default on where capable) | int8 W8A8 Metal kernel for int8 convrot Linears. Unset → on iff M5 + Metal 4.0 (macOS 26+) + `ninja`; `off`/`0` → force off; `1`/`on` → force the build attempt. |
+  | `ASFP8_INT8_DEQUANT` (default **off**) | Opt-in: dequantize int8 weights to plain bf16/fp16 **once at load** rather than per call. Trades memory (~16 GB for an 8B model) for a single-dispatch `F.linear`, which wins wherever dispatch overhead dominates the matmul — autoregressive text encoders at M=1 (measured ~19× on MiniMax Music 3 AR decode, contributed in [#26](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/pull/26)); no benefit for batched diffusion. `1`/`on` enables, and is still refused below 48 GiB RAM (it logs why) because the plain copy lands *after* comfy's model_management has budgeted around the loaded int8 size. Numerics match comfy's stock W8A16 path. |
   | `ASFP8_EXT_BUILD_TIMEOUT` (default `600`) | Seconds to wait for a Metal extension build (int8 #17, fp8 #3/#20, int4 #22) before giving up and falling back. An abandoned build lock is cleared once it is **twice** this old (twice the 600 s default when set to `0`), so a build that is merely slow is never disturbed. `0` disables the watchdog and waits indefinitely — not recommended, a wedged toolchain then hangs the render. |
 
 - **fused RMSNorm (#18) and fused RoPE (#21) are ON by default on any MPS with
