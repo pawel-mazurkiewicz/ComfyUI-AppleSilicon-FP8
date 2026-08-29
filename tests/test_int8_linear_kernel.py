@@ -874,3 +874,42 @@ def test_offloaded_cpu_weight_does_not_latch_the_kernel_off(monkeypatch):
     assert _caps._kernel_ready.get("int8") is not False, (
         "an offloaded weight latched the int8 kernel off for the session"
     )
+
+
+@requires_mps
+def test_dequant_leaves_an_offloaded_weight_on_the_cpu(monkeypatch):
+    """comfy parks weights on CPU to keep them out of memory. Dequantising one
+    pulls a bigger, full-precision copy onto the GPU and pins it there, undoing
+    the offload and inflating residency past what the >= 48 GiB gate budgeted for.
+
+    The flag must stay unset too: being offloaded is transient, so the layer
+    should still dequantise once comfy brings the weight back -- the same
+    treatment _maybe_dequant_embedding already gives this case.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)
+
+    qw_cpu = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    )
+    assert qw_cpu.device.type == "cpu", "fixture must stay offloaded"
+
+    class Holder:
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    layer = Holder()
+    layer.weight = qw_cpu
+    layer.bias = None
+
+    x = torch.randn(1, 128, dtype=torch.bfloat16, device="mps")
+    patch._maybe_dequant_weight(layer, x)
+
+    assert isinstance(layer.weight, QuantizedTensor), "offloaded weight was dequantised"
+    assert layer.weight.device.type == "cpu", "offloaded weight was pulled onto the GPU"
+    assert not getattr(layer, "_asfp8_deq_done", False), (
+        "a transient offload latched the layer out of ever dequantising"
+    )
