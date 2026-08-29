@@ -173,4 +173,5 @@ def install():
         extra = " + to_blocked"
 
     _installed = True
-    print(f"{TAG} stochastic_rounding{extra} FP8 re-quant routed via CPU on MPS.")
+    print(f"{TAG} stochastic_rounding{extra} FP8 re-quant runs on the GPU where "
+          f"the stack allows it, with a CPU round-trip as the fallback.")

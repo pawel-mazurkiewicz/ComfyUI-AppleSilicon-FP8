@@ -407,13 +407,21 @@ def _maybe_dequant_weight(self, input):
         # dequantised copy to 2x the size the >= 48 GiB gate budgets for.
         if input.dtype not in (torch.float16, torch.bfloat16):
             return
+        # Offloaded weight: comfy is deliberately keeping it off-device, so
+        # dequantising would pull a bigger, full-precision copy onto the GPU and
+        # pin it there -- undoing the offload and inflating residency past what
+        # the >= 48 GiB gate budgeted for. Transient like the checks above, so
+        # the flag stays unset and a later resident call can still dequantise.
+        # _maybe_dequant_embedding already treats its weight this way.
+        w = getattr(self, "weight", None)
+        if w is None or getattr(w, "device", None) is None or w.device.type != "mps":
+            return
         self._asfp8_deq_done = True
         if getattr(self, "_full_precision_mm", False):
             return
         if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
             return
 
-        w = self.weight
         if isinstance(w, QuantizedTensor):
             if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
                 return
