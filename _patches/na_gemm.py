@@ -101,6 +101,17 @@ def available():
     return _get_lib() is not None
 
 
+def reset_cache():
+    """Test hook: drop the compile + numeric memos so the next call re-probes.
+
+    _caps.reset_cache() delegates here. Without it, clearing _caps' own memo just
+    re-reads this stale verdict and the promised re-probe never happens."""
+    global _lib, _compiled, _self_check
+    _lib = None
+    _compiled = None
+    _self_check = None
+
+
 def na_matmul(a, b):
     """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16, on MPS.
 
@@ -142,9 +153,12 @@ def self_check_ok():
         _self_check = False
         return False
     try:
-        torch.manual_seed(0)
-        a = (torch.randn(64, 256) * 0.5).to(torch.bfloat16).to("mps").contiguous()
-        b = (torch.randn(256, 96) * 0.5).to(torch.bfloat16).to("mps").contiguous()
+        # Local generator, never torch.manual_seed: this probe runs at plugin
+        # import (conv im2col's gate), and reseeding there would move the host's
+        # RNG under every later draw in the process.
+        g = torch.Generator().manual_seed(0)
+        a = (torch.randn(64, 256, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()
+        b = (torch.randn(256, 96, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()
         ref = (a.float() @ b.float())
         out = na_matmul(a, b)
         rel = (out - ref).abs().max() / (ref.abs().max() + 1e-9)

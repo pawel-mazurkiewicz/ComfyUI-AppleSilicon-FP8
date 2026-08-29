@@ -71,15 +71,6 @@ def test_unrecognised_value_falls_through_to_default(monkeypatch):
     assert _caps.resolve("ASFP8_CAPS_TEST", default_on=True, cap=_cap(False)) is False
 
 
-# --- tier B implies both the tensor-ops probe AND ninja ---------------------
-def test_tier_b_requires_both_probe_and_ninja(monkeypatch):
-    monkeypatch.setattr(_caps, "has_tensor_ops_matmul2d", lambda: True)
-    monkeypatch.setattr(_caps, "ninja_available", lambda: False)
-    assert _caps.tier_b_ready() is False
-    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
-    assert _caps.tier_b_ready() is True
-
-
 def test_summary_is_a_string():
     s = _caps.summary()
     assert isinstance(s, str)
@@ -151,11 +142,24 @@ def test_reset_cache_clears_the_kernel_results():
     assert len(calls) == 2, "reset_cache() must force a re-probe"
 
 
-def test_summary_banner_substrings_are_unchanged():
-    """Other tests (and users' bug reports) match on these exact substrings."""
+def test_summary_banner_reports_the_chip_and_matrix_units():
+    """The banner is what users paste into bug reports, so it has to name the
+    thing the kernels actually depend on. `tensor_ops(M5/Metal4)=` claimed a GPU
+    generation it never measured -- it read yes on the M4 Pro of #25 and no on the
+    M5 Max of #27."""
     s = _caps.summary()
-    for token in ("mps=", "tensor_ops(M5/Metal4)=", "ninja="):
+    for token in ("mps=", "chip=", "matrix_units(M5+)=", "ninja="):
         assert token in s, f"{token!r} missing from banner: {s}"
+    assert "tensor_ops(M5/Metal4)=" not in s
+
+
+def test_summary_says_unknown_when_the_chip_cannot_be_identified(monkeypatch):
+    """Permissive gate, honest banner: an unidentified chip still gets a build
+    attempt, but the banner must not claim matrix units we never confirmed."""
+    _caps.reset_cache()
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: None)
+    s = _caps.summary()
+    assert "matrix_units(M5+)=unknown" in s
 
 
 def test_kernel_ready_verifies_once_under_concurrency():
@@ -205,3 +209,169 @@ def test_mark_kernel_failed_disables_without_reverifying():
     _caps.mark_kernel_failed("latch")
     assert _caps.kernel_ready("latch", verify) is False
     assert len(calls) == 1, "a latched-off kernel was re-verified"
+
+
+# --- chip identification and the matrix-unit gate (issues #25, #27) ---------
+#
+# Both issues are the same defect: has_tensor_ops_matmul2d() compiles na_gemm's
+# bf16 shader through torch.mps.compile_shader, which cannot request an MSL
+# language version -- so its answer tracks the torch build's default MSL, not the
+# GPU. #25 got tensor_ops=yes on an M4 Pro (kernel builds, every element garbage);
+# #27 got tensor_ops=no on an M5 Max (kernel is bit-exact and 3.17x faster). The
+# ObjC++ kernels want one thing the probe never measured: M5-class matrix units.
+
+
+@pytest.mark.parametrize("brand,gen", [
+    ("Apple M1", 1),
+    ("Apple M2 Pro", 2),
+    ("Apple M4 Pro", 4),
+    ("Apple M5 Max", 5),
+    ("Apple M10 Ultra", 10),
+])
+def test_chip_generation_parses_the_brand_string(monkeypatch, brand, gen):
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: brand)
+    assert _caps.chip_generation() == gen
+
+
+@pytest.mark.parametrize("brand", [
+    "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "Apple silicon",
+    "",
+    None,
+])
+def test_chip_generation_is_none_when_the_chip_is_unrecognisable(monkeypatch, brand):
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: brand)
+    assert _caps.chip_generation() is None
+
+
+def test_chip_generation_is_memoised(monkeypatch):
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    calls = []
+
+    def brand():
+        calls.append(1)
+        return "Apple M5 Max"
+
+    monkeypatch.setattr(_caps, "_cpu_brand_string", brand)
+    assert _caps.chip_generation() == 5
+    assert _caps.chip_generation() == 5
+    assert len(calls) == 1, "the sysctl probe must run once per session"
+
+
+def test_m4_reports_no_neural_accelerators(monkeypatch):
+    """#25: the tensor_ops kernels compile on M4 and return garbage."""
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
+    assert _caps.has_neural_accelerators() is False
+
+
+def test_m5_reports_neural_accelerators(monkeypatch):
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    assert _caps.has_neural_accelerators() is True
+
+
+def test_unidentified_chip_stays_permissive(monkeypatch):
+    """Never false-negative on hardware we cannot name -- that is #27's failure
+    mode. kernel_ready()'s build + numeric self-check is the real authority; the
+    chip check only short-circuits hardware we positively know cannot work."""
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: None)
+    assert _caps.has_neural_accelerators() is True
+
+
+# --- kernel_gate: the pre-filter the ObjC++ extensions actually want --------
+
+
+def test_kernel_gate_requires_neural_accelerators(monkeypatch):
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "has_neural_accelerators", lambda: False)
+    assert _caps.kernel_gate() is False
+
+
+def test_kernel_gate_requires_ninja(monkeypatch):
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(_caps, "ninja_available", lambda: False)
+    assert _caps.kernel_gate() is False
+
+
+def test_kernel_gate_requires_mps(monkeypatch):
+    monkeypatch.setattr(_caps, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: False)
+    assert _caps.kernel_gate() is False
+
+
+def test_kernel_gate_passes_on_m5_with_a_toolchain(monkeypatch):
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    assert _caps.kernel_gate() is True
+
+
+def test_kernel_gate_ignores_the_na_gemm_compile_probe(monkeypatch):
+    """#27 in one assertion: the M5 Max where compile_shader could not build
+    na_gemm's bf16 shader is the same M5 Max where int8_gemm.mm is bit-exact.
+    The ObjC++ kernels compile through newLibraryWithSource at an explicit MSL
+    version, so what compile_shader can manage says nothing about them."""
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "has_neural_accelerators", lambda: True)
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+
+    probed = []
+
+    def probe():
+        probed.append(1)
+        return False
+
+    monkeypatch.setattr(_caps, "has_tensor_ops_matmul2d", probe)
+    assert _caps.kernel_gate() is True
+    assert probed == [], "kernel_gate() must not consult the compile_shader probe"
+
+
+# --- the compile_shader probe must verify numerics, not just compilation ----
+
+
+def test_tensor_ops_probe_requires_a_passing_numeric_self_check(monkeypatch):
+    """na_gemm.available() only proves the shader compiled. #25 is a machine where
+    a tensor_ops shader compiles and computes garbage, so conv_im2col -- the one
+    consumer still gated on this probe -- needs the numeric check, not the build."""
+    import sys
+    import types
+
+    monkeypatch.setattr(_caps, "_tensor_ops", None)
+    monkeypatch.setattr(_caps, "has_compile_shader", lambda: True)
+
+    import _patches
+
+    fake = types.ModuleType("_patches.na_gemm")
+    fake.available = lambda: True
+    fake.self_check_ok = lambda: False
+    # `from . import na_gemm` resolves through the parent package attribute once
+    # the real module has been imported, so both bindings have to be replaced.
+    monkeypatch.setitem(sys.modules, "_patches.na_gemm", fake)
+    monkeypatch.setattr(_patches, "na_gemm", fake, raising=False)
+
+    assert _caps.has_tensor_ops_matmul2d() is False
+
+
+def test_no_patch_seeds_the_global_rng():
+    """`torch.manual_seed()` inside a library is never right: it reseeds every
+    device for the whole host process. The capability probes and kernel
+    self-checks all need deterministic operands, which is what a local
+    torch.Generator is for -- scaled_mm_fp8's fp8 self-check runs lazily on the
+    *first fp8 matmul*, so seeding there lands in the middle of a render."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "_patches"
+    offenders = [
+        f"{p.relative_to(root.parent)}:{i}"
+        for p in sorted(root.rglob("*.py"))
+        for i, line in enumerate(p.read_text().splitlines(), 1)
+        if "torch.manual_seed(" in line and not line.lstrip().startswith("#")
+    ]
+    assert offenders == [], f"global RNG seeded by: {offenders}"

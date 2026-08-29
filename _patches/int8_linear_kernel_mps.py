@@ -141,8 +141,9 @@ def _self_check():
 def _verify():
     """The contract _caps.kernel_ready expects: build, warmup, then numerics.
 
-    Nothing short of this proves the kernel works — tier_b_ready() only compiles
-    na_gemm's bf16 shader, which shares no operand types with ours (#14).
+    Nothing short of this proves the kernel works. kernel_gate() only checks that
+    the chip has matrix units and that ninja exists; it says nothing about whether
+    int8_gemm.mm builds here or what it computes (#14, #25, #27).
     """
     return _ensure_kernel() is not None and _self_check()
 
@@ -306,10 +307,20 @@ def _try_int8_kernel_forward(self, input):
         w = self.weight
         if not isinstance(w, QuantizedTensor) or getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
             return None
+        # Offloaded weight (comfy parks it on CPU between uses): fall back to the
+        # comfy forward, which casts it in. Reaching _int8_linear_kernel with a
+        # CPU weight would throw in its own fallback and latch mark_kernel_failed,
+        # killing the kernel for the session over a transient condition.
+        if w.device.type != "mps":
+            return None
         if getattr(self, "_full_precision_mm", False):
             return None
-        if getattr(self, "comfy_force_cast_weights", False):
-            return None
+        # comfy_force_cast_weights on an int8 QuantizedTensor only means "storage
+        # dtype != compute dtype, cast at use" -- and for a quantized weight that
+        # cast IS the per-call W8A16 dequant/un-rotation this path exists to
+        # bypass, so it must not disqualify the kernel route. (MiniMax Music 3's
+        # text encoder sets it on every layer, which silently forced the slow
+        # path for the whole model.)
         if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
             return None
 
@@ -340,17 +351,149 @@ def _try_int8_kernel_forward(self, input):
         return None
 
 
+_DEQUANT_MODE = None
+
+
+def _dequant_enabled():
+    """Opt-in gate for once-at-load weight dequant: ASFP8_INT8_DEQUANT=1 enables,
+    subject to a >= 48 GiB total-RAM safety check; unset or off stays off.
+
+    Opt-in because the plain copy (~16 GB for an 8B int8 model) lands AFTER
+    comfy's model_management has budgeted around the loaded int8 size, so
+    auto-enabling near the threshold risks thrash/OOM comfy can't see coming."""
+    global _DEQUANT_MODE
+    if _DEQUANT_MODE is None:
+        import os
+        v = os.environ.get("ASFP8_INT8_DEQUANT", "").strip().lower()
+        _DEQUANT_MODE = False
+        if v in ("1", "on", "true"):
+            try:
+                import psutil
+                _DEQUANT_MODE = psutil.virtual_memory().total >= 48 * (1 << 30)
+                if not _DEQUANT_MODE:
+                    print(f"{TAG} ASFP8_INT8_DEQUANT=1 ignored: needs >= 48 GiB RAM "
+                          f"for the dequantised weight copy.")
+            except Exception:
+                _DEQUANT_MODE = False
+    return _DEQUANT_MODE
+
+
+def _maybe_dequant_weight(self, input):
+    """One-off per layer: replace an eligible int8 QuantizedTensor weight with its
+    dequantised (un-rotated) plain tensor in the compute dtype, resident on MPS.
+
+    Rationale: single-token AR decode is memory-bandwidth-bound, and every
+    quantised route (kernel W8A8 or comfy's per-call W8A16 dequant) pays a
+    per-call rotate/quant/rescale op chain whose MPS dispatch overhead dominates
+    at M=1..2 (measured 3-10x the matmul cost on MiniMax Music 3 AR decode).
+    Paying the dequant once and running single-dispatch F.linear is both faster
+    and numerically identical to comfy's stock W8A16 path. fp16 weights with a
+    different compute dtype get the same treatment: manual_cast otherwise copies
+    the full tensor every call (MiniMax's 134 MB audio_heads dominate a decode
+    profile through aten::copy_)."""
+    if getattr(self, "_asfp8_deq_done", False):
+        return
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        # Transient conditions (properties of this call's input) leave the flag
+        # unset so a later MPS-resident call can still dequantise. Everything
+        # past the flag is a stable property of the layer, decided once.
+        if not isinstance(input, torch.Tensor) or isinstance(input, QuantizedTensor):
+            return
+        if input.device.type != "mps":
+            return
+        # Half-precision compute only: an fp32 activation would balloon the
+        # dequantised copy to 2x the size the >= 48 GiB gate budgets for.
+        if input.dtype not in (torch.float16, torch.bfloat16):
+            return
+        # Offloaded weight: comfy is deliberately keeping it off-device, so
+        # dequantising would pull a bigger, full-precision copy onto the GPU and
+        # pin it there -- undoing the offload and inflating residency past what
+        # the >= 48 GiB gate budgeted for. Transient like the checks above, so
+        # the flag stays unset and a later resident call can still dequantise.
+        # _maybe_dequant_embedding already treats its weight this way.
+        w = getattr(self, "weight", None)
+        if w is None or getattr(w, "device", None) is None or w.device.type != "mps":
+            return
+        self._asfp8_deq_done = True
+        if getattr(self, "_full_precision_mm", False):
+            return
+        if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
+            return
+
+        if isinstance(w, QuantizedTensor):
+            if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
+                return
+            if getattr(w._params, "transposed", False):
+                return
+            plain = w.dequantize()
+        elif isinstance(w, torch.Tensor) and w.dtype == torch.float16 and w.dtype != input.dtype:
+            plain = w.detach()
+        else:
+            return
+        if plain.dtype != input.dtype:
+            plain = plain.to(input.dtype)
+        if plain.device.type != "mps":
+            plain = plain.to("mps")
+        self.weight = torch.nn.Parameter(plain.contiguous(), requires_grad=False)
+        b = getattr(self, "bias", None)
+        if isinstance(b, torch.Tensor) and not isinstance(b, QuantizedTensor) and b.dtype != input.dtype:
+            self.bias = torch.nn.Parameter(b.detach().to(device="mps", dtype=input.dtype), requires_grad=False)
+        self.comfy_force_cast_weights = False
+    except Exception as e:
+        # Latch on failure too: retrying an identical dequant every call would
+        # just repeat the error (and the print) for the rest of the session.
+        self._asfp8_deq_done = True
+        print(f"{TAG} weight dequant skipped ({e!r})")
+
+
+def _maybe_dequant_embedding(self, dtype_hint):
+    """One-off per Embedding: replace an int8 QuantizedTensor (or fp16) table with
+    a plain tensor in the compute dtype so per-call cast/dequant of the whole
+    table disappears (cast_bias_weight casts the full weight every lookup)."""
+    if getattr(self, "_asfp8_deq_done", False):
+        return
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        w = self.weight
+        # Off-MPS is transient (offload); leave the flag unset for a later call.
+        if w is None or w.device.type != "mps":
+            return
+        self._asfp8_deq_done = True
+        if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
+            return
+        # The hint comes from Embedding.forward's out_dtype (kwarg or first
+        # positional); anything that isn't a half-precision dtype is ignored,
+        # not trusted (same memory-budget reasoning as _maybe_dequant_weight).
+        if dtype_hint not in (torch.float16, torch.bfloat16):
+            dtype_hint = None
+        target = dtype_hint if dtype_hint is not None else torch.bfloat16
+        if isinstance(w, QuantizedTensor):
+            plain = w.dequantize().to(target)
+        elif isinstance(w, torch.Tensor) and w.dtype == torch.float16 and w.dtype != target:
+            plain = w.detach().to(target)
+        else:
+            return
+        self.weight = torch.nn.Parameter(plain.contiguous(), requires_grad=False)
+        self.comfy_force_cast_weights = False
+    except Exception as e:
+        self._asfp8_deq_done = True
+        print(f"{TAG} embedding dequant skipped ({e!r})")
+
+
 def install():
     global _installed, _orig_int8_linear
     if _installed:
         return
     if sys.platform != "darwin":
         return
-    # DEFAULT ON, gated on Tier B (Metal-4 tensor ops + ninja to build the ObjC++
+    # DEFAULT ON, gated on M5-class matrix units + ninja to build the ObjC++
     # extension). On unsupported HW the default resolves to OFF so we never attempt a
     # build; ASFP8_INT8_EXT=off force-disables, =1 forces the build attempt anyway.
     from . import _caps
-    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready):
+    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate):
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
@@ -381,6 +524,8 @@ def install():
                 orig_forward = linear_cls.forward
 
                 def forward(self, input, *args, **kwargs):
+                    if _dequant_enabled():
+                        _maybe_dequant_weight(self, input)
                     res = _try_int8_kernel_forward(self, input)
                     if res is not None:
                         return res
@@ -388,17 +533,49 @@ def install():
 
                 linear_cls.forward = forward
                 linear_cls._asfp8_int8_patched = True
+            emb_cls = getattr(cls, "Embedding", None)
+            if emb_cls is not None and not getattr(emb_cls, "_asfp8_int8_patched", False):
+                orig_emb_forward = emb_cls.forward
+
+                def emb_forward(self, input, *args, **kwargs):
+                    if _dequant_enabled():
+                        hint = kwargs.get("out_dtype", args[0] if args else None)
+                        _maybe_dequant_embedding(self, hint)
+                    return orig_emb_forward(self, input, *args, **kwargs)
+
+                emb_cls.forward = emb_forward
+                emb_cls._asfp8_int8_patched = True
             return cls
 
         wrapped_factory._asfp8_wrapped = True
         ops.mixed_precision_ops = wrapped_factory
+
+        # down_proj is invoked via ops.linear_input_act (fused swiglu path), which
+        # reads linear.weight directly and never calls Linear.forward -- so the
+        # once-at-load dequant must hook here too or those layers stay int8.
+        # getattr, not attribute access: a comfy without linear_input_act must not
+        # abort install() here -- mixed_precision_ops is already wrapped above and
+        # the except below would leave _installed False with a misleading message.
+        orig_lia = getattr(ops, "linear_input_act", None)
+        if orig_lia is not None and not getattr(orig_lia, "_asfp8_deq_wrapped", False):
+            def linear_input_act(linear, x, input_act):
+                if _dequant_enabled():
+                    _maybe_dequant_weight(linear, x)
+                return orig_lia(linear, x, input_act)
+
+            linear_input_act._asfp8_deq_wrapped = True
+            ops.linear_input_act = linear_input_act
     except Exception as e:
         print(f"{TAG} could not wrap mixed_precision_ops: {e!r}")
         return
 
     _installed = True
+    deq = "on" if _dequant_enabled() else "off"
     print(
-        f"{TAG} INT8 convrot Linear routed through bit-exact Metal kernel on MPS "
-        f"(clean W8A8: rotate->per-row quant->int8 matmul; weight-only fp32 "
-        f"dequant/un-rotation bypassed). Kernel builds on first int8 layer, not now."
+        f"{TAG} INT8 convrot Linear seam installed on MPS (clean W8A8: "
+        f"rotate->per-row quant->int8 matmul; weight-only fp32 dequant/un-rotation "
+        f"bypassed). The kernel builds and runs its bit-exact self-check on the "
+        f"first int8 layer, and only routes if that passes. "
+        f"Once-at-load weight dequant: {deq} (opt-in: ASFP8_INT8_DEQUANT=1, "
+        f"needs >= 48 GiB RAM)."
     )

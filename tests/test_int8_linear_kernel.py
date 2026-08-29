@@ -25,7 +25,7 @@ from _patches import _caps
 # compiling (issue #13) showed up as 34 silent skips. ASFP8_INT8_EXT=0 still turns
 # them off, exactly as it turns the feature off.
 _int8_enabled = torch.backends.mps.is_available() and _caps.resolve(
-    "ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready
+    "ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate
 )
 
 
@@ -64,7 +64,7 @@ def _clear_int8_kernel_memo():
 def test_install_noop_when_explicitly_off(monkeypatch):
     """ASFP8_INT8_EXT=off force-disables even on capable hardware."""
     from _patches import _caps
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_INT8_EXT", "off")
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
@@ -75,7 +75,7 @@ def test_install_noop_when_not_capable(monkeypatch):
     """DEFAULT ON but gated: unsupported hardware -> no build attempt, stays inert."""
     from _patches import _caps
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: False)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: False)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     patch.install()
     assert patch._installed is False
@@ -92,7 +92,7 @@ def test_install_does_not_build_the_extension(monkeypatch):
     """install() runs at import time: it may wire the seam, never build the kernel."""
     from _patches import _caps
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setattr(patch, "_installed", False, raising=False)
     monkeypatch.setattr(patch, "_kernel", None, raising=False)
     monkeypatch.setattr(patch, "_kernel_tried", False, raising=False)
@@ -173,7 +173,7 @@ def test_loader_gives_up_when_the_build_stalls(monkeypatch):
         pytest.skip("needs the Metal toolchain + ninja to reach the build call")
 
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
-    monkeypatch.setattr(_caps, "tier_b_ready", lambda: True)
+    monkeypatch.setattr(_caps, "kernel_gate", lambda: True)
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.5")
     monkeypatch.setattr(loader, "_tried", False, raising=False)
     monkeypatch.setattr(loader, "_mod", None, raising=False)
@@ -555,9 +555,9 @@ def test_int8_kernel_compiles_when_enabled():
 def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
     """A kernel that fails verification must cost one attempt, not one per layer.
 
-    This is the #14 gap: tier_b_ready() green-lights int8 off na_gemm's bf16
-    probe, so a kernel that cannot build still reaches the forward path. The
-    per-kernel memo is what stops that becoming a per-call rebuild.
+    This is the #14 gap: kernel_gate() clears int8 on chip + toolchain alone, so
+    a kernel that cannot build still reaches the forward path. The per-kernel
+    memo is what stops that becoming a per-call rebuild.
     """
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps
@@ -628,3 +628,288 @@ def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
 
     assert len(calls) == 1, f"kernel re-entered after a dispatch failure ({len(calls)}x)"
     assert _caps._kernel_ready["int8"] is False
+
+
+# --- the hardware gate: issues #25 and #27 ----------------------------------
+#
+# One defect, reported from both ends. The old gate (kernel_gate) asked
+# torch.mps.compile_shader to build na_gemm's bf16 shader, which measures the
+# torch build's default MSL rather than the GPU. It answered yes on the M4 Pro of
+# #25, where int8_gemm.mm builds and returns garbage, and no on the M5 Max of
+# #27, where the very same kernel is bit-exact and 3.17x faster.
+
+
+def test_install_is_inert_on_a_pre_m5_chip(monkeypatch):
+    """#25: on M1-M4 there are no Neural Accelerators, so the tensor-ops kernel
+    dispatches and computes garbage. _self_check() catches it -- but only after
+    every cold start has paid a ~7s ninja+clang build for a kernel that is then
+    discarded. A chip we can positively name as pre-M5 must not reach the seam.
+    """
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+
+    patch.install()
+
+    assert patch._installed is False
+
+
+def _stub_comfy_ops(monkeypatch):
+    """Stand in for `comfy.ops`, which isn't importable from the repo root.
+
+    install() wraps ops.mixed_precision_ops, so without this the gate tests can
+    never observe a completed install -- install() bails on the import first.
+    """
+    import sys
+    import types
+
+    class _Linear:
+        def forward(self, x):
+            return x
+
+    def mixed_precision_ops(*a, **k):
+        return type("Ops", (), {"Linear": type("Linear", (_Linear,), {})})
+
+    comfy = types.ModuleType("comfy")
+    ops = types.ModuleType("comfy.ops")
+    ops.mixed_precision_ops = mixed_precision_ops
+    comfy.ops = ops
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.ops", ops)
+    return ops
+
+
+def test_install_survives_a_failing_compile_shader_probe(monkeypatch):
+    """#27: macOS 26.6 + torch 2.10 on an M5 Max cannot compile na_gemm through
+    compile_shader ("use of undeclared identifier 'mpp'"), while int8_gemm.mm
+    builds fine via newLibraryWithSource at MSL 4.0 and passes its bit-exact
+    self-check. The probe's verdict must not disable the kernel."""
+    _stub_comfy_ops(monkeypatch)
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(_caps, "has_tensor_ops_matmul2d", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: None, raising=False)
+
+    patch.install()
+
+    assert patch._installed is True
+
+
+def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys):
+    """#25's second cost: the startup line announced the kernel as routing before
+    anything had been built or numerically checked, and the retraction landed one
+    line deep in the sampling log. The banner must promise a check, not a result.
+    """
+    _stub_comfy_ops(monkeypatch)
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: None, raising=False)
+
+    patch.install()
+
+    out = capsys.readouterr().out
+    assert "routed through" not in out, f"banner claims a result it hasn't got: {out}"
+    assert "self-check" in out.lower(), f"banner doesn't mention verification: {out}"
+
+
+@requires_mps
+def test_force_cast_weights_does_not_disqualify_the_kernel(monkeypatch):
+    """comfy sets comfy_force_cast_weights on int8 layers where storage dtype !=
+    compute dtype; for a QuantizedTensor that cast is the per-call W8A16 dequant
+    this kernel bypasses, so the flag must not push the layer off the kernel route
+    (regression: it silently forced MiniMax Music 3's whole TE onto the slow path)."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_kernel", object(), raising=False)
+    monkeypatch.setattr(patch, "_kernel_tried", True, raising=False)
+    monkeypatch.setattr(patch, "_self_checked", True, raising=False)
+    monkeypatch.setattr(patch, "_self_ok", True, raising=False)
+
+    out = torch.full((1,), 7.0)
+    monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: out, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+    assert patch._try_int8_kernel_forward(Holder(), x) is out, (
+        "comfy_force_cast_weights pushed an int8 layer off the kernel route"
+    )
+
+
+@requires_mps
+def test_dequant_retries_after_a_transient_off_mps_call(monkeypatch):
+    """An off-MPS first call must not latch _asfp8_deq_done: the same layer can be
+    called later with MPS input (offload/warmup) and should still dequantise then."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    layer = Holder()
+    layer.weight = qw
+    layer.bias = None
+
+    patch._maybe_dequant_weight(layer, torch.randn(1, 128, dtype=torch.bfloat16))
+    assert isinstance(layer.weight, QuantizedTensor), "dequantised from a CPU-input call"
+    assert not getattr(layer, "_asfp8_deq_done", False), "off-MPS call latched the flag"
+
+    x = torch.randn(1, 128, dtype=torch.bfloat16, device="mps")
+    patch._maybe_dequant_weight(layer, x)
+    assert not isinstance(layer.weight, QuantizedTensor), "MPS call did not dequantise"
+    assert layer.weight.dtype == torch.bfloat16
+    assert layer.weight.device.type == "mps"
+    assert layer._asfp8_deq_done is True
+
+    ref = qw.dequantize().to(torch.bfloat16)
+    assert torch.equal(layer.weight.detach().cpu(), ref.cpu()), (
+        "dequantised weight differs from QuantizedTensor.dequantize()"
+    )
+
+
+# --- the ASFP8_INT8_DEQUANT gate: the switch people actually touch --------------
+
+
+def _resolve_dequant_gate(monkeypatch, env, total_ram):
+    import psutil
+
+    class _VM:
+        total = total_ram
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", None, raising=False)
+    if env is None:
+        monkeypatch.delenv("ASFP8_INT8_DEQUANT", raising=False)
+    else:
+        monkeypatch.setenv("ASFP8_INT8_DEQUANT", env)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: _VM())
+    return patch._dequant_enabled()
+
+
+def test_dequant_gate_is_opt_in(monkeypatch):
+    """Unset stays OFF regardless of RAM: the plain copy lands after comfy's
+    model_management has already budgeted around the int8 size."""
+    assert _resolve_dequant_gate(monkeypatch, None, 128 * (1 << 30)) is False
+
+
+def test_dequant_gate_off_stays_off(monkeypatch):
+    assert _resolve_dequant_gate(monkeypatch, "off", 128 * (1 << 30)) is False
+
+
+def test_dequant_gate_on_with_enough_ram(monkeypatch):
+    assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
+
+
+def test_dequant_gate_ram_check_overrides_opt_in(monkeypatch, capsys):
+    """=1 on a small box is refused (safety), and says so."""
+    assert _resolve_dequant_gate(monkeypatch, "1", 16 * (1 << 30)) is False
+    assert "48 GiB" in capsys.readouterr().out
+
+
+def test_dequant_gate_memoises(monkeypatch):
+    """The gate resolves once; later env changes don't flip a live session."""
+    assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
+    monkeypatch.setenv("ASFP8_INT8_DEQUANT", "off")
+    assert patch._dequant_enabled() is True
+
+
+@requires_mps
+def test_offloaded_cpu_weight_does_not_latch_the_kernel_off(monkeypatch):
+    """comfy parks weights on CPU between uses and casts them back in via
+    comfy_force_cast_weights. Now that the force-cast bail is gone (#26), such a
+    layer reaches this path -- and if it got as far as _int8_linear_kernel, that
+    function's own fallback would hand an MPS input and a CPU weight to the eager
+    int8_linear, throw, and latch mark_kernel_failed. One offloaded layer would
+    then disable int8 for the rest of the session, over a transient condition.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+    from _patches import _caps
+
+    qw_cpu = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    )
+    assert qw_cpu.device.type == "cpu", "fixture must stay off-device"
+
+    class Holder:
+        weight = qw_cpu
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    x = torch.randn(8, 128, dtype=torch.bfloat16, device="mps")
+
+    assert patch._try_int8_kernel_forward(Holder(), x) is None
+    assert _caps._kernel_ready.get("int8") is not False, (
+        "an offloaded weight latched the int8 kernel off for the session"
+    )
+
+
+@requires_mps
+def test_dequant_leaves_an_offloaded_weight_on_the_cpu(monkeypatch):
+    """comfy parks weights on CPU to keep them out of memory. Dequantising one
+    pulls a bigger, full-precision copy onto the GPU and pins it there, undoing
+    the offload and inflating residency past what the >= 48 GiB gate budgeted for.
+
+    The flag must stay unset too: being offloaded is transient, so the layer
+    should still dequantise once comfy brings the weight back -- the same
+    treatment _maybe_dequant_embedding already gives this case.
+    """
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)
+
+    qw_cpu = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    )
+    assert qw_cpu.device.type == "cpu", "fixture must stay offloaded"
+
+    class Holder:
+        _full_precision_mm = False
+        comfy_force_cast_weights = True
+        weight_function = []
+        bias_function = []
+
+    layer = Holder()
+    layer.weight = qw_cpu
+    layer.bias = None
+
+    x = torch.randn(1, 128, dtype=torch.bfloat16, device="mps")
+    patch._maybe_dequant_weight(layer, x)
+
+    assert isinstance(layer.weight, QuantizedTensor), "offloaded weight was dequantised"
+    assert layer.weight.device.type == "cpu", "offloaded weight was pulled onto the GPU"
+    assert not getattr(layer, "_asfp8_deq_done", False), (
+        "a transient offload latched the layer out of ever dequantising"
+    )

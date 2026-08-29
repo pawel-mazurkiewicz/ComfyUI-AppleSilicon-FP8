@@ -1,7 +1,7 @@
 """JIT loader for the bit-exact int8 matmul2d MPS extension.
 
 Builds _patches/int8_ext/int8_gemm.mm via torch.utils.cpp_extension.load (ObjC++,
-Metal 4.1). DEFAULT ON where capable (Tier B: M5 / Metal 4.1 + ninja, via the shared
+Metal 4.0). DEFAULT ON where capable (M5-class matrix units + ninja, via the shared
 three-state gate); guarded, cached; returns None on any failure so callers fall back
 to the fp32/bf16 _int_mm path.
 
@@ -50,10 +50,10 @@ def module():
         return _mod
     _tried = True
 
-    # DEFAULT ON where capable (Tier B: M5/Metal-4.1 + ninja). Three-state gate:
-    # unset -> on iff tier_b_ready; ASFP8_INT8_EXT=off -> off; =1 -> force the build.
+    # DEFAULT ON where capable (M5-class matrix units + ninja). Three-state gate:
+    # unset -> on iff kernel_gate; ASFP8_INT8_EXT=off -> off; =1 -> force the build.
     from .. import _caps
-    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.tier_b_ready):
+    if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate):
         return None
     if shutil.which("xcrun") is None:
         print("[int8_ext] no Metal toolchain (xcrun); int8-native disabled.")

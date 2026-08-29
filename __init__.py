@@ -26,7 +26,7 @@ Patches applied:
  13. int8-fast Linear via MPS bf16 GEMM           (INT8 wide-batch matmul was 3-5x too slow in fp32 _int_mm)
  14. MLX-backed TextGenerate on MPS (Qwen3-VL + Gemma3)  (Krea2 ~50s & LTX2 ~13h eager generate -> MLX)
  16. strided FP8 ops -> CPU on MPS (global)        (NVFP4/MXFP8 quant+dequant: reshape/contiguous of fp8 crashes MPS)
- 17. INT8 W8A8 via bit-exact Metal kernel on MPS   (DEFAULT ON, gated on M5/Metal-4.1 + ninja; ASFP8_INT8_EXT=off
+ 17. INT8 W8A8 via bit-exact Metal kernel on MPS   (DEFAULT ON, gated on M5+ matrix units + ninja; ASFP8_INT8_EXT=off
                                                     to disable: int8 matmul ~1.75x over bf16, bypasses per-step
                                                     fp32 weight dequant/un-rotation; Cider-derived kernel)
  18. fused RMSNorm+modulation+residual on MPS  (DEFAULT ON, gated on compile_shader; ASFP8_FUSED_NORM=off to disable:

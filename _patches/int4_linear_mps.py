@@ -141,6 +141,13 @@ def _w4a16_linear_mps(x, qweight, wscales, bias, convrot_groupsize, mod):
     x_rot = mod._rotate_activation(x2d, h, convrot_groupsize)
 
     from . import _caps
+    # No chip pre-filter here, unlike int8/fp8. int4 is opt-in: int4_ext's loader
+    # returns None before building unless ASFP8_INT4_EXT=1, so an unset install
+    # never reaches a build on any hardware and there is nothing for a pre-filter
+    # to save. The only case it could reach is a user who explicitly asked for the
+    # kernel, and an explicit env var is exactly what _caps promises will beat a
+    # probe -- gating it would lock that user out. The self-check still rejects a
+    # wrong result on pre-M5 hardware, which is #25's documented outcome.
     kernel = _load_kernel() if _caps.kernel_ready("int4", _verify) else None
     if kernel is not None:
         try:
