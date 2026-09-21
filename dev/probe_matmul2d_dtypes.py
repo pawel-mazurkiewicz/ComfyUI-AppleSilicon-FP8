@@ -318,7 +318,7 @@ def build_extension():
         mod = cpp_load(
             name="asfp8_probe_host",
             sources=[src_path],
-            extra_cflags=["-std=c++17", "-ObjC++"],
+            extra_cflags=["-ObjC++"],
             extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
             build_directory=_BUILD_DIR,
             verbose=False,

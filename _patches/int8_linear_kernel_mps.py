@@ -558,10 +558,10 @@ def install():
         # the except below would leave _installed False with a misleading message.
         orig_lia = getattr(ops, "linear_input_act", None)
         if orig_lia is not None and not getattr(orig_lia, "_asfp8_deq_wrapped", False):
-            def linear_input_act(linear, x, input_act):
+            def linear_input_act(linear, x, input_act, *args, **kwargs):
                 if _dequant_enabled():
                     _maybe_dequant_weight(linear, x)
-                return orig_lia(linear, x, input_act)
+                return orig_lia(linear, x, input_act, *args, **kwargs)
 
             linear_input_act._asfp8_deq_wrapped = True
             ops.linear_input_act = linear_input_act

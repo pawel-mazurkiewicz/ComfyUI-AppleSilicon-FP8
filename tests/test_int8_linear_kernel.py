@@ -725,6 +725,43 @@ def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys)
     assert "self-check" in out.lower(), f"banner doesn't mention verification: {out}"
 
 
+def test_linear_input_act_wrapper_forwards_the_extended_signature(monkeypatch):
+    """#36: the wrapper must accept ComfyUI v0.36's extended signature."""
+    ops = _stub_comfy_ops(monkeypatch)
+    calls = []
+
+    def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
+                         residual=None, residual_scale=None):
+        calls.append((input_act, act_weight, act_eps, residual, residual_scale))
+        return x
+
+    ops.linear_input_act = linear_input_act
+    monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
+    monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
+    monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M5 Max")
+    monkeypatch.setattr(_caps, "ninja_available", lambda: True)
+    monkeypatch.setattr(_caps, "is_mps", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(patch, "_installed", False, raising=False)
+    monkeypatch.setattr(patch, "_load_kernel", lambda: None, raising=False)
+    monkeypatch.setattr(patch, "_dequant_enabled", lambda: False)
+
+    patch.install()
+    assert ops.linear_input_act is not linear_input_act, "the seam was never wrapped"
+
+    x = torch.zeros(2, 4)
+    ops.linear_input_act(object(), x, "rms_norm", "norm_w", 1e-6)
+    ops.linear_input_act(object(), x, "rms_norm", "norm_w", 1e-6,
+                         residual="res", residual_scale="scale")
+    ops.linear_input_act(object(), x, "swiglu")
+
+    assert calls == [
+        ("rms_norm", "norm_w", 1e-6, None, None),
+        ("rms_norm", "norm_w", 1e-6, "res", "scale"),
+        ("swiglu", None, 0.0, None, None),
+    ]
+
+
 @requires_mps
 def test_force_cast_weights_does_not_disqualify_the_kernel(monkeypatch):
     """comfy sets comfy_force_cast_weights on int8 layers where storage dtype !=

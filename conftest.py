@@ -1,3 +1,8 @@
+import os
+
+# before the torch import: torch 2.14 reads it once at init
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import pytest
 import torch
 

@@ -106,7 +106,7 @@ def module():
             prepare=_prepare,
             name="asfp8_int8_gemm",
             sources=[src],
-            extra_cflags=["-std=c++17", "-ObjC++"],
+            extra_cflags=["-ObjC++"],  # no -std: torch sets its own
             extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
             build_directory=build_dir,
             verbose=False,
