@@ -726,11 +726,7 @@ def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys)
 
 
 def test_linear_input_act_wrapper_forwards_the_extended_signature(monkeypatch):
-    """#36: ComfyUI v0.36 grew linear_input_act to (linear, x, input_act,
-    act_weight, act_eps, residual, residual_scale) for fused pre-norm blocks, and
-    the MiniMax H3 VAE calls it with five positional args. The dequant wrapper
-    pinned the old three, so every decode died with a TypeError after sampling.
-    """
+    """#36: the wrapper must accept ComfyUI v0.36's extended signature."""
     ops = _stub_comfy_ops(monkeypatch)
     calls = []
 

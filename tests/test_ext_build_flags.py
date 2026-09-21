@@ -1,9 +1,4 @@
-"""The Metal-extension builds must leave the C++ standard to torch.
-
-cpp_extension puts its own -std (c++17 on torch 2.11, c++20 on 2.14) ahead of
-extra_cflags, so a -std of ours lands after it and wins. A hardcoded c++17 broke
-all three builds on torch 2.14, whose headers #error below C++20 (issue #34).
-"""
+"""The Metal-extension builds must leave the C++ standard to torch (#34)."""
 import importlib
 
 import pytest
