@@ -51,7 +51,7 @@ def load():
         _mod = cpp_load(
             name="asfp8_fp8_matmul2d",
             sources=[src],
-            extra_cflags=["-std=c++17", "-ObjC++"],
+            extra_cflags=["-ObjC++"],
             extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
             verbose=True,
         )
