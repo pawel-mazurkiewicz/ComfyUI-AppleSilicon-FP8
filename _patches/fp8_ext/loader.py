@@ -111,7 +111,10 @@ def module():
             prepare=_prepare,
             name="asfp8_fp8_matmul2d",
             sources=[src],
-            extra_cflags=["-std=c++17", "-ObjC++"],
+            # No -std here: cpp_extension already passes the standard its own headers
+            # need (c++17 on torch 2.11, c++20 on 2.14), and ours would land after
+            # it and win -- which is what broke the build on torch 2.14 (#34).
+            extra_cflags=["-ObjC++"],
             extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
             build_directory=build_dir,
             verbose=False,

@@ -35,7 +35,7 @@ def load_tune():
     try:
         cpp.TORCH_LIB_PATH = i4_loader._nospace_torch_lib()
         return cpp_load(name="asfp8_int4_tune", sources=[src],
-                        extra_cflags=["-std=c++17", "-ObjC++"],
+                        extra_cflags=["-ObjC++"],
                         extra_ldflags=["-framework", "Metal", "-framework", "Foundation"],
                         build_directory=build_dir, verbose=False)
     finally:

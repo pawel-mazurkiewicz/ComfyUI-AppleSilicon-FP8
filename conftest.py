@@ -1,3 +1,9 @@
+import os
+
+# Before torch loads: 2.14 reads this once at init, so the per-test setdefault in
+# the int8 reference comparisons comes too late there and eager _int_mm raises.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import pytest
 import torch
 
