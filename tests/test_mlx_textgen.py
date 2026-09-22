@@ -194,8 +194,7 @@ class _FakeGemmaSub:
 
 
 class _FakeSPieceTok:
-    """comfy SentencePiece tokenizer: decode(ids, skip_special_tokens=), no .encode,
-    encode via __call__ -> {'input_ids': [...]}."""
+    """comfy's SentencePiece tokenizer: no .encode, so encoding goes through __call__."""
     def decode(self, ids, skip_special_tokens=False):
         return "GEMMA_TEMPLATED"
     def __call__(self, text):

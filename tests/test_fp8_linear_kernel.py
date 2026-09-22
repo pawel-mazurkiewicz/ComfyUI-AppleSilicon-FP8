@@ -44,19 +44,16 @@ def test_loader_memo_resets_between_flag_states(monkeypatch):
     assert loader.module() is None
     monkeypatch.setenv("ASFP8_FP8_NATIVE", "1")
     _reset_loader(monkeypatch)
-    # On non-MPS/no-toolchain CI this returns None via a *different* branch (xcrun/build),
-    # NOT the env gate; that is still correct. On this M5 it builds and returns a module.
-    _ = loader.module()  # must not raise; value depends on host
+    _ = loader.module()  # must not raise; the value depends on the host
 
 
-# --- Task 3: unit guards (no kernel needed; run everywhere) ---------------------
+# --- unit guards: no kernel needed, so these run everywhere ---------------------
 from _patches import fp8_linear_kernel_mps as patch
 
 
 @pytest.fixture(autouse=True)
 def _clear_fp8_kernel_memo():
-    """_caps.kernel_ready memoises per process, so one test's verdict would
-    otherwise decide every later test's gate."""
+    """Clear _caps.kernel_ready's per-process memo, or one test's verdict decides the rest."""
     from _patches import _caps
     _caps._kernel_ready.pop("fp8", None)
     yield
@@ -165,7 +162,7 @@ def test_eligibility_rejects_non_fp8_weight(monkeypatch):
 
 
 def test_self_check_not_run_on_ineligible(monkeypatch):
-    # BLOCKER 2 regression guard: a non-MPS/non-fp8 layer must NOT trigger the self-check.
+    # a non-MPS/non-fp8 layer must not trigger the self-check
     monkeypatch.setattr(patch, "_kernel", object(), raising=False)
     monkeypatch.setattr(patch, "_self_checked", False, raising=False)
     calls = {"n": 0}
@@ -178,14 +175,12 @@ def test_self_check_not_run_on_ineligible(monkeypatch):
     assert calls["n"] == 0, "self-check ran on an ineligible layer (BLOCKER 2 regression)"
 
 
-# --- Task 4: REAL spy tests (kernel really ran AND wrapper dispatched native) -----
-# Gated on ASFP8_FP8_NATIVE=1 + MPS (builds the Metal lib).
+# --- spy tests: the kernel really ran AND the wrapper dispatched native ---------
 from _patches import _caps
 from _patches import fp8_linear_kernel_mps as _fp8patch
 
-# Run whenever the node ITSELF would use the kernel here -- same gate production
-# uses, so a kernel that stops compiling surfaces as a failure rather than a
-# silent skip (issue #13). ASFP8_FP8_NATIVE=0 turns them off with the feature.
+# the same gate production uses, so a kernel that stops compiling surfaces as a
+# failure rather than a silent skip
 _fp8_enabled = torch.backends.mps.is_available() and _caps.resolve(
     "ASFP8_FP8_NATIVE", default_on=True, cap=_caps.kernel_gate
 )
@@ -215,8 +210,7 @@ def test_fp8_kernel_compiles_when_enabled():
         "fp8 Metal library does not compile on this machine — the kernel is inert"
     )
 
-# MPS cannot cast bf16->fp8, so real fp8 QuantizedTensors are built on CPU then moved.
-# This comfy_kitchen registers the e4m3 layout as "TensorCoreFP8Layout".
+# MPS cannot cast bf16->fp8, so real fp8 QuantizedTensors are built on CPU then moved
 _FP8_LAYOUT = "TensorCoreFP8Layout"
 
 
@@ -243,7 +237,7 @@ def test_native_matches_ground_truth(monkeypatch):
 
 @requires_fp8_native
 def test_native_per_channel_scale(monkeypatch):
-    # Exercise the [N] scale branch (resolves OQ#1 in code regardless of Task -1 finding).
+    # the [N] per-channel scale branch
     from _patches.fp8_ext import loader
     from _patches._common import decode_fp8
     mod = loader.module(); assert mod is not None; mod.warmup()
@@ -261,10 +255,10 @@ def test_native_per_channel_scale(monkeypatch):
 
 @requires_fp8_native
 def test_wrapper_dispatches_native_not_fallback(monkeypatch):
-    """End-to-end SPY: build a REAL QuantizedTensor fp8 weight, monkeypatch
-    _fp8_linear_kernel to a sentinel AND the captured orig_forward to RAISE.
-    If Linear.forward returns the sentinel, the native path dispatched; if the fallback
-    ran, the test ERRORS (orig_forward raises) instead of silently passing."""
+    """Linear.forward dispatches the native path on a real fp8 QuantizedTensor weight.
+
+    orig_forward is poisoned, so taking the fallback errors instead of passing quietly.
+    """
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches.fp8_ext import loader
     mod = loader.module(); assert mod is not None
@@ -276,8 +270,7 @@ def test_wrapper_dispatches_native_not_fallback(monkeypatch):
     monkeypatch.setattr(patch, "_fp8_linear_kernel",
                         lambda *a, **k: SENTINEL, raising=False)
 
-    # Build a real fp8 QuantizedTensor weight on CPU (MPS can't cast bf16->fp8), then
-    # move to MPS so _qdata is MPS-resident fp8 e4m3 (layout_cls starts "TensorCoreFP8").
+    # built on CPU because MPS can't cast bf16->fp8, then moved
     N, K = 8192, 8192
     wf = (torch.randn(N, K) * 0.3).to(torch.bfloat16)
     qw = QuantizedTensor.from_float(wf, _FP8_LAYOUT, scale=torch.tensor(1.0))
@@ -310,12 +303,7 @@ def test_wrapper_dispatches_native_not_fallback(monkeypatch):
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
 def test_failed_build_short_circuits_before_the_range_guard(monkeypatch):
-    """Once the build is known to have failed, an eligible layer must bail early.
-
-    The fp16 range guard is a full-tensor amax plus a device sync, and it sits
-    ahead of _ensure_kernel(), so without a top-level short circuit every
-    eligible fp8 Linear pays it on every step for the rest of the session.
-    """
+    """A known-failed build bails ahead of the range guard, which costs an amax and a sync."""
     QuantizedTensor = pytest.importorskip("comfy_kitchen.tensor").QuantizedTensor
     from _patches import fp8_linear_kernel_mps as patch
 

@@ -59,7 +59,7 @@ def test_reshape_after_transpose_fp8_mps():
     fs.install()
     x = torch.arange(512, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(4, 128).to("mps")
     blocks = x.reshape(-1, 4, 32, 4).transpose(1, 2)          # non-contiguous fp8 on mps
-    out = blocks.reshape(-1, 32, 16)                          # used to raise "Undefined type Float8_e4m3fn"
+    out = blocks.reshape(-1, 32, 16)                          # used to raise on fp8
     assert out.device.type == "mps" and out.dtype == torch.float8_e4m3fn
     ref = blocks.cpu().reshape(-1, 32, 16)
     assert torch.equal(out.cpu().view(torch.uint8), ref.view(torch.uint8))  # bit-exact

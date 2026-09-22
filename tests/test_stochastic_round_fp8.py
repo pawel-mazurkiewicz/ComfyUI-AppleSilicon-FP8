@@ -1,16 +1,8 @@
-"""Tests for patch #7: FP8 re-quant on MPS (LoRA applied to an fp8 base model).
+"""Tests for patch #7: FP8 re-quant on MPS (LoRA applied to an fp8 base model, #29).
 
-Issue #29: loading an fp8 DiT with a LoRA took 80-200s, while the same model with
-no LoRA loaded fast and int8 convrot was unaffected. LoRA application re-quantises
-every weight it touches, and this patch was sending each of those to the CPU in
-full -- because ONE operation inside the re-quant, the final float->fp8 cast, has
-no MPS kernel. Patch #8 (tensor_to_fp8) already routes exactly that cast via a
-LUT/CPU hop, so the rest of the maths can stay on the GPU. Measured 5.6x at
-per-weight granularity (11.3 -> 2.0 ms/weight), bit-exact.
-
-The CPU round-trip has to stay reachable: comfy's own fallback implementation
-writes through `output[i:].copy_(...)`, a strided fp8 copy that patch #8 does not
-cover (it wraps `.to`, not `copy_`).
+Only the final float->fp8 cast lacks an MPS kernel, and patch #8 already routes that, so
+the rest stays on the GPU. The CPU round-trip has to stay reachable for comfy's own
+fallback, which writes through a strided fp8 copy_ that patch #8 does not wrap.
 """
 import torch
 
@@ -43,8 +35,7 @@ def _recorder(fail_on_mps=False):
 
 @requires_mps
 def test_native_mps_path_is_preferred():
-    """The whole point of #29: don't ship the tensor to the CPU when the GPU can
-    do the maths and patch #8 can handle the one unsupported cast."""
+    """The native MPS path is preferred over the CPU round-trip (#29)."""
     original = _recorder()
     x = torch.randn(256, device="mps")
 
@@ -56,8 +47,8 @@ def test_native_mps_path_is_preferred():
 
 @requires_mps
 def test_falls_back_to_the_cpu_round_trip_when_native_raises():
-    """comfy's own fallback implementation writes through a strided fp8 copy_,
-    which patch #8 doesn't cover -- that path still needs the CPU hop."""
+    """A raising native path falls back to the CPU round-trip, which comfy's own
+    implementation still needs for its strided fp8 copy_."""
     original = _recorder(fail_on_mps=True)
     x = torch.randn(256, device="mps")
 
@@ -70,8 +61,7 @@ def test_falls_back_to_the_cpu_round_trip_when_native_raises():
 
 @requires_mps
 def test_a_failed_native_path_is_not_retried_per_weight():
-    """A LoRA re-quantises every weight it touches. Re-raising and re-catching on
-    each one would put the exception cost back on the hot path #29 is about."""
+    """A failed native path is latched, not retried per weight (#29)."""
     original = _recorder(fail_on_mps=True)
     x = torch.randn(256, device="mps")
 
@@ -95,8 +85,7 @@ def test_non_fp8_targets_are_passed_straight_through():
 
 @requires_mps
 def test_native_requant_is_bit_exact_vs_the_cpu_round_trip():
-    """The anchor for the whole change: moving the maths back onto the GPU must
-    not move the numbers. Compared byte-for-byte in the stored fp8 encoding."""
+    """The native re-quant is bit-exact against the CPU round-trip, in the fp8 encoding."""
     import comfy_kitchen.backends.eager.quantization as q
     from _patches import tensor_to_fp8
 
@@ -123,9 +112,7 @@ def test_native_requant_is_bit_exact_vs_the_cpu_round_trip():
     RuntimeError("MPS backend out of memory (MPS allocated: 90.00 GB)"),
 ])
 def test_a_transient_oom_does_not_condemn_the_session(exc):
-    """Memory pressure is not a missing kernel. Latching the whole session onto
-    the 4.6x-slower path because one weight hit the allocator would be the same
-    silent regression #29 was -- the next weight must try the GPU again."""
+    """A transient OOM doesn't latch the session off the GPU: the next weight retries."""
     calls = []
 
     def original(value, dtype, seed=0):

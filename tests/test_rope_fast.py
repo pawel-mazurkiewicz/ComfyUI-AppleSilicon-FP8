@@ -28,7 +28,7 @@ def _shapes():
 
 
 # ---------------------------------------------------------------------------
-# Task 2 — interleaved kernel vs REAL eager
+# interleaved kernel vs real eager
 # ---------------------------------------------------------------------------
 @mps
 @pytest.mark.parametrize("B,H,L,D", _shapes())
@@ -53,7 +53,7 @@ def test_interleaved_matches_real_eager(B, H, L, D, dtype, atol, rtol):
 
 
 # ---------------------------------------------------------------------------
-# Task 3 — split-half kernel vs REAL eager
+# split-half kernel vs real eager
 # ---------------------------------------------------------------------------
 @mps
 @pytest.mark.parametrize("B,H,L,D", _shapes())
@@ -75,12 +75,11 @@ def test_split_half_matches_real_eager(B, H, L, D, dtype, atol, rtol):
 
 
 # ---------------------------------------------------------------------------
-# Task 4 — pair wrappers, cross-length, real public-API dispatch proof
+# pair wrappers, cross-length, real public-API dispatch
 # ---------------------------------------------------------------------------
 @mps
 def test_pair_cross_length():
-    """xq (Lq) and xk (Lk) share one table; each slices its own prefix (real-eager parity).
-    Per-call trace must show BOTH single-tensor calls took the kernel (MAJOR 5)."""
+    """xq and xk of different lengths share one table, and both calls take the kernel."""
     torch.manual_seed(2)
     B, H, D = 1, 8, 64
     Lq, Lk = 4096, 512
@@ -102,9 +101,10 @@ def test_pair_cross_length():
 @pytest.mark.parametrize("public_name", ["apply_rope1", "apply_rope",
                                          "apply_rope_split_half1", "apply_rope_split_half"])
 def test_real_public_dispatch_hits_kernel(public_name):
-    """BLOCKER 2: call the REAL comfy_kitchen public API (-> torch.ops -> custom op ->
-    registry.get_implementation -> getattr(eager, name)) and prove our kernel fires. Poison the
-    captured originals so any silent fallback RAISES. Assert kernel for all four ops."""
+    """The real comfy_kitchen public API reaches our kernel for all four ops.
+
+    The captured originals are poisoned, so a silent fallback raises instead.
+    """
     import comfy_kitchen as ck
     torch.manual_seed(3)
     x = torch.randn(1, 4, 256, 64, device="mps", dtype=torch.bfloat16)
@@ -132,17 +132,16 @@ def test_real_public_dispatch_hits_kernel(public_name):
 
 
 # ---------------------------------------------------------------------------
-# Task 5 — fallback regimes, dtype, cache spy
+# fallback regimes, dtype, cache spy
 # ---------------------------------------------------------------------------
-# (1) VALID-eager but UNSUPPORTED-kernel -> fallback SUCCEEDS and matches real eager.
+# valid for eager but unsupported by the kernel: the fallback must match real eager
 @mps
 def test_non_broadcast_table_falls_back_and_matches():
-    """Non-broadcast leading table dims (real B/H) are valid eager but unsupported by the kernel
-    (Open Q #2). Must fall back and produce the SAME result as real eager."""
+    """A non-broadcast table falls back and still matches real eager."""
     torch.manual_seed(7)
     B, H, L, D = 2, 4, 128, 64
     x = torch.randn(B, H, L, D, device="mps", dtype=torch.bfloat16)
-    fr = torch.randn(B, H, L, D // 2, 2, 2, device="mps", dtype=torch.float32)   # leading dims != 1
+    fr = torch.randn(B, H, L, D // 2, 2, 2, device="mps", dtype=torch.float32)   # B/H != 1
     ref = _orig_interleaved(x, fr)               # real eager broadcasts B/H fine
     m._backend_events.clear()
     out = m.apply_rope1_fused(x, fr)
@@ -152,8 +151,7 @@ def test_non_broadcast_table_falls_back_and_matches():
 
 @mps
 def test_non_fp32_table_falls_back_and_matches():
-    """MAJOR 8: a bf16 freqs_cis table is valid eager but routed to fallback (kernel is fp32-only).
-    Output must match real eager (which multiplies in the table dtype)."""
+    """A bf16 freqs_cis table falls back (the kernel is fp32-only) and matches real eager."""
     torch.manual_seed(8)
     x = torch.randn(1, 8, 128, 64, device="mps", dtype=torch.bfloat16)
     fr = torch.randn(1, 1, 128, 32, 2, 2, device="mps", dtype=torch.bfloat16)
@@ -167,12 +165,10 @@ def test_non_fp32_table_falls_back_and_matches():
 # (2) GENUINELY MALFORMED -> kernel must NOT dispatch; real eager then legitimately RAISES.
 @mps
 def test_malformed_table_does_not_dispatch_and_raises():
-    """BLOCKER 3 / fused-norm pattern: a wrong-shaped freqs_cis (halfD=16 vs D/2=32) cannot
-    broadcast in real eager. The load-bearing assertion is that we did NOT dispatch the kernel
-    (backend == 'fallback') and that the real eager fallback RAISES -- NOT an allclose."""
+    """A malformed freqs_cis never reaches the kernel, and the eager fallback raises."""
     torch.manual_seed(6)
     x = torch.randn(1, 8, 128, 64, device="mps", dtype=torch.bfloat16)   # D/2 = 32
-    bad = torch.randn(1, 1, 128, 16, 2, 2, device="mps", dtype=torch.float32)  # halfD = 16 (malformed)
+    bad = torch.randn(1, 1, 128, 16, 2, 2, device="mps", dtype=torch.float32)  # halfD 16, not 32
     m._backend_events.clear()
     m._backend_events.append(("stale", "kernel", ()))   # stale spy must be overwritten
     with pytest.raises(Exception):
@@ -182,15 +178,11 @@ def test_malformed_table_does_not_dispatch_and_raises():
 
 @mps
 def test_per_call_trace_distinguishes_kernel_then_fallback():
-    """MAJOR 5: the per-call trace must distinguish a kernel call from a fallback call -- a scalar
-    `_last_backend` would only reflect the LAST and could mask an earlier mixed result.
+    """The per-call trace distinguishes a kernel call from a later fallback.
 
-    Note: a genuine [kernel, fallback] mix is NOT reachable through a single pair-wrapper call with
-    a shared table, because the kernel's per-tensor rejections (rank!=4, odd-D, numel==0) are
-    exactly the cases real eager also rejects, and the table-based rejections (non-fp32,
-    non-broadcast) are shared by both tensors. So we drive the two paths with two sequential
-    single-tensor calls: an fp32-table call (kernel) then a bf16-table call (valid eager, kernel
-    fp32-only -> fallback). Both originals stay real so the fallback succeeds."""
+    Driven as two sequential single-tensor calls: a mix inside one pair call isn't
+    reachable, since every rejection a pair shares applies to both its tensors.
+    """
     torch.manual_seed(9)
     x = torch.randn(1, 8, 256, 64, device="mps", dtype=torch.bfloat16)
     fr_fp32 = torch.randn(1, 1, 256, 32, 2, 2, device="mps", dtype=torch.float32)   # -> kernel
@@ -206,10 +198,7 @@ def test_per_call_trace_distinguishes_kernel_then_fallback():
 
 @mps
 def test_pair_wrapper_records_both_calls():
-    """MAJOR 5 (pair form): a pair-wrapper call must append ONE event per tensor (two total), so a
-    first-call fallback can never be masked by the second. Drive both to fallback with a bf16 table
-    (shared) -> two 'fallback' events; combined with test_pair_cross_length's two 'kernel' events,
-    this proves the trace is per-call, not a scalar."""
+    """A pair-wrapper call appends one event per tensor, so neither can mask the other."""
     torch.manual_seed(11)
     xq = torch.randn(1, 8, 256, 64, device="mps", dtype=torch.bfloat16)
     xk = torch.randn(1, 8, 128, 64, device="mps", dtype=torch.bfloat16)
@@ -235,7 +224,7 @@ def test_cpu_falls_back():
     assert torch.allclose(out.float(), ref.float(), atol=1e-5)
 
 
-# (4) cache invalidation on in-place table mutation (MAJOR 9).
+# cache invalidation on in-place table mutation
 @mps
 def test_table_mutation_invalidates_cache():
     """Mutating the table in place must change the output (no stale id()-keyed data)."""
@@ -252,12 +241,10 @@ def test_table_mutation_invalidates_cache():
 
 @mps
 def test_install_does_not_claim_active_when_the_reroute_failed(monkeypatch, capsys):
-    """The banner is the only signal a user gets; it must not claim success
-    when comfy_kitchen is missing or the eager reroute raised.
+    """The banner doesn't claim active when the eager reroute failed.
 
-    install() has three early returns ahead of _do_install, so assert the stub
-    actually ran. Without that this passes on any machine that trips a gate --
-    proving nothing about the banner.
+    install() has three early returns ahead of _do_install, so assert the stub ran:
+    otherwise this passes on any machine that trips a gate.
     """
     pytest.importorskip("comfy_kitchen.backends.eager")
     from _patches import _caps

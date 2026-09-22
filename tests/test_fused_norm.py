@@ -1,10 +1,10 @@
 # tests/test_fused_norm.py
-"""Issue E: fused RMSNorm + affine + adaLN(scale,shift) + residual kernel.
+"""Tests for the fused RMSNorm + affine + adaLN(scale,shift) + residual kernel.
 
-Correctness oracle = exact, GROUP-AWARE torch composition in fp32 (the same formula the
-wrapper falls back to). Every MPS test asserts the real Metal kernel ran (m._last_backend
-== 'kernel') so it cannot pass silently through the torch fallback. Includes the int32
-row*D overflow regime (rows*D > 2**31) since this kernel supersedes rmsnorm_mps_large.py."""
+The oracle is the module's own group-aware fp32 torch composition. Every MPS test asserts
+_last_backend == "kernel" so none can pass through the fallback, and the set includes the
+rows*D > 2**31 regime, since this kernel supersedes rmsnorm_mps_large.py.
+"""
 import pytest
 import torch
 
@@ -43,8 +43,8 @@ def test_full_path_matches_reference(dtype, atol, rtol):
 
 @mps
 def test_bare_rmsnorm_tight_tolerance():
-    """Deterministic low-dynamic-range case: x in [-1,1], weight=ones, no modulation/residual.
-    Expected error is final-store rounding only, so use a tight fp16 tolerance (Codex MINOR #10)."""
+    """A bare rmsnorm over x in [-1,1] with weight=ones: only final-store rounding, so the
+    fp16 tolerance is tight."""
     torch.manual_seed(7)
     rows, dim = 1024, 64
     x = (torch.rand(rows, dim, device="mps", dtype=torch.float16) * 2.0 - 1.0)
@@ -98,7 +98,7 @@ def test_per_batch_modulation_grouping():
 
 @mps
 def test_mixed_group_counts():
-    """Open question #5/#6: scale=[B,D], shift=[1,D] (different group counts) must work."""
+    """scale=[B,D] and shift=[1,D] together: different group counts in one call."""
     torch.manual_seed(8)
     B, L, D = 4, 256, 256
     x = torch.randn(B * L, D, device="mps", dtype=torch.float16)
@@ -119,8 +119,7 @@ def test_mixed_group_counts():
 
 @mps
 def test_multidim_normalized_shape_reroute():
-    """Codex BLOCKER #2: F.rms_norm reroute must reduce over ALL normalized dims
-    (D = prod(normalized_shape)), not just the last one, and must read a multi-dim weight."""
+    """The F.rms_norm reroute reduces over ALL normalized dims and reads a multi-dim weight."""
     m.install_for_test()                       # force the F.rms_norm reroute regardless of env flag
     try:
         torch.manual_seed(9)
@@ -141,8 +140,7 @@ def test_multidim_normalized_shape_reroute():
 
 @mps
 def test_grouped_modulation_fallback_equiv(monkeypatch):
-    """Codex MAJOR #3: forcing the fallback with grouped [B,D] scale/shift must NOT raise and
-    must match the kernel result (group-aware reference). Plain broadcasting would crash here."""
+    """The fallback handles grouped [B,D] scale/shift, where plain broadcasting would crash."""
     torch.manual_seed(10)
     B, L, D = 3, 128, 256
     x = torch.randn(B * L, D, device="mps", dtype=torch.float16)
@@ -158,15 +156,13 @@ def test_grouped_modulation_fallback_equiv(monkeypatch):
 
 @mps
 def test_bad_optional_shape_falls_back():
-    """Codex MAJOR #4: a short weight / mismatched residual must route to the fallback, not
-    dispatch undefined memory reads."""
+    """A short weight or mismatched residual routes to the fallback, never an OOB read."""
     torch.manual_seed(11)
     rows, dim = 256, 128
     x = torch.randn(rows, dim, device="mps", dtype=torch.float16)
     bad_w = torch.randn(dim - 1, device="mps", dtype=torch.float16)   # wrong length
-    # the validation must route to the fallback (no kernel dispatch / no OOB buffer read); the
-    # torch fallback then legitimately broadcast-fails on the genuinely-malformed tensor. The
-    # load-bearing assertion is that we did NOT dispatch the kernel (backend == "fallback").
+    # the load-bearing assertion is the absence of a kernel dispatch: the torch fallback
+    # then legitimately broadcast-fails on a genuinely malformed tensor
     m._last_backend = "kernel"
     with pytest.raises(RuntimeError):
         fused_rmsnorm_modulate(x, bad_w, 1e-6)
@@ -181,9 +177,10 @@ def test_bad_optional_shape_falls_back():
 @mps
 @pytest.mark.slow
 def test_overflow_rows_2pow24_kernel_path(monkeypatch):
-    """THE int32-offset overflow proof (Codex MAJOR #5): rows*D = 1<<24 * 256 = 4.29e9 > 2**31.
-    Monkeypatch _reference to raise so this CANNOT pass through the fallback — it must be the
-    real 64-bit-indexed kernel. ~8.6 GiB fp16; needs the 128 GB box."""
+    """rows*D past 2**31 goes through the real 64-bit-indexed kernel.
+
+    _reference is poisoned so the fallback cannot answer instead. Needs ~8.6 GiB.
+    """
     monkeypatch.setattr(m, "_reference",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not fall back")))
     torch.manual_seed(4)
@@ -203,9 +200,10 @@ def test_overflow_rows_2pow24_kernel_path(monkeypatch):
 @mps
 @pytest.mark.slow
 def test_stock_mps_broken_regime_2pow22():
-    """rows=1<<22 (4.19M). This is BELOW int32 element max (1.07e9 < 2.147e9) so it does NOT
-    prove offset overflow; it reproduces the *stock PyTorch* MPS row-count bug regime. Our kernel
-    must stay correct here (fp32 + kernel path)."""
+    """The kernel stays correct at 1<<22 rows, the regime where stock MPS rms_norm breaks.
+
+    Below the int32 element max, so this is the row-count bug, not offset overflow.
+    """
     torch.manual_seed(3)
     rows, dim = 1 << 22, 256
     x = torch.randn(rows, dim, device="mps", dtype=torch.float16)
@@ -233,9 +231,7 @@ def test_cpu_falls_back():
 @mps
 @pytest.mark.parametrize("D", [17, 31])
 def test_direct_kernel_D_not_multiple_of_32(D):
-    """Verify #4 MINOR: exercise the kernel's fp32 simd_sum reduction at D < 32 / not a multiple
-    of 32 against an INDEPENDENT hand-computed fp32 oracle (no m._reference) so a subtle bug in the
-    module's own reference could not mask a partial-simdgroup reduction error."""
+    """A D that isn't a multiple of 32 reduces correctly, against an independent fp32 oracle."""
     torch.manual_seed(D)
     rows = 257                                            # not a multiple of TG either
     x = torch.randn(rows, D, device="mps", dtype=torch.float16)
@@ -250,14 +246,11 @@ def test_direct_kernel_D_not_multiple_of_32(D):
 
 
 def test_reroute_bypass_sets_fallback_backend():
-    """Verify #3 MAJOR: when the F.rms_norm reroute bypasses the kernel on an outer guard (here a
-    non-MPS device), it must set _last_backend = 'fallback' so a stale 'kernel' value from a previous
-    successful call cannot create a false-positive kernel-path test. Uses a CPU tensor with a VALID
-    normalized_shape so the bypass reaches the real stock rms_norm (which then succeeds)."""
+    """An outer-guard bypass sets _last_backend = "fallback", so no stale "kernel" survives."""
     m.install_for_test()
     try:
-        m._last_backend = "kernel"                        # simulate a stale spy from a prior kernel run
-        x = torch.randn(4, 16)                            # CPU tensor -> device.type != "mps" outer bypass
+        m._last_backend = "kernel"                        # a stale spy from a prior run
+        x = torch.randn(4, 16)                            # CPU -> the outer bypass
         w = torch.randn(16)
         out = torch.nn.functional.rms_norm(x, (16,), w, 1e-6)
         assert m._last_backend == "fallback", "outer reroute bypass must reset the spy to 'fallback'"

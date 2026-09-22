@@ -1,10 +1,6 @@
-"""Issue-F Task 0 probe (run on M5, ASFP8_FP8_NATIVE=1).
+"""Synthetic probe: does the native fp8 NT kernel match decoded-fp32 on Flux-2 shapes?
 
-SYNTHETIC ONLY. Confirms the existing native fp8 NT kernel (half activation x fp8
-e4m3 weight) matches the decoded-fp32 ground truth on real Flux-2-Klein linear
-shapes, and that the current LUT->bf16 path is not dramatically more accurate.
-Cannot establish real activation range (see Task -1). Lifts the layout/spy
-approach from docs/superpowers/results/G2-results.md.
+Says nothing about real activation range, which needs a live model.
 """
 import os, sys, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,13 +41,13 @@ for (M, K, N) in SHAPES:
     den  = gt.abs().max() + 1e-9
     rel_native = (diff.max() / den).item()
     rel_lut    = ((lut - gt).abs().max() / den).item()
-    # Distribution-aware stats (MAJOR 10): worst-element relative is not enough over K<=16384.
+    # distribution-aware: worst-element relative is not enough at these K
     rel_elt = (diff / (gt.abs() + 1e-6))
     mean_abs = diff.mean().item()
     p999     = torch.quantile(rel_elt.flatten().float()[:: max(1, rel_elt.numel()//1_000_000)], 0.999).item()
     actmax   = act_bf16.float().abs().max().item()
     worst = max(worst, rel_native)
-    # Decision rule (MAJOR 10): native must be within ~2x of the LUT path it replaces.
+    # native must land within ~2x of the LUT path it replaces
     within_lut = rel_native <= 2 * rel_lut + 1e-4
     ok = ok and (rel_native < 2e-2) and within_lut
     print(f"M={M} K={K} N={N}: rel_native={rel_native:.4e} rel_lut={rel_lut:.4e} "

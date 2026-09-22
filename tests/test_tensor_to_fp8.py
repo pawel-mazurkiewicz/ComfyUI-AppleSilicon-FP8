@@ -26,9 +26,7 @@ def _installed(monkeypatch):
     ],
 )
 def test_fp8_dtype_shortcuts_work_on_mps(method, want_dtype):
-    """`.float()` and friends bypass Tensor.to entirely, so patching only .to()
-    left them raising on MPS (issue #16: `s_rel.float()` on an fp8 group-scale
-    tensor -> RuntimeError: Undefined type Float8_e4m3fn)."""
+    """The dtype shortcuts work on MPS: they bypass Tensor.to entirely (#16)."""
     src = torch.randn(32) * 0.5
     t = src.to(torch.float8_e4m3fn).to("mps")
 
@@ -59,12 +57,9 @@ def test_non_fp8_shortcuts_are_untouched():
 
 @requires_mps
 def test_double_still_raises_on_mps():
-    """MPS has no float64, so .double() has nothing to rescue — it must keep
-    raising torch's own error rather than being silently rerouted.
+    """.double() still raises on MPS, which has no float64 to rescue it into.
 
-    The exception type moves between torch versions (fp8 casts raise TypeError on
-    2.11 and RuntimeError on 2.14-dev), so match on the message instead to pin
-    that this is still the float64-unsupported path.
+    Matched on the message, since the exception type moves between torch versions.
     """
     t = (torch.randn(8) * 0.5).to(torch.float8_e4m3fn).to("mps")
     with pytest.raises((TypeError, RuntimeError), match="float64"):
@@ -79,8 +74,7 @@ def test_cpu_fp8_shortcut_delegates_to_original():
 
 @requires_mps
 def test_w4a8_grouped_dequant_with_fp8_group_scales():
-    """The issue #16 shape: comfy_kitchen's _dequant_int4_grouped_to_int8 does
-    `s_rel.float()` on group scales that the W4A8-mixed checkpoint stores as fp8."""
+    """A W4A8 grouped dequant works with the fp8 group scales the checkpoint stores (#16)."""
     n, k, group_size = 8, 64, 16
     groups = k // group_size
     torch.manual_seed(0)
@@ -110,8 +104,7 @@ def test_w4a8_grouped_dequant_with_fp8_group_scales():
 @requires_mps
 @pytest.mark.parametrize("method", ["float", "half", "bfloat16"])
 def test_memory_format_keyword_is_honoured(method):
-    """memory_format is keyword-only on these shortcuts; the fp8 path must
-    forward it rather than dropping it on the floor."""
+    """memory_format is forwarded, not dropped, by the fp8 path."""
     t = (torch.randn(2, 3, 4, 5) * 0.5).to(torch.float8_e4m3fn).to("mps")
     got = getattr(t, method)(memory_format=torch.channels_last)
     assert got.is_contiguous(memory_format=torch.channels_last)
@@ -120,8 +113,8 @@ def test_memory_format_keyword_is_honoured(method):
 @requires_mps
 @pytest.mark.parametrize("method", ["float", "half", "bfloat16"])
 def test_positional_memory_format_rejected_like_stock_torch(method):
-    """Stock torch raises `takes 0 positional arguments`; the fp8 path must not
-    quietly accept it and feed it to .to() as non_blocking."""
+    """A positional memory_format is rejected as stock torch rejects it, not passed on
+    to .to() as non_blocking."""
     t8 = (torch.randn(2, 3, 4, 5) * 0.5).to(torch.float8_e4m3fn).to("mps")
     t32 = torch.randn(2, 3, 4, 5, device="mps")
     for t in (t8, t32):

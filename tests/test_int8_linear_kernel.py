@@ -1,10 +1,6 @@
-"""Tests for patch #17: INT8 W8A8 via the bit-exact Metal kernel (int8_linear_kernel_mps).
+"""Tests for patch #17: INT8 W8A8 via the bit-exact Metal kernel.
 
-Unit tests (always run): install() is opt-in/guarded; the wrapper falls back to the
-original int8_linear when the kernel is unavailable or off-MPS.
-
-Integration test (opt-in, ASFP8_INT8_EXT=1 on an MPS box): the kernel-backed
-int8_linear is bit-identical to comfy_kitchen's original across convrot/bias/3D/M=1.
+The integration tests need ASFP8_INT8_EXT=1 on an MPS box; the rest always run.
 """
 import os
 import shutil
@@ -20,10 +16,8 @@ from _patches import int8_linear_kernel_mps as patch
 
 from _patches import _caps
 
-# Run whenever the node ITSELF would use the kernel here -- same gate production
-# uses. Hiding these behind an opt-in env var meant a kernel that stopped
-# compiling (issue #13) showed up as 34 silent skips. ASFP8_INT8_EXT=0 still turns
-# them off, exactly as it turns the feature off.
+# the same gate production uses: behind an opt-in env var instead, a kernel that
+# stopped compiling showed up as silent skips
 _int8_enabled = torch.backends.mps.is_available() and _caps.resolve(
     "ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate
 )
@@ -49,12 +43,8 @@ requires_int8_ext = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def _clear_int8_kernel_memo():
-    """_caps.kernel_ready memoises per process.
-
-    Without this, whichever test verifies the kernel first decides the answer for
-    every later test, and a test that installs a deliberately broken kernel is
-    silently skipped past its own gate.
-    """
+    """Clear _caps.kernel_ready's per-process memo, or the first test to verify the
+    kernel decides the answer for every later one."""
     from _patches import _caps
     _caps._kernel_ready.pop("int8", None)
     yield
@@ -82,9 +72,6 @@ def test_install_noop_when_not_capable(monkeypatch):
 
 
 # --- the Metal build must never run on the ComfyUI startup thread ---------------
-# Regression guard for "ComfyUI hangs forever at startup when `ninja` is installed":
-# install() used to run a synchronous ninja+clang build of the ObjC++/Metal source
-# while ComfyUI was still importing custom nodes, with no timeout and no message.
 
 
 @requires_mps
@@ -217,8 +204,7 @@ def test_wrapper_falls_back_off_mps(monkeypatch):
 
 
 def test_fallback_without_install_raises_clean_error(monkeypatch):
-    """Direct call before install() (both _kernel and _orig are None) must raise a
-    clear RuntimeError, not an opaque AttributeError from calling None(...)."""
+    """A direct call before install() raises a clear RuntimeError, not an AttributeError."""
     monkeypatch.setattr(patch, "_kernel", None, raising=False)
     monkeypatch.setattr(patch, "_orig_int8_linear", None, raising=False)
     x = torch.zeros(4, 8)
@@ -287,20 +273,14 @@ def test_kernel_matches_original_bit_exact():
     run(1, 6144, 6144, convrot=True, bias=False, three_d=False)
 
 
-# P0 verdict: Metal `erf` is unavailable under MTLLanguageVersion4_1, so act=3
-# ("gelu", erf) is dropped entirely; only {silu, gelu_tanh} are supported.
+# gelu-erf is absent (Metal has no `erf`), so only {silu, gelu_tanh} are supported
 @requires_int8_ext
 @pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("convrot", [False, True])  # rotation shifts the activation magnitude dist
 @pytest.mark.parametrize("M", [1, 256])
 def test_int8_linear_fused_activation_matches_reference(M, convrot, bias, act):
-    """Fused-epilogue activation == torch activation of the unfused kernel output.
-
-    convrot=True exercises the Hadamard-rotate -> requant path feeding the fused
-    activation epilogue: rotation reshapes the magnitude distribution (GELU x^3,
-    SiLU saturation, quant edges), so the activation must stay correct there too.
-    """
+    """Fused-epilogue activation == torch activation of the unfused kernel output."""
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     from _patches.int8_ext import loader
     from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
@@ -335,22 +315,15 @@ def test_int8_linear_fused_activation_matches_reference(M, convrot, bias, act):
         patch._orig_int8_linear = saved
     torch.mps.synchronize()
     assert out.shape == ref.shape
-    # The fused epilogue rounds the activation to bf16; torch rounds its own bf16
-    # activation too, so the honest correctness bound is ONE bf16 ulp (relative
-    # 2**-7 ~= 7.8e-3). The plan's rtol=2e-3 sits *below* bf16 precision and is
-    # unsatisfiable for these magnitude-~15 outputs even by a perfect kernel
-    # (the plan's rationale assumed outputs ~1.0; this data reaches ~15). rtol=8e-3
-    # admits a 1-ulp-correct kernel; atol=2e-3 bounds the near-zero regime. This
-    # still rejects real bugs: the original precise::tanh GELU (~160 ulp) had an
-    # absolute diff of 0.0156 at small ref, which exceeds atol and fails here.
-    # See docs/superpowers/results/D-results.md.
+    # rtol is one bf16 ulp: both sides round to bf16, so anything tighter is below
+    # bf16 precision and unsatisfiable. atol bounds the near-zero regime.
     d = (out.float() - ref.float()).abs()
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
         f"M={M} convrot={convrot} bias={bias} {act}: max|d|={d.max().item():.4g}"
 
 
 def test_wrapper_fallback_applies_activation(monkeypatch):
-    """Off-MPS / no-kernel fallback must still apply the requested activation, not drop it."""
+    """The no-kernel fallback still applies the requested activation."""
     monkeypatch.setattr(patch, "_kernel", None)  # force the early fallback branch
 
     captured = {}
@@ -376,8 +349,7 @@ def test_wrapper_rejects_unknown_act():
 
 
 def test_swiglu_rejects_unknown_act():
-    """Mirror of test_wrapper_rejects_unknown_act for the gated kernel: a typo'd
-    activation must raise before any dispatch (CPU tensors, no kernel needed)."""
+    """A typo'd activation raises before any dispatch, for the gated kernel too."""
     w = torch.randint(-1, 2, (3, 4), dtype=torch.int8)
     s = torch.tensor([0.01])
     with pytest.raises(ValueError):
@@ -386,8 +358,7 @@ def test_swiglu_rejects_unknown_act():
 
 
 def test_swiglu_rejects_none_act():
-    """'none' is a *valid* activation name but meaningless for a gate — it must be
-    rejected (the gate would degenerate to a plain elementwise product)."""
+    """act="none" is rejected for a gate: it would degenerate to an elementwise product."""
     w = torch.randint(-1, 2, (3, 4), dtype=torch.int8)
     s = torch.tensor([0.01])
     with pytest.raises(ValueError):
@@ -395,11 +366,8 @@ def test_swiglu_rejects_none_act():
                                   None, None, False, 256, act="none")
 
 
-# tolerance: one bf16 ulp (rtol=8e-3) + atol=2e-3 near zero — see the point-activation
-# test rationale above and docs/superpowers/results/D-results.md. act=3 (gelu-erf) dropped.
-# 2576 = remainder-K; the (256,2560,convrot=True) case exercises the Hadamard-rotate ->
-# requant path through the fused gate kernel (rotation reshapes the gate magnitude dist,
-# which is where SwiGLU/GEGLU saturation + quant edges live) and keeps its spy guard.
+# tolerance is one bf16 ulp, as above. K=2576 covers remainder-K; the convrot case
+# covers the Hadamard-rotate -> requant path into the fused gate kernel.
 @requires_int8_ext
 @pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
@@ -431,13 +399,8 @@ def test_int8_swiglu_matches_reference(M, K, convrot, bias, act):
 
     lin_g = patch._int8_linear_kernel(x, wg, sg, bg, torch.bfloat16, convrot, 256, act="none")
     lin_u = patch._int8_linear_kernel(x, wu, su, bu, torch.bfloat16, convrot, 256, act="none")
-    # The fused gate keeps act(gate) in fp32 registers and multiplies by up in fp32,
-    # rounding to bf16 ONCE (that single-rounding is the whole point of fusion). The
-    # reference must do the same: torch's INDEPENDENT fp32 activation (not the kernel's
-    # exp identity) * up in fp32, rounded once. A bf16-rounded intermediate gate would
-    # double-round and diverge by up to half-a-gate-ulp * |up| — that is not a kernel
-    # bug. The kernel matches this fp32-fused reference to ~1 bf16 ulp; near-zero gelu
-    # epsilon * large up is bounded by atol=2e-3. See docs/superpowers/results/D-results.md.
+    # the fused gate rounds to bf16 ONCE, so the reference must too: a bf16-rounded
+    # intermediate gate would double-round and diverge, which is not a kernel bug
     gfp = lin_g.float()
     gate = torch.nn.functional.silu(gfp) if act == "silu" \
            else torch.nn.functional.gelu(gfp, approximate="tanh")
@@ -460,7 +423,7 @@ def test_int8_swiglu_matches_reference(M, K, convrot, bias, act):
 
 @requires_int8_ext
 def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
-    """Length-N weight scales must route through the per-branch path, not the fused gate kernel."""
+    """Length-N weight scales route through the per-branch path, not the fused gate."""
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     from _patches.int8_ext import loader
     from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
@@ -491,13 +454,8 @@ def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
 
 @requires_mps
 def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
-    """The Metal library compiles on first kernel USE, not at extension build time.
-
-    A toolchain that rejects it (issue #13) otherwise recompiles on every eligible
-    Linear -- measured at 1.46x slower than not having the kernel at all, with 822
-    fallback lines in one run. The cpp_extension build succeeds, so _kernel_tried
-    never short-circuits this.
-    """
+    """A Metal library the toolchain rejects on first use is latched off, not recompiled
+    on every eligible Linear (#13)."""
     from comfy_kitchen.tensor import QuantizedTensor
 
     calls = []
@@ -537,12 +495,10 @@ def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
 
 @pytest.mark.skipif(not _int8_enabled, reason="int8 kernel not enabled on this machine")
 def test_int8_kernel_compiles_when_enabled():
-    """Canary: if the node turns the int8 kernel on, it must actually work.
+    """Canary: an int8 kernel the node turns on actually works (#13).
 
-    The Metal library is compiled on first dispatch, so a macOS or toolchain
-    update can kill it while the cpp_extension still builds and the capability
-    banner stays green (issue #13). Without this the rest of the kernel tests
-    just skip and the breakage is invisible.
+    Without it, an OS or toolchain update that kills the Metal library only shows up
+    as the rest of these tests skipping.
     """
     assert patch._ensure_kernel() is not None, "int8 cpp_extension failed to build"
     assert patch._self_check(), (
@@ -553,12 +509,7 @@ def test_int8_kernel_compiles_when_enabled():
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
 def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch):
-    """A kernel that fails verification must cost one attempt, not one per layer.
-
-    This is the #14 gap: kernel_gate() clears int8 on chip + toolchain alone, so
-    a kernel that cannot build still reaches the forward path. The per-kernel
-    memo is what stops that becoming a per-call rebuild.
-    """
+    """A kernel that fails verification costs one attempt, not one per layer (#14)."""
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps
 
@@ -593,11 +544,7 @@ def test_failed_verification_disables_the_kernel_and_is_not_retried(monkeypatch)
 
 @requires_mps
 def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
-    """warmup() and the self-check passed, then dispatch failed anyway.
-
-    That repeats on every later layer if it is not latched -- the 822 fallback
-    log lines in issue #13. One line, then comfy's path for the session.
-    """
+    """A dispatch failure after verification passed is latched off for the session (#13)."""
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps
 
@@ -631,20 +578,12 @@ def test_a_forward_failure_after_verification_disables_the_kernel(monkeypatch):
 
 
 # --- the hardware gate: issues #25 and #27 ----------------------------------
-#
-# One defect, reported from both ends. The old gate (kernel_gate) asked
-# torch.mps.compile_shader to build na_gemm's bf16 shader, which measures the
-# torch build's default MSL rather than the GPU. It answered yes on the M4 Pro of
-# #25, where int8_gemm.mm builds and returns garbage, and no on the M5 Max of
-# #27, where the very same kernel is bit-exact and 3.17x faster.
+# One defect from both ends: the old gate measured the torch build's default MSL
+# rather than the GPU, so it answered yes on an M4 Pro and no on an M5 Max.
 
 
 def test_install_is_inert_on_a_pre_m5_chip(monkeypatch):
-    """#25: on M1-M4 there are no Neural Accelerators, so the tensor-ops kernel
-    dispatches and computes garbage. _self_check() catches it -- but only after
-    every cold start has paid a ~7s ninja+clang build for a kernel that is then
-    discarded. A chip we can positively name as pre-M5 must not reach the seam.
-    """
+    """A chip positively named as pre-M5 never reaches the build at all (#25)."""
     monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
     monkeypatch.setattr(_caps, "_cpu_brand_string", lambda: "Apple M4 Pro")
@@ -658,11 +597,8 @@ def test_install_is_inert_on_a_pre_m5_chip(monkeypatch):
 
 
 def _stub_comfy_ops(monkeypatch):
-    """Stand in for `comfy.ops`, which isn't importable from the repo root.
-
-    install() wraps ops.mixed_precision_ops, so without this the gate tests can
-    never observe a completed install -- install() bails on the import first.
-    """
+    """Stand in for `comfy.ops`, which isn't importable from the repo root: without it
+    install() bails on the import before the gate tests can observe anything."""
     import sys
     import types
 
@@ -683,10 +619,7 @@ def _stub_comfy_ops(monkeypatch):
 
 
 def test_install_survives_a_failing_compile_shader_probe(monkeypatch):
-    """#27: macOS 26.6 + torch 2.10 on an M5 Max cannot compile na_gemm through
-    compile_shader ("use of undeclared identifier 'mpp'"), while int8_gemm.mm
-    builds fine via newLibraryWithSource at MSL 4.0 and passes its bit-exact
-    self-check. The probe's verdict must not disable the kernel."""
+    """A failing compile_shader probe does not disable the kernel (#27)."""
     _stub_comfy_ops(monkeypatch)
     monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
@@ -704,10 +637,7 @@ def test_install_survives_a_failing_compile_shader_probe(monkeypatch):
 
 
 def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys):
-    """#25's second cost: the startup line announced the kernel as routing before
-    anything had been built or numerically checked, and the retraction landed one
-    line deep in the sampling log. The banner must promise a check, not a result.
-    """
+    """The startup banner promises a check, not a result nothing has verified yet (#25)."""
     _stub_comfy_ops(monkeypatch)
     monkeypatch.setattr(_caps, "_chip_gen", _caps._UNPROBED)
     monkeypatch.delenv("ASFP8_INT8_EXT", raising=False)
@@ -726,7 +656,7 @@ def test_install_banner_does_not_claim_an_unverified_kernel(monkeypatch, capsys)
 
 
 def test_linear_input_act_wrapper_forwards_the_extended_signature(monkeypatch):
-    """#36: the wrapper must accept ComfyUI v0.36's extended signature."""
+    """The wrapper accepts ComfyUI v0.36's extended signature (#36)."""
     ops = _stub_comfy_ops(monkeypatch)
     calls = []
 
@@ -764,10 +694,10 @@ def test_linear_input_act_wrapper_forwards_the_extended_signature(monkeypatch):
 
 @requires_mps
 def test_force_cast_weights_does_not_disqualify_the_kernel(monkeypatch):
-    """comfy sets comfy_force_cast_weights on int8 layers where storage dtype !=
-    compute dtype; for a QuantizedTensor that cast is the per-call W8A16 dequant
-    this kernel bypasses, so the flag must not push the layer off the kernel route
-    (regression: it silently forced MiniMax Music 3's whole TE onto the slow path)."""
+    """comfy_force_cast_weights does not push a layer off the kernel route (#26).
+
+    On a QuantizedTensor that cast is the per-call dequant this kernel bypasses.
+    """
     from comfy_kitchen.tensor import QuantizedTensor
 
     monkeypatch.setattr(patch, "_kernel", object(), raising=False)
@@ -798,8 +728,8 @@ def test_force_cast_weights_does_not_disqualify_the_kernel(monkeypatch):
 
 @requires_mps
 def test_dequant_retries_after_a_transient_off_mps_call(monkeypatch):
-    """An off-MPS first call must not latch _asfp8_deq_done: the same layer can be
-    called later with MPS input (offload/warmup) and should still dequantise then."""
+    """An off-MPS first call doesn't latch _asfp8_deq_done, so a later MPS call still
+    dequantises."""
     from comfy_kitchen.tensor import QuantizedTensor
 
     monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)
@@ -854,8 +784,7 @@ def _resolve_dequant_gate(monkeypatch, env, total_ram):
 
 
 def test_dequant_gate_is_opt_in(monkeypatch):
-    """Unset stays OFF regardless of RAM: the plain copy lands after comfy's
-    model_management has already budgeted around the int8 size."""
+    """Unset stays OFF regardless of RAM."""
     assert _resolve_dequant_gate(monkeypatch, None, 128 * (1 << 30)) is False
 
 
@@ -868,13 +797,13 @@ def test_dequant_gate_on_with_enough_ram(monkeypatch):
 
 
 def test_dequant_gate_ram_check_overrides_opt_in(monkeypatch, capsys):
-    """=1 on a small box is refused (safety), and says so."""
+    """=1 on a small box is refused, and says so."""
     assert _resolve_dequant_gate(monkeypatch, "1", 16 * (1 << 30)) is False
     assert "48 GiB" in capsys.readouterr().out
 
 
 def test_dequant_gate_memoises(monkeypatch):
-    """The gate resolves once; later env changes don't flip a live session."""
+    """The gate resolves once, so a later env change can't flip a live session."""
     assert _resolve_dequant_gate(monkeypatch, "1", 128 * (1 << 30)) is True
     monkeypatch.setenv("ASFP8_INT8_DEQUANT", "off")
     assert patch._dequant_enabled() is True
@@ -882,12 +811,10 @@ def test_dequant_gate_memoises(monkeypatch):
 
 @requires_mps
 def test_offloaded_cpu_weight_does_not_latch_the_kernel_off(monkeypatch):
-    """comfy parks weights on CPU between uses and casts them back in via
-    comfy_force_cast_weights. Now that the force-cast bail is gone (#26), such a
-    layer reaches this path -- and if it got as far as _int8_linear_kernel, that
-    function's own fallback would hand an MPS input and a CPU weight to the eager
-    int8_linear, throw, and latch mark_kernel_failed. One offloaded layer would
-    then disable int8 for the rest of the session, over a transient condition.
+    """An offloaded CPU weight doesn't latch the kernel off for the session (#26).
+
+    Reaching _int8_linear_kernel with an MPS input and a CPU weight would throw in its
+    own fallback and call mark_kernel_failed.
     """
     from comfy_kitchen.tensor import QuantizedTensor
     from _patches import _caps
@@ -915,14 +842,8 @@ def test_offloaded_cpu_weight_does_not_latch_the_kernel_off(monkeypatch):
 
 @requires_mps
 def test_dequant_leaves_an_offloaded_weight_on_the_cpu(monkeypatch):
-    """comfy parks weights on CPU to keep them out of memory. Dequantising one
-    pulls a bigger, full-precision copy onto the GPU and pins it there, undoing
-    the offload and inflating residency past what the >= 48 GiB gate budgeted for.
-
-    The flag must stay unset too: being offloaded is transient, so the layer
-    should still dequantise once comfy brings the weight back -- the same
-    treatment _maybe_dequant_embedding already gives this case.
-    """
+    """An offloaded weight is left on the CPU, with the flag unset so the layer still
+    dequantises once comfy brings it back."""
     from comfy_kitchen.tensor import QuantizedTensor
 
     monkeypatch.setattr(patch, "_DEQUANT_MODE", True, raising=False)

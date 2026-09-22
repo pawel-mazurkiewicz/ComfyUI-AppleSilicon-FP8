@@ -1,6 +1,7 @@
-"""Issue-F bench: native fp8 NT vs LUT->bf16, on Flux shapes. Verifies before timing.
-Reports: native(kernel-only), native(end-to-end incl bf16->half cast),
-         lut(GEMM-only, weight pre-decoded), lut(end-to-end incl per-call decode_fp8)."""
+"""Bench: native fp8 NT vs LUT->bf16 on Flux shapes, verifying before timing.
+
+Reports the kernel-only and end-to-end cost of each path.
+"""
 import os, sys, time, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["ASFP8_FP8_NATIVE"] = "1"
@@ -45,5 +46,4 @@ for (M, K, N) in SHAPES:
     print(f"M={M} K={K} N={N}: native_kernel={tk:.3f}ms native_e2e={tne:.3f}ms "
           f"lut_gemm={tlg:.3f}ms lut_e2e(+decode)={tle:.3f}ms "
           f"speedup_e2e={tle/tne:.2f}x  rel={rel_n:.2e}")
-# Honest comparison: the model-relevant number is native_e2e vs lut_e2e (both include their
-# real per-call costs). native_kernel vs lut_gemm is the kernel-only ceiling.
+# native_e2e vs lut_e2e is the model-relevant pair; the kernel-only figures are a ceiling

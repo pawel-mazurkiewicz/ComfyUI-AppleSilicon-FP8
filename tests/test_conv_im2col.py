@@ -12,7 +12,7 @@ def test_im2col_2d_matches_unfold(H, W, Cin, kh, kw, s, p):
     from _patches.conv_im2col_mps import _im2col_2d_full  # test helper: full (untiled) im2col
     torch.manual_seed(0)
     x = torch.randn(1, Cin, H, W, device="mps", dtype=torch.float16)
-    # F.unfold gives [N, Cin*kh*kw, L] with the SAME (c,ki,kj) ordering as our K index.
+    # F.unfold uses the same (c,ki,kj) ordering as our K index
     ref = torch.nn.functional.unfold(x.float(), (kh, kw), stride=s, padding=p)  # [1, K, P]
     ref = ref[0].t().contiguous()  # [P, K]
     A = _im2col_2d_full(x, kh, kw, s, p).float()  # [P, K]
@@ -28,10 +28,8 @@ def test_gemm_nt_bias_matches_reference(M, K, N, bias, monkeypatch):
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import _gemm_nt_bias
     torch.manual_seed(0)
-    # SPY: wrap the compiled lib so the test proves the real Metal entry point ran.
-    # NOTE: torch.mps compiled-shader objects route attribute access to kernel-function
-    # lookup (you cannot set/get arbitrary attrs on them), so we wrap the lib in a thin
-    # delegating proxy that counts gemm_nt_bias invocations and forwards everything else.
+    # a delegating proxy, not a patched attribute: compiled-shader objects route every
+    # attribute access to kernel-function lookup
     calls = {"gemm_nt_bias": 0}
     real_lib = cm._lib
 
@@ -80,7 +78,7 @@ def test_conv2d_matches_reference(H, W, Cin, Cout, s, p, bias, monkeypatch):
     ref = torch.nn.functional.conv2d(x.float(), w.float(),
                                      b.float() if bias else None, stride=s, padding=p)
     stock = torch.nn.functional.conv2d(x, w, b, stride=s, padding=p).float()  # capture BEFORE spy
-    # SPY: make the in-module stock fallback explode so a silent fallback fails the test.
+    # make the stock fallback explode, so a silent fallback fails the test
     def boom(*a, **k):
         raise AssertionError("conv_im2col fell back to stock conv instead of running the kernel")
     monkeypatch.setattr(cm, "_fallback_conv", boom, raising=True)
@@ -94,10 +92,10 @@ def test_conv2d_matches_reference(H, W, Cin, Cout, s, p, bias, monkeypatch):
 
 @requires_mps
 def test_tile_buffer_capped():
-    """DETERMINISTIC OOM proof: the A_tile the driver allocates is provably <= _TILE_BYTES,
-    and for a large conv it actually tiles (tile_p < P) rather than materializing full im2col."""
+    """A_tile stays under _TILE_BYTES, and a large conv really tiles instead of
+    materializing the full im2col."""
     import _patches.conv_im2col_mps as cm
-    # 512x512, Cin=256, 3x3 -> full im2col is 1.21 GB, well above the 384 MB default cap.
+    # full im2col here is 1.21 GB, well above the 384 MB default cap
     N, Cin, kh, kw = 1, 256, 3, 3  # H = W = 512
     Hout = Wout = 512  # pad=1, stride=1
     P, K = N * Hout * Wout, Cin * kh * kw
@@ -112,9 +110,10 @@ def test_tile_buffer_capped():
 
 @requires_mps
 def test_conv_alloc_smoke_nonpeak():
-    """NON-PEAK smoke: current_allocated delta with the output held live stays under an explicit
-    budget = _TILE_BYTES + out_flat + contiguous-copy + weight + slack. (current_allocated is NOT
-    a high-watermark; the deterministic guarantee is test_tile_buffer_capped above.)"""
+    """The allocation delta with the output held live stays inside an explicit budget.
+
+    current_allocated is not a high-watermark; test_tile_buffer_capped is the real proof.
+    """
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
     torch.mps.empty_cache()
@@ -155,8 +154,7 @@ def test_conv3d_matches_reference(D, H, W, Cin, Cout, bias, monkeypatch):
 
 
 def test_install_default_on_routes_conv3d_only(monkeypatch):
-    """Default (no env) routes conv3d (the measured ~2.7x win) but NOT conv2d
-    (stock conv2d is at-roofline; im2col loses there)."""
+    """The default routes conv3d but not conv2d."""
     import torch.nn.functional as F
     import _patches.conv_im2col_mps as cm
     monkeypatch.delenv("ASFP8_CONV_IM2COL", raising=False)
@@ -211,7 +209,7 @@ def test_wrapper_falls_back_unsupported(kwargs):
     def fake_orig(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         called["hit"] = True
         return sentinel
-    conv2 = cm._make_wrap(fake_orig, 2)  # module-level wrapper factory (no MPS/install needed)
+    conv2 = cm._make_wrap(fake_orig, 2)  # module-level, so no MPS or install() needed
     x = torch.zeros(1, 4, 8, 8)          # CPU tensor, also unsupported device
     w = torch.zeros(8, 4, 3, 3)
     out = conv2(x, w, padding=1, **kwargs)
@@ -241,11 +239,8 @@ def _boom_fallback(*a, **k):
 
 @requires_mps
 def test_fallback_after_install_no_recursion(monkeypatch):
-    """[MAJOR #1] After install() swaps F.conv2d for the wrapper, a kernel failure inside
-    conv_im2col must fall back to the captured ORIGINAL conv -- not re-enter the wrapper.
-    Before the fix _fallback_conv called F.conv2d (= the wrapper) -> wrapper -> conv_im2col
-    -> kernel raises -> _fallback_conv -> wrapper -> ... infinite recursion. We force the
-    kernel to raise and assert exactly ONE kernel attempt (no re-entry) + a correct result."""
+    """After install(), a kernel failure falls back to the captured original conv rather
+    than re-entering the wrapper and recursing forever."""
     import torch.nn.functional as F
     import _patches.conv_im2col_mps as cm
     saved2, saved3 = F.conv2d, F.conv3d
@@ -270,12 +265,11 @@ def test_fallback_after_install_no_recursion(monkeypatch):
 
         x = torch.randn(1, 4, 8, 8, device="mps", dtype=torch.float16)
         w = torch.randn(8, 4, 3, 3, device="mps", dtype=torch.float16)
-        ref = saved2(x, w, None, 1, 1).float()           # stock conv via TRUE original
-        # call THROUGH the installed wrapper (what real callers hit after install)
+        ref = saved2(x, w, None, 1, 1).float()           # via the true original
+        # through the installed wrapper, as a real caller would
         out = F.conv2d(x, w, None, 1, 1).float()
         torch.mps.synchronize()
-        # with the recursion bug this is re-entered many times (or RecursionError); the
-        # fix makes the fallback use the captured original -> exactly ONE kernel attempt.
+        # exactly one attempt: re-entering the wrapper would recurse instead
         assert calls["checked"] == 1, calls
         assert out.shape == ref.shape
         assert (out - ref).abs().max().item() < 1e-2
@@ -285,9 +279,7 @@ def test_fallback_after_install_no_recursion(monkeypatch):
 
 @requires_mps
 def test_conv3d_multitile_matches_reference(monkeypatch):
-    """[MAJOR #2] Force tiny tiles so the conv3d tiling loop runs MANY tiles, and compare
-    against the F.conv3d fp32 reference. All other correctness tests are single-tile
-    (tile_p >= P); this is the only test that exercises the p0/rows tiling loop for real."""
+    """A many-tile conv3d matches the fp32 reference; every other test is single-tile."""
     import math
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
@@ -326,7 +318,7 @@ def test_conv3d_multitile_matches_reference(monkeypatch):
 @requires_mps
 @pytest.mark.parametrize("rank", [2, 3])
 def test_conv_batch_n_gt_1(rank, monkeypatch):
-    """[MINOR #5] N>1 batch: the pixel decode n = pix/(...) must place batches correctly."""
+    """N>1: the pixel decode places each batch correctly."""
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
     torch.manual_seed(0)
@@ -347,7 +339,7 @@ def test_conv_batch_n_gt_1(rank, monkeypatch):
 
 @requires_mps
 def test_conv3d_stride2_matches_reference(monkeypatch):
-    """[MINOR #6] conv3d with stride>1 (sD/sH/sW used independently in the gather)."""
+    """conv3d with stride>1, where the gather uses sD/sH/sW independently."""
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
     torch.manual_seed(0)
@@ -364,8 +356,7 @@ def test_conv3d_stride2_matches_reference(monkeypatch):
 
 @requires_mps
 def test_conv3d_bf16_end_to_end(monkeypatch):
-    """[MINOR #4] bf16 end-to-end conv (all other conv tests are fp16). Result must be no
-    worse than the stock bf16 conv against the fp32 reference."""
+    """A bf16 conv is no worse than the stock bf16 conv against the fp32 reference."""
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
     torch.manual_seed(0)
@@ -383,8 +374,8 @@ def test_conv3d_bf16_end_to_end(monkeypatch):
 
 
 def test_supported_rejects_dtype_mismatch():
-    """[MINOR #7] _supported must reject weight.dtype != x.dtype (kernel is compiled for the
-    input dtype and would read the weight buffer's bytes as the wrong type -> garbage)."""
+    """_supported rejects weight.dtype != x.dtype: the kernel is compiled per input dtype
+    and would read the weight bytes as the wrong type."""
     import _patches.conv_im2col_mps as cm
 
     class _FakeT:
@@ -400,15 +391,14 @@ def test_supported_rejects_dtype_mismatch():
 
 @requires_mps
 def test_scatter_matches_nonscatter(monkeypatch):
-    """The fused channel-major scatter epilogue must produce byte-identical output to the
-    out_flat+permute path (same kernel math, different store)."""
+    """The fused scatter epilogue is byte-identical to the out_flat+permute path."""
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
     torch.manual_seed(0)
     x = torch.randn(1, 16, 5, 24, 24, device="mps", dtype=torch.float16)
     w = torch.randn(12, 16, 3, 3, 3, device="mps", dtype=torch.float16)
     b = torch.randn(12, device="mps", dtype=torch.float16)
-    # [MINOR #3] defense-in-depth: a silent fallback would make scatter==nonscatter trivially
+    # a silent fallback would make scatter==nonscatter trivially
     monkeypatch.setattr(cm, "_fallback_conv", _boom_fallback, raising=True)
     monkeypatch.setenv("ASFP8_CONV_SCATTER", "0")
     ref = conv_im2col(x, w, b, stride=1, padding=1)
@@ -421,14 +411,14 @@ def test_scatter_matches_nonscatter(monkeypatch):
 
 @requires_mps
 def test_scatter_drops_extra_buffer(monkeypatch):
-    """DETERMINISTIC proof (current_allocated is NOT a high-watermark, so it cannot observe
-    the transient out_flat/copy that scatter removes). We spy torch.empty: the scatter path
-    must allocate ONLY the channel-major final output [N,Cout,H,W] + the [tile_p,K] A_tile,
-    and NEVER the [P,Cout] out_flat staging buffer the non-scatter path allocates."""
+    """The scatter path never allocates the [P,Cout] out_flat staging buffer.
+
+    Spied through torch.empty: current_allocated can't observe a transient buffer.
+    """
     import _patches.conv_im2col_mps as cm
     from _patches.conv_im2col_mps import conv_im2col
-    # [MINOR #3] defense-in-depth: stock fallback doesn't allocate [P,Cout] either, so a
-    # silent fallback could mask a broken scatter path -- make it explode instead.
+    # the stock fallback doesn't allocate [P,Cout] either, so a silent one would mask a
+    # broken scatter path -- make it explode instead
     monkeypatch.setattr(cm, "_fallback_conv", _boom_fallback, raising=True)
     N, Cin, H, W, Cout = 1, 64, 256, 256, 128
     P = N * H * W  # pad=1, stride=1 -> Hout=H, Wout=W

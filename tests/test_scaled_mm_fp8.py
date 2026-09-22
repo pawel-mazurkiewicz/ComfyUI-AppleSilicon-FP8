@@ -269,8 +269,7 @@ def v2_installed(monkeypatch):
 
 @requires_v2
 def test_install_wraps_the_v2_seam(monkeypatch):
-    """install() must wrap F.scaled_mm too — wrapping only torch._scaled_mm leaves
-    the patch attached to a function comfy_kitchen no longer calls."""
+    """install() wraps F.scaled_mm too, not just torch._scaled_mm (#19)."""
     monkeypatch.setattr(scaled_mm_fp8, "_installed", False)
     monkeypatch.setattr(torch, "_scaled_mm", torch._scaled_mm)
     monkeypatch.setattr(torch.nn.functional, "scaled_mm", torch.nn.functional.scaled_mm)
@@ -282,8 +281,7 @@ def test_install_wraps_the_v2_seam(monkeypatch):
 @requires_mps
 @requires_v2
 def test_v2_fp8_tensorwise_matches_the_legacy_seam(v2_installed):
-    """A plain TensorWise fp8 call through F.scaled_mm must produce exactly what
-    the torch._scaled_mm seam produces — same machinery, same numerics."""
+    """A plain TensorWise fp8 call through F.scaled_mm matches the legacy seam exactly."""
     ST = torch.nn.functional.ScalingType
     torch.manual_seed(0)
     a = (torch.randn(64, 128) * 0.3).to(torch.float8_e4m3fn).to("mps")
@@ -311,8 +309,7 @@ def test_v2_fp8_tensorwise_matches_the_legacy_seam(v2_installed):
     ["blockwise_swizzled", "list_recipes", "contraction_dim"],
 )
 def test_v2_passes_microscaling_through_untouched(v2_installed, kwargs_name):
-    """MXFP8/NVFP4 recipes and contraction_dim must reach the original unchanged —
-    this patch deliberately does not claim them."""
+    """Microscaling recipes and contraction_dim reach the original unchanged."""
     ST = torch.nn.functional.ScalingType
     SW = torch.nn.functional.SwizzleType
     a = (torch.randn(64, 64) * 0.1).to(torch.float8_e4m3fn).to("mps")
@@ -357,8 +354,7 @@ def test_v2_non_fp8_passes_through(v2_installed):
 @requires_mps
 @requires_v2
 def test_comfy_kitchen_plain_fp8_entry_point_routes(v2_installed):
-    """The live seam: comfy_kitchen's tensor/fp8.py _fp8_scaled_mm is what every
-    plain-fp8 Linear actually calls. It must land on our wrapper, not raise."""
+    """comfy_kitchen's own plain-fp8 entry point lands on our wrapper rather than raising."""
     ck_fp8 = pytest.importorskip("comfy_kitchen.tensor.fp8")
     a = (torch.randn(64, 128) * 0.3).to(torch.float8_e4m3fn).to("mps")
     w = (torch.randn(32, 128) * 0.3).to(torch.float8_e4m3fn).to("mps").t()
@@ -370,8 +366,7 @@ def test_comfy_kitchen_plain_fp8_entry_point_routes(v2_installed):
 
 @requires_v2
 def test_v2_without_an_original_raises_clearly(monkeypatch):
-    """Bound without install(), the pass-through branch must say so rather than
-    failing with 'NoneType' object is not callable."""
+    """Bound without install(), the pass-through branch raises a clear error."""
     monkeypatch.setattr(scaled_mm_fp8, "_original_v2", None)
     ST = torch.nn.functional.ScalingType
     a = torch.randn(4, 4)

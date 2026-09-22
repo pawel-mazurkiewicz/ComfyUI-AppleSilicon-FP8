@@ -1,16 +1,8 @@
-"""Patch #6 (ops_bias) must not intercept comfy_kitchen QuantizedTensor weights.
+"""Patch #6 (ops_bias) must not intercept comfy_kitchen QuantizedTensor weights (#9).
 
-Regression tests for issue #9: loading the MiniMax H3 int8 text encoder raised
-
-    NoCapableBackendError: No backend can handle 'dequantize_int8_embedding':
-    eager: q: dtype torch.bfloat16 not in {torch.int8}
-
-because our cast_bias_weight override dequantized the int8 QuantizedTensor to a
-plain bf16 tensor.  comfy's Embedding.forward_comfy_cast_weights needs the
-wrapper back so it can reach the raw int8 storage for a per-row gather.
-
-Native cast_bias_weight handles QuantizedTensors of any layout fine on MPS; it
-only fails on RAW fp8 tensors, which is the case this patch exists for.
+Native cast_bias_weight handles a QuantizedTensor of any layout on MPS; it only fails on
+raw fp8, which is the case this patch exists for. Dequantizing an int8 one to plain bf16
+takes the wrapper comfy needs for its per-row gather away.
 """
 import inspect
 import os
@@ -20,7 +12,7 @@ import pytest
 import torch
 
 # ComfyUI-desktop keeps the code tree outside the repo venv, so comfy is not
-# importable by default (same convention as test_rope_fast_comfy.py).
+# importable by default
 _CANDIDATES = [
     os.environ.get("ASFP8_COMFY_PATH"),
     "/Users/pawelma/ComfyUI-Installs/ComfyUI/ComfyUI",
@@ -53,11 +45,8 @@ class _FakeLayer:
 
 @pytest.fixture
 def patched():
-    """Install the ops_bias override, then restore the real one.
-
-    comfykitchen_fp8 installs before ops_bias at runtime and is what makes the
-    fp8 dequantize path MPS-safe, so it has to be in place here too.
-    """
+    """Install the ops_bias override, with comfykitchen_fp8 in place ahead of it as at
+    runtime, then restore the real one."""
     ck.install()
     original = ops.cast_bias_weight
     m._installed = False
@@ -90,11 +79,7 @@ def test_int8_quantized_weight_keeps_its_wrapper(patched):
 
 @requires_mps
 def test_fp8_quantized_weight_is_decoded(patched):
-    """fp8 storage must still be rescued: MPS cannot gather on fp8 qdata.
-
-    Guards the int8 fix from over-reaching into a blanket "delegate every
-    QuantizedTensor", which would push raw fp8 into F.embedding and raise.
-    """
+    """fp8 storage is still rescued: MPS cannot gather on fp8 qdata (#9)."""
     weight = _quantized("TensorCoreFP8Layout", scale=torch.tensor(1.0))
     layer = _FakeLayer(weight)
 
@@ -106,11 +91,7 @@ def test_fp8_quantized_weight_is_decoded(patched):
 
 @requires_mps
 def test_real_fp8_embedding_runs_on_mps(patched, monkeypatch):
-    """End-to-end: an fp8 embedding must survive its forward on MPS.
-
-    comfy hands the qdata straight to F.embedding, and MPS has no fp8 gather,
-    so our patch has to have decoded it to bf16 first.
-    """
+    """An fp8 embedding survives its forward on MPS, where F.embedding cannot gather fp8."""
     MP = ops.mixed_precision_ops(compute_dtype=torch.bfloat16)
     layer = MP.Embedding(16, 32, device="cpu", dtype=torch.bfloat16)
     src = torch.randn(16, 32, dtype=torch.bfloat16)
@@ -140,16 +121,11 @@ def test_real_fp8_embedding_runs_on_mps(patched, monkeypatch):
 
 @requires_mps
 def test_int8_embedding_dequantizes_without_backend_error(patched):
-    """The exact issue #9 crash: comfy >=0.30 routes int8 embeddings through
-    dequantize_int8_embedding, which rejects anything but int8 storage.
-
-    Skipped on older comfy, which has no int8_tensorwise branch.
-    """
+    """An int8 embedding dequantizes without NoCapableBackendError (#9)."""
     MP = ops.mixed_precision_ops(compute_dtype=torch.bfloat16)
     layer = MP.Embedding(16, 32, device="cpu", dtype=torch.bfloat16)
-    # Read the MODULE source, not mixed_precision_ops: our own kernel patches wrap
-    # that function, so once they install this probe would see their wrapper and
-    # silently skip the regression test it guards.
+    # the module source, not mixed_precision_ops: our own kernel patches wrap that
+    # function, and this probe would then see their wrapper and skip the test
     if "int8_tensorwise" not in inspect.getsource(ops):
         pytest.skip("comfy too old for the int8_tensorwise embedding path")
 
@@ -184,10 +160,9 @@ def test_raw_fp8_weight_is_still_decoded(patched):
 
 @requires_mps
 def test_int8_weight_survives_an_fp8_bias(patched):
-    """The rescue is decided per layer but must be applied per parameter.
+    """An fp8 bias doesn't drag an int8 weight through dequantize() (#9).
 
-    An fp8 bias must not drag an int8 weight through dequantize() -- that is the
-    issue #9 failure reached by a different route.
+    The rescue is decided per layer but applied per parameter.
     """
     weight = _quantized("TensorWiseINT8Layout")
     bias = torch.randn(64, dtype=torch.bfloat16).to(torch.float8_e4m3fn).to("mps")

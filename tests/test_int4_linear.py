@@ -1,7 +1,6 @@
 """Tests for _patches/int4_linear_mps.py (ConvRot W4A4 fast path on MPS).
 
-Requires comfy-kitchen >= 0.2.13 (ConvRot W4A4 layout). Skips otherwise —
-run with PYTHONPATH pointing at a new-enough kitchen if the env has an old one.
+Needs comfy-kitchen >= 0.2.13 for the ConvRot W4A4 layout, and skips otherwise.
 """
 
 import pytest
@@ -74,8 +73,8 @@ def _kernel_or_skip():
     import os
     os.environ["ASFP8_INT4_EXT"] = "1"
     from _patches.int4_ext import loader
-    # Earlier default-off W4A16 tests call loader.module() and permanently cache None;
-    # clear that cache so the W4A8 build is actually attempted (and tested) on capable HW.
+    # the default-off W4A16 tests above cache None here, so clear it or no build is
+    # ever attempted
     loader._tried = False
     loader._mod = None
     mod = loader.module()
@@ -152,12 +151,7 @@ def test_install_routes_mps_only():
 
 @requires_mps
 def test_int4_self_check_passes_on_a_working_kernel(monkeypatch):
-    """warmup() only proves the shader compiles.
-
-    The nibble order and the fused dequant epilogue are separate claims, and
-    either could break under a toolchain update the way #13's operand constraint
-    did. Opt-in, so this skips unless int4 is actually enabled.
-    """
+    """The self-check passes on a working kernel: warmup() only proves it compiles."""
     _kernel_or_skip()   # opts in and builds the extension, but not into _kernel
     monkeypatch.setattr(int4_linear_mps, "_kernel", None)
     monkeypatch.setattr(int4_linear_mps, "_kernel_tried", False)
@@ -204,11 +198,7 @@ def test_int4_verification_is_memoised(monkeypatch):
 
 @requires_mps
 def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
-    """A W4A8 dispatch that blows up must not be retried on every ConvRot layer.
-
-    Verification already passed by this point, so the failure recurs; without a
-    latch each layer pays the exception and logs a line (issue #13's 822).
-    """
+    """A W4A8 dispatch failure latches the kernel off instead of retrying per layer (#13)."""
     from _patches import _caps
 
     calls = []
@@ -239,15 +229,10 @@ def test_int4_dispatch_failure_latches_off_the_kernel(monkeypatch):
 
 @requires_mps
 def test_int4_explicit_opt_in_is_honoured_on_pre_m5_hardware(monkeypatch):
-    """int4 is opt-in (README: `ASFP8_INT4_EXT` default **off**) and its loader
-    returns None before building whenever the var is unset -- so a chip pre-filter
-    here would save no build at all, and would only be reachable in the one case
-    where the user has explicitly asked for the kernel.
+    """An explicit ASFP8_INT4_EXT=1 is honoured on pre-M5 hardware (#25).
 
-    _caps' standing promise is that an explicit env var beats any probe, "so
-    nothing here can lock a user out". Forcing the build on hardware we believe
-    cannot run it is the user's call to make; the self-check still rejects the
-    result, which is the outcome #25 documents.
+    int4 is opt-in, so a chip pre-filter would save no build and could only fire where
+    the user asked for the kernel; the self-check still rejects a wrong result.
     """
     from _patches import _caps
 
