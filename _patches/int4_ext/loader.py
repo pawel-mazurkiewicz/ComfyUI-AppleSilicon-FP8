@@ -1,8 +1,7 @@
-"""JIT loader for the packed-int4 matmul2d MPS probe extension.
+"""JIT loader for the packed-int4 matmul2d MPS extension.
 
-Builds _patches/int4_ext/int4_matmul2d.mm via torch.utils.cpp_extension.load
-(ObjC++, Metal 4.1). Opt-in (ASFP8_INT4_EXT=1), guarded, cached; returns None on
-any failure. Same space-in-path workaround as int8_ext/fp8_ext.
+Opt-in via ASFP8_INT4_EXT=1; guarded and cached, and returns None on any failure. Same
+space-in-path workaround as int8_ext/fp8_ext.
 """
 
 import os

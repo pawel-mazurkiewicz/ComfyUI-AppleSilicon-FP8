@@ -1,9 +1,8 @@
 """Shared guards for the JIT Metal-extension builds (int8_ext / fp8_ext / int4_ext).
 
 torch's cpp_extension.load takes no timeout and guards each build directory with a
-FileBaton. Both facts have bitten us: building inside install() froze ComfyUI's
-startup outright, and a lock left behind by a killed process stalls every later
-build, because FileBaton.wait() spins on os.path.exists with no ceiling.
+FileBaton whose wait() spins on os.path.exists forever, so a lock left by a killed
+process stalls every later build.
 """
 
 import atexit
@@ -11,9 +10,7 @@ import os
 import threading
 import time
 
-# Ceiling on one cold Metal-extension build, in seconds (ASFP8_EXT_BUILD_TIMEOUT;
-# <=0 disables the watchdog). A cold build measures ~5 s on an M5 Max / macOS 27, so
-# 600 s only fires when something is genuinely wedged.
+# seconds for one cold build (ASFP8_EXT_BUILD_TIMEOUT; <=0 disables the watchdog)
 BUILD_TIMEOUT_DEFAULT = 600.0
 
 
@@ -24,11 +21,8 @@ def _build_timeout():
         return BUILD_TIMEOUT_DEFAULT
 
 
-# Serialises prepare/load/undo across every loader. prepare() mutates torch's
-# module-level TORCH_LIB_PATH, so two overlapping workers would each snapshot the
-# other's temporary value and restore that, leaking it for the rest of the
-# session. Overlap is reachable through our own timeout path: a build we abandon
-# keeps running while the caller starts the next one.
+# serialises prepare/load/undo: prepare() mutates torch's module-level TORCH_LIB_PATH,
+# so two overlapping workers would each restore the other's temporary value
 _BUILD_LOCK = threading.Lock()
 
 
@@ -39,19 +33,16 @@ def _lock_path(build_dir):
 def _clear_stale_lock(build_dir, tag=""):
     """Drop a build lock that no live build could still own.
 
-    Age-gated deliberately: the build root is shared, so a young lock may belong to
-    a concurrent build in another ComfyUI process. Removing that one would let two
-    ninja runs write the same object files and produce a truncated extension.
+    Age-gated: the build root is shared, so a young lock may belong to another ComfyUI
+    process, and removing it would put two ninja runs in one directory.
     """
     lock = _lock_path(build_dir)
     try:
         age = time.time() - os.path.getmtime(lock)
     except OSError:
         return
-    # Twice the abandon timeout, not once: we give up waiting at T but never kill
-    # the build, so a lock just past T may still belong to a compile that is slow
-    # rather than wedged. Being too patient only costs one more stall on a machine
-    # that is already broken; being too eager puts two ninja runs in one directory.
+    # twice the abandon timeout: we stop waiting at T but never kill the build, so a
+    # lock just past T may still belong to a compile that is slow rather than wedged
     timeout = _build_timeout()
     threshold = 2 * (timeout if timeout > 0 else BUILD_TIMEOUT_DEFAULT)
     if age <= threshold:
@@ -65,14 +56,11 @@ def _clear_stale_lock(build_dir, tag=""):
 
 
 def _abandoned_lock_cleanup(build_dir, thread, owned=True):
-    """Cleanup for a build we stopped waiting on.
+    """Cleanup for a build we stopped waiting on, since an abandoned daemon thread
+    never reaches torch's baton-releasing `finally`.
 
-    torch releases the baton in a `finally` that an abandoned daemon thread never
-    reaches, so without this every timeout strands a lock for the next run.
-
-    `owned` guards the case a live thread cannot distinguish on its own: a thread
-    blocked in FileBaton.wait() is alive but holds nothing, and unlinking there
-    would free another process's lock and fail its build on release.
+    `owned` is false when our thread is merely blocked in FileBaton.wait(): it is alive
+    but holds nothing, and unlinking there would free another process's lock.
     """
     lock = _lock_path(build_dir)
 
@@ -89,13 +77,9 @@ def _abandoned_lock_cleanup(build_dir, thread, owned=True):
 def _cpp_load_guarded(cpp_load, prepare=None, **kwargs):
     """`torch.utils.cpp_extension.load` with a wall-clock ceiling.
 
-    There is no safe way to cancel torch's loader, so on expiry we raise and leave
-    the build on a daemon thread; the caller degrades to "kernel unavailable" for
-    this session.
-
-    `prepare` runs on the build thread and returns an undo callable. Globals the
-    build needs (torch's TORCH_LIB_PATH) must be set and restored there: doing it
-    around this call would restore them while an abandoned build is still linking.
+    torch's loader cannot be cancelled, so on expiry we raise and leave the build on a
+    daemon thread. `prepare` runs on that thread and returns an undo callable: doing it
+    around this call would restore the globals while an abandoned build still links.
     """
     timeout = _build_timeout()
     if timeout <= 0:
@@ -108,15 +92,12 @@ def _cpp_load_guarded(cpp_load, prepare=None, **kwargs):
                     undo()
 
     build_dir = kwargs.get("build_directory")
-    # A lock already present isn't ours: our thread will be waiting on it, not
-    # holding it, so we must not clean it up on the way out.
+    # a lock already present isn't ours to clean up: we will be waiting on it
     pre_existing_lock = os.path.exists(_lock_path(build_dir))
     result = {}
 
     def run():
         undo = None
-        # Held across prepare/load/undo so the global prepare() touches is never
-        # observed or restored by a second worker mid-build.
         with _BUILD_LOCK:
             try:
                 if prepare is not None:

@@ -1,14 +1,11 @@
 """JIT loader for the bit-exact int8 matmul2d MPS extension.
 
-Builds _patches/int8_ext/int8_gemm.mm via torch.utils.cpp_extension.load (ObjC++,
-Metal 4.0). DEFAULT ON where capable (M5-class matrix units + ninja, via the shared
-three-state gate); guarded, cached; returns None on any failure so callers fall back
-to the fp32/bf16 _int_mm path.
+Builds int8_gemm.mm through torch.utils.cpp_extension.load; guarded and cached, and
+returns None on any failure so callers fall back to the fp32/bf16 _int_mm path.
 
-Space-in-path workaround (same as fp8_ext): cpp_extension emits torch's lib `-L`
-UNQUOTED, so a space in torch's install path (".../IMPERIAL SPACE/...") breaks the
-link. We point the linker at a no-space symlink to torch/lib and build under a
-no-space directory. Best-effort, reverted on failure.
+Space-in-path workaround: cpp_extension emits torch's lib `-L` UNQUOTED, so a space in
+torch's install path breaks the link. Point the linker at a no-space symlink to torch/lib
+and build under a no-space directory; both are reverted on failure.
 """
 
 import os
@@ -50,8 +47,6 @@ def module():
         return _mod
     _tried = True
 
-    # DEFAULT ON where capable (M5-class matrix units + ninja). Three-state gate:
-    # unset -> on iff kernel_gate; ASFP8_INT8_EXT=off -> off; =1 -> force the build.
     from .. import _caps
     if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate):
         return None
@@ -59,12 +54,11 @@ def module():
         print("[int8_ext] no Metal toolchain (xcrun); int8-native disabled.")
         return None
 
-    # torch's cpp_extension needs the `ninja` *binary* on PATH (not just the
-    # python module). When ComfyUI is launched from the Desktop app, PATH often
-    # lacks homebrew/venv bins, so add the ninja package's bundled binary dir.
+    # cpp_extension needs the ninja *binary* on PATH, and ComfyUI-Desktop often
+    # launches without homebrew/venv bins on it
     if shutil.which("ninja") is None:
         try:
-            import ninja  # provides a bundled `ninja` executable
+            import ninja  # ships a bundled `ninja` executable
             bin_dir = getattr(ninja, "BIN_DIR", None) or os.path.join(
                 os.path.dirname(ninja.__file__), "data", "bin"
             )
