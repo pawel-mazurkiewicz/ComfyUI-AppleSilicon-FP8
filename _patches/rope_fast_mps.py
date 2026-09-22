@@ -1,20 +1,10 @@
 """Patch #21: fused standalone RoPE (apply_rope / apply_rope_split_half) on MPS.
 
-comfy_kitchen's eager apply_rope is bandwidth-bound but spends several ms/call because it runs the
-rotation as ~3-7 separate PyTorch launches with fp32 intermediates and (split-half) two
-non-contiguous movedim views (see dev/probe_rope_source.py / probe_rope_cost.py). This replaces
-it with ONE compile_shader pass: read x once, read the precomputed 2x2 rotation table once, write
-out once, fp32 math in registers, store in the input dtype. freqs_cis is the precomputed rotation
-matrix per (position, pair) -- NO complex multiply, NO cos/sin computed in-kernel.
-
-Pure elementwise compile_shader -> works on Apple Silicon M1+ (torch>=2.5); NOT gated on Metal
-4.1 / M5. DEFAULT ON, gated on compile_shader (ASFP8_ROPE_FAST=off disables). Never fatal: any
-compile/shape/dtype/convention
-mismatch falls back to the captured original eager apply_rope*. Per-call backend trace in
-_backend_events records (fn_name, "kernel"|"fallback", shape) for the spy tests. Patches the four
-comfy_kitchen.backends.eager attributes the registry reads via getattr() on every dispatch, and --
-as defence-in-depth -- the same four names on comfy_kitchen.backends.eager.rope.
-Scope: 4-D [B,H,L,D], fp32 freqs_cis table, batch/head-broadcast table. Anything else -> fallback."""
+Replaces eager's ~3-7 launches with one compile_shader pass: read x and the precomputed
+2x2 rotation table once, fp32 math in registers, store in the input dtype. Pure
+elementwise, so M1+ with no Metal-4.1 requirement. DEFAULT ON (ASFP8_ROPE_FAST=off
+disables); anything outside 4-D [B,H,L,D] with an fp32 broadcast table falls back.
+"""
 from __future__ import annotations
 import torch
 
@@ -65,20 +55,17 @@ _libs: dict[str, object] = {}
 _meta_cache: dict[tuple, torch.Tensor] = {}
 _warned = False
 
-# Per-call backend trace (MAJOR 5). Each kernel/fallback decision appends one event.
-# Tests inspect the tail to assert BOTH calls of a pair wrapper took the intended path.
+# per-call backend trace; the tests read its tail
 _backend_events: list[tuple] = []   # (fn_name, "kernel"|"fallback", tuple(shape))
-_MAX_EVENTS = 4096                   # bound the spy trace: default-on RoPE fires every block,
-                                     # so an unbounded list would leak across a long session
+_MAX_EVENTS = 4096                  # bounded: RoPE fires every block, for whole sessions
 
-# captured originals (set in install()/install_for_test()); fallback uses these.
-_orig: dict = {}                    # name -> original eager fn
+_orig: dict = {}                    # name -> original eager fn, used by the fallback
 
 
 def _record(name, backend, shape):
     _backend_events.append((name, backend, tuple(shape)))
     if len(_backend_events) > _MAX_EVENTS:
-        del _backend_events[:-_MAX_EVENTS // 2]   # keep the most-recent half (tests read the tail)
+        del _backend_events[:-_MAX_EVENTS // 2]   # keep the most-recent half
 
 
 def _last_backend():
@@ -105,8 +92,8 @@ def _meta(D, halfD, L, ny, rows, split, device):
 
 
 def _reference_interleaved(x, freqs_cis):
-    """Eager-FORMULA reference for apply_rope1 (interleaved). DIAGNOSTIC ONLY -- not the
-    primary oracle. The primary oracle in tests is the captured REAL eager op (see Task 2)."""
+    """Formula reference for apply_rope1 (interleaved). Diagnostic only: the tests'
+    oracle is the captured real eager op."""
     x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
     f = freqs_cis
     if x_.shape[2] != 1 and f.shape[2] != 1 and x_.shape[2] != f.shape[2]:
@@ -117,7 +104,7 @@ def _reference_interleaved(x, freqs_cis):
 
 
 def _reference_split_half(x, freqs_cis):
-    """Eager-FORMULA reference for apply_rope_split_half1. DIAGNOSTIC ONLY."""
+    """Formula reference for apply_rope_split_half1. Diagnostic only."""
     t_ = x.reshape(*x.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2).to(freqs_cis.dtype)
     t_out = freqs_cis[..., 0] * t_[..., 0] + freqs_cis[..., 1] * t_[..., 1]
     return t_out.movedim(-1, -2).reshape(*x.shape).type_as(x)
@@ -129,16 +116,12 @@ def _fallback1(name, x, freqs_cis):
 
 
 def _prep_table(freqs_cis, halfD, L):
-    """Return contiguous fp32 [Lf,halfD,4] table or None (-> fallback).
+    """Return a contiguous fp32 [Lf,halfD,4] table, or None to fall back.
 
-    No cache (MAJOR 9 contingency): a ``weakref.WeakKeyDictionary`` keyed by a tensor crashes on
-    this torch build because ``weakref.ref.__eq__`` delegates to the tensor's elementwise ``__eq__``
-    ("Boolean value of Tensor with more than one value is ambiguous"). The plan's sanctioned
-    fallback is to recompute ``fr`` every call -- which is free for the common case: an
-    already-contiguous fp32 table makes ``reshape`` a metadata-only view and ``contiguous`` a no-op
-    (returns the same storage, no copy). Recomputing also means the table can never go stale, so
-    in-place table mutation is reflected automatically."""
-    if freqs_cis.dtype != torch.float32:                # MAJOR 8: hard-fallback on non-fp32
+    Deliberately uncached: a WeakKeyDictionary keyed by a tensor raises here, and for an
+    already-contiguous fp32 table this is a metadata-only view plus a no-op.
+    """
+    if freqs_cis.dtype != torch.float32:
         return None
     fs = freqs_cis.shape
     if len(fs) < 4 or fs[-1] != 2 or fs[-2] != 2 or fs[-3] != halfD:
@@ -146,16 +129,14 @@ def _prep_table(freqs_cis, halfD, L):
     Lf = fs[-4]
     if Lf < L:
         return None
-    if any(int(d) != 1 for d in fs[:-4]):               # require batch/head broadcast (Open Q #2)
+    if any(int(d) != 1 for d in fs[:-4]):               # batch/head must broadcast
         return None
-    return freqs_cis.reshape(Lf, halfD, 4).contiguous()  # already fp32; view + no-op for contiguous
+    return freqs_cis.reshape(Lf, halfD, 4).contiguous()
 
 
 def _launch(x, fr, D, halfD, L, split):
-    """Low-level kernel launch. ``x`` must be rank-4 MPS with a supported dtype; ``fr`` a contiguous
-    fp32 rotation table whose rows are indexed by ``row % L`` (table layout [Lf, halfD, 4], flattened
-    f00,f01,f10,f11 per pair). Returns ``out`` shaped like ``x``. Raises on any kernel failure (the
-    caller turns that into a fallback)."""
+    """Low-level launch: rank-4 MPS ``x``, and ``fr`` laid out [Lf, halfD, 4] as flattened
+    f00,f01,f10,f11 per pair, indexed by ``row % L``. Raises, and the caller falls back."""
     xc = x.contiguous()
     rows = xc.numel() // D
     ny = min(rows, _NY)
@@ -170,7 +151,7 @@ def _launch(x, fr, D, halfD, L, split):
 def _rope_fused(name, x, freqs_cis, split):
     global _warned
     if (x.device.type != "mps" or x.dtype not in _MSL_T
-            or freqs_cis.device != x.device or x.numel() == 0 or x.dim() != 4):  # MAJOR 6: rank-4 only
+            or freqs_cis.device != x.device or x.numel() == 0 or x.dim() != 4):
         return _fallback1(name, x, freqs_cis)
     try:
         D = x.shape[-1]
@@ -218,8 +199,8 @@ _installed = False
 
 
 def _targets():
-    """The module objects whose attrs we patch: the eager PACKAGE (read by the registry) and the
-    eager.rope SOURCE module (defence-in-depth for direct importers / pair-wrapper internals)."""
+    """The modules whose attrs we patch: the eager package the registry reads, and the
+    eager.rope source module, for direct importers."""
     import comfy_kitchen.backends.eager as e
     import comfy_kitchen.backends.eager.rope as r
     return (e, r)
@@ -231,12 +212,12 @@ def _do_install():
         return True
     e, r = _targets()
     for name in _PATCH_MAP:
-        _orig[name] = getattr(e, name)        # capture original (used by fallback + as oracle)
+        _orig[name] = getattr(e, name)
     g = globals()
     for name, repl in _PATCH_MAP.items():
         setattr(e, name, g[repl])             # the attr the registry reads via getattr
         try:
-            setattr(r, name, g[repl])         # source-module global (MAJOR 4)
+            setattr(r, name, g[repl])         # source-module global
         except Exception:
             pass
     _installed = True
@@ -244,8 +225,6 @@ def _do_install():
 
 
 def install():
-    # Patch #21 (standalone fused RoPE kernel) is DEFAULT ON, gated on compile_shader
-    # (Tier A: fp32 math, no Metal-4.1/M5 needed). ASFP8_ROPE_FAST=off disables; =1 forces on.
     from . import _caps
     if not _caps.resolve("ASFP8_ROPE_FAST", default_on=True, cap=_caps.has_compile_shader):
         return
@@ -261,14 +240,11 @@ def install():
             print(f"{TAG} comfy_kitchen not installed; eager-rope retarget off.",
                   flush=True)
         else:
-            # A missing submodule or transitive dependency is not an absent
-            # package; naming it saves people from reinstalling the wrong thing.
+            # naming the missing submodule saves people reinstalling the wrong thing
             print(f"{TAG} comfy_kitchen is installed but {e.name} is missing; "
                   f"eager-rope retarget off.", flush=True)
     except Exception as e:
-        # Installed but unimportable (broken dep, partial install) is a different
-        # story from absent, and reporting it as "not installed" sends people
-        # looking in the wrong place.
+        # unimportable is not absent, and saying "not installed" misdirects people
         have_ck = False
         print(f"{TAG} comfy_kitchen present but failed to import ({e!r}); "
               f"eager-rope retarget off.", flush=True)

@@ -1,38 +1,8 @@
 """Patch: route comfy_kitchen INT8 convrot layers through our bit-exact Metal kernel.
 
-Background
-----------
-comfy ships int8 (`int8_tensorwise`, e.g. Krea2 convrot int8mixed) but **disables
-the real int8 compute path on every non-CUDA platform**: `comfy.quant_ops` sets
-``QUANT_ALGOS["int8_tensorwise"]["quantize_input"] = False`` (no CUDA -> no fast
-int8 matmul). So on MPS every step instead runs **weight-only W8A16**: it
-dequantizes the full int8 weight to bf16 *and un-rotates the whole convrot weight
-in fp32* per layer per step (~50% of GPU time), then a bf16 ``F.linear``.
-
-Naively flipping ``quantize_input = True`` does NOT work: comfy's forward then
-pre-quantizes the activation **tensorwise** (a single scalar scale over the whole
-[M,K] activation) via ``QuantizedTensor.from_float`` *before* convrot can spread
-the outliers, then re-quantizes inside ``int8_linear``. Measured: that pre-quant
-adds ~16% error (17x worse than W8A16) -> structured garbage. (That is exactly why
-comfy disabled it for int8.)
-
-What works (measured ~1.3% err, on par with W8A16's ~0.9%): the **clean W8A8**
-path -- feed ``comfy_kitchen.int8_linear`` the *raw bf16* activation so it does the
-convrot rotation first and *then* per-row quantization, then an int8xint8 matmul.
-
-So this patch wraps the ``mixed_precision_ops`` factory and replaces the int8
-``Linear.forward`` so that, on MPS, eligible int8 layers compute via our
-kernel-backed ``int8_linear`` on the raw bf16 input -- skipping both comfy's lossy
-pre-quant and the per-step fp32 weight dequant/un-rotation. The matmul runs on our
-bit-exact INT8xINT8->INT32 Metal kernel (~102 TF/s, ~1.75x over bf16). For the
-tensorwise-scale bf16 case (Krea2's int8mixed), the rescale ``float(C)*row_scale[m]``
-and bias add are **fused into the kernel's store epilogue** (Cider's
-``w8a8_matmul_fused_dequant``), so the int32 product never round-trips through
-global memory -- bit-identical to the chunked path, ~1.2-1.65x faster per call.
-Everything else (other quant formats, transposed weights, LoRA weight/bias
-functions, non-MPS) falls back to comfy's original forward unchanged.
-
-DEFAULT ON, gated on M5/Metal-4.1 + ninja; ``ASFP8_INT8_EXT=off`` force-disables, ``=1`` forces the build attempt.
+Feeds int8_linear the raw bf16 activation so convrot rotates before the per-row quant,
+skipping both comfy's lossy tensorwise pre-quant and the per-step fp32 weight dequant
+and un-rotation. DEFAULT ON, gated on M5/Metal-4.1 + ninja; ASFP8_INT8_EXT=off disables.
 """
 
 import sys
@@ -48,9 +18,7 @@ _kernel_tried = False
 _self_checked = False
 _self_ok = False
 
-# Supported fused activations. P0 verdict (M5 Max / macOS 27 / Metal 4.1):
-# Metal `erf` is unavailable, so act=3 (gelu-erf) is dropped entirely; only
-# {none, silu, gelu_tanh} are kept everywhere (kernel store, pybind, this map).
+# gelu-erf is absent everywhere (kernel store, pybind, here): Metal has no `erf`
 _ACT = {"none": 0, "silu": 1, "gelu_tanh": 2}
 
 
@@ -61,8 +29,7 @@ def _act_code(act):
 
 
 def _apply_act(result, act):
-    """Apply the named activation to an already-computed linear output. Single source
-    of truth so no return path can silently drop the activation."""
+    """Apply the named activation to an already-computed linear output."""
     if act == "none":
         return result
     if act == "silu":
@@ -81,8 +48,8 @@ def _load_kernel():
     mod = loader.module()
     if mod is not None:
         try:
-            # warmup() dispatches for real, so it is where a library that BUILT
-            # but whose Metal source the runtime rejects actually fails (#13).
+            # warmup() dispatches for real, so a library that built but whose Metal
+            # source the runtime rejects fails here
             mod.warmup()
         except Exception as e:
             print(f"{TAG} warmup failed; disabling: {e!r}")
@@ -93,10 +60,7 @@ def _load_kernel():
 def _ensure_kernel():
     """Build the Metal extension lazily, on the FIRST layer that can actually use it.
 
-    Building inside install() blocked ComfyUI's startup import on a synchronous
-    ninja+clang build (issue: "hangs forever at startup when ninja is installed").
-    Deferring it here matches scaled_mm_fp8._get_backend / int4_linear_mps._load_kernel
-    and keeps startup non-blocking; a failed build is remembered so we retry once only.
+    Building inside install() would block ComfyUI's startup on a ninja+clang build.
     """
     global _kernel, _kernel_tried
     if _kernel is not None or _kernel_tried:
@@ -111,13 +75,9 @@ def _ensure_kernel():
 def _self_check():
     """One-time correctness gate on a tiny int8 matmul.
 
-    The .so loading is not proof the kernel works: the Metal library is compiled
-    by newLibraryWithSource on the FIRST dispatch, so a toolchain that rejects it
-    fails here rather than at build time. Without this latch that compile is
-    retried on every eligible Linear (issue #13) — slower than not having the
-    kernel at all. Mirrors fp8_linear_kernel_mps._self_check.
-
-    MUST be called only AFTER a layer passes every eligibility gate.
+    The .so loading proves nothing: the Metal library is compiled on the first
+    dispatch, so a toolchain that rejects it fails here. Call only after a layer has
+    passed every eligibility gate.
     """
     global _self_checked, _self_ok
     if _self_checked:
@@ -139,12 +99,7 @@ def _self_check():
 
 
 def _verify():
-    """The contract _caps.kernel_ready expects: build, warmup, then numerics.
-
-    Nothing short of this proves the kernel works. kernel_gate() only checks that
-    the chip has matrix units and that ninja exists; it says nothing about whether
-    int8_gemm.mm builds here or what it computes (#14, #25, #27).
-    """
+    """The contract _caps.kernel_ready expects: build, warmup, then numerics."""
     return _ensure_kernel() is not None and _self_check()
 
 
@@ -160,12 +115,10 @@ def _int8_linear_kernel(
 ):
     """Kernel-backed drop-in for comfy_kitchen eager int8_linear.
 
-    Semantics match the original exactly (optional convrot activation rotation,
-    per-row int8 activation quant, int8xint8->int32 matmul, chunked rescale by
-    weight_scale*row_scale, optional bias). Only the matmul backend differs (our
-    NT kernel vs torch._int_mm) and the weight is used in its stored [N,K] layout.
+    Semantics match the original exactly; only the matmul backend differs, and the
+    weight is used in its stored [N,K] layout.
     """
-    code = _act_code(act)  # validate up front (raises on typo) before any dispatch
+    code = _act_code(act)  # raise on a typo before any dispatch
 
     if (
         _kernel is None
@@ -199,11 +152,8 @@ def _int8_linear_kernel(
     x_8, x_scale = quantize_int8_rowwise(x_2d)
     weight_scale = weight_scale.view(-1)
 
-    # Fused fast path: when the rescale is purely per-row (tensorwise weight
-    # scale, the int8_tensorwise case) and the output is bf16, fold
-    # float(C)*row_scale[m] (+bias) straight into the kernel's store epilogue so
-    # the int32 product never round-trips through global memory. Bit-identical to
-    # the chunked path below (verified equal across convrot/bias/3D/M=1).
+    # fused fast path: fold float(C)*row_scale[m] (+bias) into the kernel's store
+    # epilogue, which is bit-identical to the chunked path below
     if (
         out_dtype == torch.bfloat16
         and weight_scale.numel() == 1
@@ -211,13 +161,13 @@ def _int8_linear_kernel(
     ):
         row_scale = (weight_scale.float() * x_scale.reshape(-1).float()).contiguous()
         bias_arg = bias.to(torch.bfloat16) if bias is not None else None
-        # Activation is fused IN-KERNEL here; do NOT also call _apply_act.
+        # the activation is fused in-kernel here; do NOT also call _apply_act
         result = _kernel.i8_matmul2d_nt_fused(
             x_8.contiguous(), weight.contiguous(), row_scale, bias_arg, code
         )
         return result.reshape(*orig_shape[:-1], weight.shape[0])
 
-    # C[M,N] int32 = x_8[M,K] @ weight[N,K]^T  (NT: weight in stored layout).
+    # C[M,N] int32 = x_8[M,K] @ weight[N,K]^T  (NT: weight in stored layout)
     result = _kernel.i8_matmul2d_nt(x_8.contiguous(), weight.contiguous())
 
     m, n = result.shape
@@ -233,7 +183,6 @@ def _int8_linear_kernel(
     if bias is not None:
         result = result + bias.to(device=result.device, dtype=result.dtype)
 
-    # Chunked fallback path: activation is applied here (never fused in-kernel).
     result = _apply_act(result, act)
 
     return result.reshape(*orig_shape[:-1], weight.shape[0])
@@ -243,10 +192,8 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                         convrot=False, convrot_groupsize=256, act="silu"):
     """Fused gated linear: H = act(x@w_gate^T + bias_gate) * (x@w_up^T + bias_up).
 
-    Uses the single-pass fused gate kernel only when both weight scales are scalar
-    (the row-scale precombine ws*x_scale[m] is only valid then); otherwise routes
-    through the per-branch _int8_linear_kernel path (which handles per-channel scales
-    and applies the activation itself). act in {"silu","gelu_tanh"} (no "none").
+    The single-pass kernel needs scalar weight scales; per-channel scales route through
+    _int8_linear_kernel per branch. act in {"silu","gelu_tanh"}, never "none".
     """
     if act == "none":
         raise ValueError("_int8_swiglu_kernel requires a real gate activation, not 'none'")
@@ -261,8 +208,6 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                 and w_up.dtype == torch.int8 and scalar_scales
                 and hasattr(_kernel, "i8_matmul2d_nt_swiglu"))
     if not fused_ok:
-        # Per-branch fallback (kernel missing, off-MPS, non-int8, or per-channel scales —
-        # the row-scale precombine below is only valid for scalar weight scales).
         g = _int8_linear_kernel(x, w_gate, ws_gate, bias_gate, torch.bfloat16,
                                 convrot, convrot_groupsize, act=act)  # activation applied here
         u = _int8_linear_kernel(x, w_up, ws_up, bias_up, torch.bfloat16,
@@ -290,11 +235,8 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
 def _try_int8_kernel_forward(self, input):
     """Return the layer output via the kernel W8A8 path, or None to fall back.
 
-    Eligible iff: input is a plain MPS Tensor (not a QuantizedTensor); weight is a
-    TensorWiseINT8Layout QuantizedTensor; not full-precision-mm; no force-cast; no
-    LoRA weight/bias functions; weight not logically transposed; and the Metal
-    kernel builds. The build is attempted only AFTER every cheap eligibility gate
-    passes, so a model with no int8 convrot layers never pays for it.
+    The kernel build is attempted only after every cheap eligibility gate passes, so a
+    model with no int8 convrot layers never pays for it.
     """
     try:
         from comfy_kitchen.tensor import QuantizedTensor
@@ -307,20 +249,14 @@ def _try_int8_kernel_forward(self, input):
         w = self.weight
         if not isinstance(w, QuantizedTensor) or getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
             return None
-        # Offloaded weight (comfy parks it on CPU between uses): fall back to the
-        # comfy forward, which casts it in. Reaching _int8_linear_kernel with a
-        # CPU weight would throw in its own fallback and latch mark_kernel_failed,
-        # killing the kernel for the session over a transient condition.
+        # offloaded weight: transient, so let comfy's forward cast it in rather than
+        # latch mark_kernel_failed for the session
         if w.device.type != "mps":
             return None
         if getattr(self, "_full_precision_mm", False):
             return None
-        # comfy_force_cast_weights on an int8 QuantizedTensor only means "storage
-        # dtype != compute dtype, cast at use" -- and for a quantized weight that
-        # cast IS the per-call W8A16 dequant/un-rotation this path exists to
-        # bypass, so it must not disqualify the kernel route. (MiniMax Music 3's
-        # text encoder sets it on every layer, which silently forced the slow
-        # path for the whole model.)
+        # deliberately no comfy_force_cast_weights check: on a quantized weight that
+        # cast IS the per-call dequant/un-rotation this path exists to bypass
         if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
             return None
 
@@ -340,9 +276,7 @@ def _try_int8_kernel_forward(self, input):
 
         return _int8_linear_kernel(input, qdata, scale, bias, input.dtype, convrot, gs)
     except Exception as e:
-        # Never take down a render; fall back to comfy's original forward, and
-        # stop using the kernel for the rest of the session -- verification
-        # already passed, so this repeats on every later layer if we don't.
+        # latch off: verification already passed, so this repeats on every later layer
         from . import _caps
         if _caps._kernel_ready.get("int8"):
             print(f"{TAG} kernel forward failed ({e!r}); using comfy's int8 path "
@@ -355,12 +289,11 @@ _DEQUANT_MODE = None
 
 
 def _dequant_enabled():
-    """Opt-in gate for once-at-load weight dequant: ASFP8_INT8_DEQUANT=1 enables,
-    subject to a >= 48 GiB total-RAM safety check; unset or off stays off.
+    """Opt-in gate for once-at-load weight dequant, plus a >= 48 GiB total-RAM check.
 
-    Opt-in because the plain copy (~16 GB for an 8B int8 model) lands AFTER
-    comfy's model_management has budgeted around the loaded int8 size, so
-    auto-enabling near the threshold risks thrash/OOM comfy can't see coming."""
+    Opt-in because the plain copy lands after comfy's model_management has budgeted
+    around the loaded int8 size.
+    """
     global _DEQUANT_MODE
     if _DEQUANT_MODE is None:
         import os
@@ -379,40 +312,28 @@ def _dequant_enabled():
 
 
 def _maybe_dequant_weight(self, input):
-    """One-off per layer: replace an eligible int8 QuantizedTensor weight with its
-    dequantised (un-rotated) plain tensor in the compute dtype, resident on MPS.
+    """One-off per layer: replace an eligible int8 (or fp16) weight with a plain
+    tensor in the compute dtype, resident on MPS.
 
-    Rationale: single-token AR decode is memory-bandwidth-bound, and every
-    quantised route (kernel W8A8 or comfy's per-call W8A16 dequant) pays a
-    per-call rotate/quant/rescale op chain whose MPS dispatch overhead dominates
-    at M=1..2 (measured 3-10x the matmul cost on MiniMax Music 3 AR decode).
-    Paying the dequant once and running single-dispatch F.linear is both faster
-    and numerically identical to comfy's stock W8A16 path. fp16 weights with a
-    different compute dtype get the same treatment: manual_cast otherwise copies
-    the full tensor every call (MiniMax's 134 MB audio_heads dominate a decode
-    profile through aten::copy_)."""
+    At M=1..2 the per-call rotate/quant/rescale dispatch overhead dominates the matmul,
+    so paying the dequant once is faster and numerically identical to comfy's W8A16.
+    """
     if getattr(self, "_asfp8_deq_done", False):
         return
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
-        # Transient conditions (properties of this call's input) leave the flag
-        # unset so a later MPS-resident call can still dequantise. Everything
-        # past the flag is a stable property of the layer, decided once.
+        # checks before the flag are properties of this call, so leave it unset for a
+        # later one; everything past it is a stable property of the layer
         if not isinstance(input, torch.Tensor) or isinstance(input, QuantizedTensor):
             return
         if input.device.type != "mps":
             return
-        # Half-precision compute only: an fp32 activation would balloon the
-        # dequantised copy to 2x the size the >= 48 GiB gate budgets for.
+        # half precision only: fp32 would double the copy the RAM gate budgets for
         if input.dtype not in (torch.float16, torch.bfloat16):
             return
-        # Offloaded weight: comfy is deliberately keeping it off-device, so
-        # dequantising would pull a bigger, full-precision copy onto the GPU and
-        # pin it there -- undoing the offload and inflating residency past what
-        # the >= 48 GiB gate budgeted for. Transient like the checks above, so
-        # the flag stays unset and a later resident call can still dequantise.
-        # _maybe_dequant_embedding already treats its weight this way.
+        # offloaded weight: dequantising would pull a bigger copy back onto the GPU
+        # and undo the offload
         w = getattr(self, "weight", None)
         if w is None or getattr(w, "device", None) is None or w.device.type != "mps":
             return
@@ -442,31 +363,27 @@ def _maybe_dequant_weight(self, input):
             self.bias = torch.nn.Parameter(b.detach().to(device="mps", dtype=input.dtype), requires_grad=False)
         self.comfy_force_cast_weights = False
     except Exception as e:
-        # Latch on failure too: retrying an identical dequant every call would
-        # just repeat the error (and the print) for the rest of the session.
+        # latch on failure too, or the same error prints on every call
         self._asfp8_deq_done = True
         print(f"{TAG} weight dequant skipped ({e!r})")
 
 
 def _maybe_dequant_embedding(self, dtype_hint):
-    """One-off per Embedding: replace an int8 QuantizedTensor (or fp16) table with
-    a plain tensor in the compute dtype so per-call cast/dequant of the whole
-    table disappears (cast_bias_weight casts the full weight every lookup)."""
+    """One-off per Embedding: replace an int8 (or fp16) table with a plain tensor in
+    the compute dtype, so cast_bias_weight stops casting it on every lookup."""
     if getattr(self, "_asfp8_deq_done", False):
         return
     try:
         from comfy_kitchen.tensor import QuantizedTensor
 
         w = self.weight
-        # Off-MPS is transient (offload); leave the flag unset for a later call.
+        # off-MPS is transient (offload), so leave the flag unset for a later call
         if w is None or w.device.type != "mps":
             return
         self._asfp8_deq_done = True
         if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
             return
-        # The hint comes from Embedding.forward's out_dtype (kwarg or first
-        # positional); anything that isn't a half-precision dtype is ignored,
-        # not trusted (same memory-budget reasoning as _maybe_dequant_weight).
+        # half precision only, same memory budget as _maybe_dequant_weight
         if dtype_hint not in (torch.float16, torch.bfloat16):
             dtype_hint = None
         target = dtype_hint if dtype_hint is not None else torch.bfloat16
@@ -489,16 +406,12 @@ def install():
         return
     if sys.platform != "darwin":
         return
-    # DEFAULT ON, gated on M5-class matrix units + ninja to build the ObjC++
-    # extension). On unsupported HW the default resolves to OFF so we never attempt a
-    # build; ASFP8_INT8_EXT=off force-disables, =1 forces the build attempt anyway.
     from . import _caps
     if not _caps.resolve("ASFP8_INT8_EXT", default_on=True, cap=_caps.kernel_gate):
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
 
-    # Capture the original eager int8_linear for the fallback inside the wrapper.
     try:
         from comfy_kitchen.backends.eager.quantization import int8_linear as _orig
         _orig_int8_linear = _orig
@@ -506,9 +419,8 @@ def install():
         print(f"{TAG} could not import eager int8_linear: {e!r}")
         return
 
-    # Wrap the mixed_precision_ops factory so each generated int8 Linear routes
-    # through the kernel W8A8 path. pick_operations() calls this by module name at
-    # model load, so wrapping the module attribute is sufficient.
+    # pick_operations() calls the factory by module name at model load, so wrapping
+    # the module attribute is enough
     try:
         import comfy.ops as ops
 
@@ -550,12 +462,9 @@ def install():
         wrapped_factory._asfp8_wrapped = True
         ops.mixed_precision_ops = wrapped_factory
 
-        # down_proj is invoked via ops.linear_input_act (fused swiglu path), which
-        # reads linear.weight directly and never calls Linear.forward -- so the
-        # once-at-load dequant must hook here too or those layers stay int8.
-        # getattr, not attribute access: a comfy without linear_input_act must not
-        # abort install() here -- mixed_precision_ops is already wrapped above and
-        # the except below would leave _installed False with a misleading message.
+        # ops.linear_input_act (fused swiglu) reads linear.weight directly and never
+        # calls Linear.forward, so the dequant has to hook here too. getattr: a comfy
+        # without it must not abort install() after the wrap above.
         orig_lia = getattr(ops, "linear_input_act", None)
         if orig_lia is not None and not getattr(orig_lia, "_asfp8_deq_wrapped", False):
             def linear_input_act(linear, x, input_act, *args, **kwargs):

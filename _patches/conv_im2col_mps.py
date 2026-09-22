@@ -1,20 +1,9 @@
-"""Patch #18: VAE conv on MPS via tiled im2col + matmul2d tensor-op GEMM (conv3d default-ON).
+"""Patch #18: VAE conv on MPS via tiled im2col + a matmul2d tensor-op GEMM.
 
-Routes conv2d/conv3d through `im2col_2d/3d` gather -> NT `matmul2d` GEMM (half/bf16/fp32
-operands, fp32 cooperative-tensor accumulate) + fused bias, looping over output-pixel
-tiles so the lowered patch buffer (`A_tile`) is capped (default 384 MB). Targets the
-Session-15 SeedVR2 non-tiled conv3d decode OOM. Authored with torch.mps.compile_shader
-(pure-Python authoring path, no .mm/xcrun/ninja build step).
-
-Gating: conv3d is ON by default (im2col is ~2.7x faster than stock MPS conv3d and ~31%
-faster end-to-end on SeedVR2 — measured on M5/Metal 4.1). conv2d stays OFF by default
-(stock conv2d is already at-roofline; im2col loses there). Kill switch: ASFP8_CONV_IM2COL=off.
-Opt conv2d in with =2d or =2d,3d (=1|on|true => both ranks). Build is M5/Metal-4.1 gated and
-never fatal: any compile/kernel/shape failure falls back to stock F.conv2d/conv3d.
-
-B.0 probe (M5 Max / macOS 27 / PyTorch 2.11 / Metal 4.1) confirmed the <T,T,float>
-cooperative-accumulate matmul2d compiles+runs+CORRECT for half, bfloat AND float, so all
-three are exposed below.
+im2col gather -> NT matmul2d + fused bias, looping over output-pixel tiles so the
+lowered patch buffer stays under ASFP8_CONV_TILE_MB. conv3d is ON by default; conv2d
+is not (stock conv2d is already at roofline). ASFP8_CONV_IM2COL=off kills it, =2d or
+=2d,3d opts conv2d in. Any compile/kernel/shape failure falls back to stock conv.
 """
 import os
 
@@ -24,8 +13,7 @@ import torch.nn.functional as F
 TAG = "[AppleSilicon-FP8/conv]"
 
 def _tile_mb():
-    # Parsed at import time; a malformed value must NOT crash the whole node before the
-    # per-patch install guards run — fall back to the 384 MB default.
+    # parsed at import, before the install guards run, so it must never raise
     try:
         return max(1, int(os.environ.get("ASFP8_CONV_TILE_MB", "384")))
     except (TypeError, ValueError):
@@ -34,8 +22,7 @@ def _tile_mb():
 
 _TILE_BYTES = _tile_mb() * 1024 * 1024
 
-# B.0 (dev/probe_matmul2d_dtype_scatter.py) recorded PASS for all three operand dtypes
-# with an fp32 cooperative-tensor accumulator (matching the handed-down G2 result).
+# operand dtypes the fp32-accumulate matmul2d is verified correct for
 _DT = {
     torch.float16: "half",
     torch.bfloat16: "bfloat",
@@ -190,7 +177,7 @@ kernel void im2col_3d(
 }
 """
 
-# combined per-dtype source is assembled in _lib(). Keep _ALL_SRC as source fragments.
+# fragments; _lib() assembles and compiles the per-dtype source
 _ALL_SRC = [_IM2COL_2D_SRC, _IM2COL_3D_SRC, _GEMM_SRC]
 
 
@@ -260,8 +247,7 @@ def _im2col_2d_full(x, kh, kw, s, p):
 
 
 def _gemm_nt_bias(A, Bw, bias, out=None):
-    """OUT[M,N] = A[M,K] @ Bw[N,K]^T + bias. Writes into `out` if given (a view into
-    out_flat[p0:p0+rows]); allocates only when out is None. No per-tile alloc/copy."""
+    """OUT[M,N] = A[M,K] @ Bw[N,K]^T + bias, into `out` if given, else a fresh tensor."""
     M, K = A.shape
     N = Bw.shape[0]
     if out is None:
@@ -281,16 +267,15 @@ def _gemm_nt_bias(A, Bw, bias, out=None):
 
 
 def _scatter_on():
-    # Fused channel-major scatter epilogue (drops out_flat + permute copy). Default on.
     return os.environ.get("ASFP8_CONV_SCATTER", "1").lower() in ("1", "on", "true")
 
 
 def _gemm_nt_bias_scatter(A, Bw, bias, out, p0, Cout, Dout, Hout, Wout):
-    """OUT[N,Cout,(Dout,)Hout,Wout] = A[rows,K] @ Bw[Cout,K]^T + bias, scattered to the
-    channel-major destination by decoding pix=p0+(m0+r) -> (n,od,oh,ow). Each element is
-    STORED exactly once (assign, not accumulate) and every (m<M, n<Cout) is covered across
-    tiles, so `out` needs no pre-zeroing. `out` is the final channel-major tensor (no
-    out_flat staging, no permute copy). For 2D pass Dout=1."""
+    """As _gemm_nt_bias, but scattered straight into the channel-major destination.
+
+    Every element is stored exactly once and all of them are covered across tiles, so
+    `out` needs no pre-zeroing. Pass Dout=1 for 2D.
+    """
     M, K = A.shape
     N = Bw.shape[0]
     has_bias = 1 if bias is not None else 0
@@ -320,12 +305,11 @@ def _supported(x, weight, dilation, groups, dtype):
 
 
 def _fallback_conv(x, weight, bias, stride, padding, dilation, groups):
-    """Single named seam for the stock-conv fallback (monkeypatched by the spy test).
+    """Single named seam for the stock-conv fallback.
 
-    MUST call the captured true originals (_orig_conv2d/_orig_conv3d) when install() has
-    replaced F.conv2d/F.conv3d with our wrappers -- otherwise the fallback re-enters the
-    wrapper -> conv_im2col -> (kernel raises) -> _fallback_conv -> wrapper -> ... infinite
-    recursion, breaking the "never fatal" contract. Pre-install, F.conv2d IS the original."""
+    MUST call the captured originals: going through F.conv2d/F.conv3d after install()
+    re-enters our own wrapper and recurses forever.
+    """
     if weight.dim() == 4:
         fn = _orig_conv2d if _orig_conv2d is not None else F.conv2d
     else:
@@ -334,7 +318,7 @@ def _fallback_conv(x, weight, bias, stride, padding, dilation, groups):
 
 
 def conv_im2col(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    # Total + never-raising: unsupported -> stock conv. Safe for direct callers (BLOCKER).
+    # total and never-raising, so direct callers need no guard of their own
     rank = weight.dim() - 2          # 2 -> conv2d, 3 -> conv3d
     if rank not in (2, 3) or not _supported(x, weight, dilation, groups, x.dtype):
         return _fallback_conv(x, weight, bias, stride, padding, dilation, groups)
@@ -342,14 +326,13 @@ def conv_im2col(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)
         if rank == 2:
             return _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups)
         return _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups)
-    except Exception as e:      # defense in depth: never raise into the caller
+    except Exception as e:      # never raise into the caller
         print(f"{TAG} conv{rank}d kernel error, falling back ({e!r})")
         return _fallback_conv(x, weight, bias, stride, padding, dilation, groups)
 
 
 def _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
-    # re-validate before any output-size math; dilation!=1 / groups!=1 already excluded by
-    # _supported, but assert defensively so direct callers of the checked fn can't get wrong math.
+    # re-asserted for direct callers: the output-size math below assumes both
     assert groups == 1 and weight.dim() == 4
     s = (stride, stride) if isinstance(stride, int) else tuple(stride)
     p = (padding, padding) if isinstance(padding, int) else tuple(padding)
@@ -357,13 +340,12 @@ def _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
     assert all(d == 1 for d in dil), "dilation!=1 not supported"
     N, Cin, H, W = x.shape
     Cout, _, kh, kw = weight.shape
-    Hout, Wout = _out_hw(H, W, kh, kw, s, p)   # dilation==1 guaranteed -> formula needs no dilation
+    Hout, Wout = _out_hw(H, W, kh, kw, s, p)   # dilation==1, so the formula omits it
     P, K = N * Hout * Wout, Cin * kh * kw
     Wmat = weight.reshape(Cout, K).contiguous()
     tile_p = max(1, min(P, _TILE_BYTES // (K * x.element_size())))
     A_tile = torch.empty(tile_p, K, device=x.device, dtype=x.dtype)
     if _scatter_on():
-        # Fused channel-major scatter: allocate the final output ONCE, no out_flat / copy.
         out = torch.empty(N, Cout, Hout, Wout, device=x.device, dtype=x.dtype)
         for p0 in range(0, P, tile_p):
             rows = min(tile_p, P - p0)
@@ -376,7 +358,6 @@ def _conv2d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
         rows = min(tile_p, P - p0)
         view = A_tile[:rows]
         _im2col_2d_tile(x, view, kh, kw, s, p, Hout, Wout, p0, rows)
-        # write GEMM result DIRECTLY into the out_flat slice (no per-tile alloc/copy):
         _gemm_nt_bias(view, Wmat, bias, out=out_flat[p0:p0 + rows])
     # [P,Cout] -> [N,Hout,Wout,Cout] -> [N,Cout,Hout,Wout]
     return out_flat.reshape(N, Hout, Wout, Cout).permute(0, 3, 1, 2).contiguous()
@@ -396,7 +377,6 @@ def _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
     tile_p = max(1, min(P, _TILE_BYTES // (K * x.element_size())))
     A_tile = torch.empty(tile_p, K, device=x.device, dtype=x.dtype)
     if _scatter_on():
-        # Fused channel-major scatter: allocate the final output ONCE, no out_flat / copy.
         out = torch.empty(N, Cout, Dout, Hout, Wout, device=x.device, dtype=x.dtype)
         for p0 in range(0, P, tile_p):
             rows = min(tile_p, P - p0)
@@ -418,8 +398,7 @@ def _conv3d_im2col_checked(x, weight, bias, stride, padding, dilation, groups):
 # Guarded install (never fatal). Mirrors flash_attn_mtl.py.
 # ---------------------------------------------------------------------------
 
-# Track which ranks are installed, NOT a single bool -- so a later =3d after a =2d
-# in the same process can still install conv3d (idempotence-per-mode).
+# per-rank, not a single bool, so a later =3d after a =2d still installs conv3d
 _installed_ranks = set()   # subset of {2, 3}
 _orig_conv2d = None
 _orig_conv3d = None
@@ -430,9 +409,6 @@ _CONV_BOTH = ("1", "on", "true", "all", "both", "2d,3d", "3d,2d")
 
 
 def _mode():
-    # DEFAULT-ON for conv3d (measured ~2.7x vs stock MPS conv3d, ~31% faster SeedVR2).
-    # conv2d stays OFF by default (stock conv2d is at-roofline; im2col loses there).
-    # Kill switch: ASFP8_CONV_IM2COL=off. Opt conv2d in with =2d / =2d,3d (=1|on|true => both).
     return os.environ.get("ASFP8_CONV_IM2COL", "3d").strip().lower()
 
 
@@ -440,9 +416,7 @@ def _gate():
     mode = _mode()
     if mode in _CONV_OFF:
         return False
-    # When the user hasn't explicitly set ASFP8_CONV_IM2COL, only default-on where the
-    # Metal-4 tensor-ops matmul2d kernel actually compiles (M5 / Metal 4.1). An explicit
-    # 3d/2d/1 still forces it on (the wrapper falls back per-call if a conv can't run).
+    # an explicit mode forces it on; the wrapper still falls back per call
     if os.environ.get("ASFP8_CONV_IM2COL") is None:
         from . import _caps
         if not _caps.has_tensor_ops_matmul2d():
@@ -458,8 +432,7 @@ def _wanted_ranks():
         return {2, 3}
     if m == "2d":
         return {2}
-    # "3d", the default, and any unrecognized value -> conv3d only (the proven default win)
-    return {3}
+    return {3}   # "3d", the default, and anything unrecognized
 
 
 def _make_wrap(orig, rank):

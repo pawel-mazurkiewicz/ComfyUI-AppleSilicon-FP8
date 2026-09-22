@@ -1,21 +1,15 @@
 """Threadgroup-staged simdgroup-matrix bf16 GEMM via torch.mps.compile_shader.
 
-Stages A and B K-tiles into threadgroup memory (as half, since simdgroup_half8x8
-is the proven type — simdgroup_bfloat8x8 is not supported on this SDK) and
-accumulates with simdgroup_float8x8 into fp32. Proven idiom from
-mtlflashattn/_kernel.py. Single-buffered; double-buffering is a later task.
-bf16 inputs are reinterpreted as half for staging; fp32 output.
-
-Off-MPS / unsupported SDKs are gated by available()/self_check_ok(); any
-failure disables the backend.
+Stages A and B K-tiles into threadgroup memory as half, since the SDK exposes
+simdgroup_half8x8 and not simdgroup_bfloat8x8, and accumulates into fp32.
+available()/self_check_ok() gate use; any failure disables the backend.
 """
 
 import torch
 
 TAG = "[AppleSilicon-FP8/sg_gemm]"
 
-# BM = 8 * NSG (each simdgroup owns 8 output rows). BN, BK multiples of 8.
-# NSG=8 → BM=64; BN=64, BK=32 → threadgroup memory = 64*32 + 32*64 = 4096 halfs = 8 KB
+# BM must be 8 * NSG (each simdgroup owns 8 output rows); BN and BK multiples of 8
 _BM, _BN, _BK, _NSG = 64, 64, 32, 8
 
 _GEMM_MSL = r"""
@@ -141,10 +135,7 @@ def available():
 
 
 def sg_matmul(a, b):
-    """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16 on MPS.
-
-    Inputs are made contiguous so callers need not worry about strides.
-    """
+    """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16 on MPS, made contiguous here."""
     lib = _get_lib()
     if lib is None:
         raise RuntimeError("sg_gemm unavailable")
@@ -157,9 +148,8 @@ def sg_matmul(a, b):
     sh = torch.tensor([M, N, K], dtype=torch.int32, device="mps")
     ntg_x = -(-M // _BM)
     ntg_y = -(-N // _BN)
-    # threads = total threads per dimension; group_size = per-threadgroup size.
-    # Threadgroups = threads / group_size.
-    # X: ntg_x threadgroups cover M tiles; Y: ntg_y threadgroups cover N tiles.
+    # `threads` is the TOTAL thread count per dimension, so threadgroups per
+    # dimension = threads / group_size: ntg_x over M tiles, ntg_y over N tiles
     lib.sgemm(a, b, c, sh,
               threads=(ntg_x * _NSG * 32, ntg_y, 1),
               group_size=(_NSG * 32, 1, 1))

@@ -1,29 +1,7 @@
-"""Fix: torch.nn.functional.linear with FP8 inputs/weights on MPS.
+"""Fix: `F.linear` with FP8 inputs/weights on MPS (3rd-party fp8 Linears, T5).
 
-`F.linear` is a C++ op. When called with FP8-dtype tensors on MPS it raises:
-
-    RuntimeError: MPS device does not support linear for non-float weights
-    RuntimeError: MPS device does not support linear for non-float inputs
-
-This covers the gap that patch #8 (tensor_to_fp8.py / Tensor.to shim) cannot:
-that patch intercepts Python-level `.to()` calls, but `F.linear` promotes dtypes
-internally in C++, so no Python `.to()` is ever called.
-
-Typical pattern (WanVideo T5 encoder, any custom Linear that stores fp8 weights):
-
-    class FP8Linear(nn.Module):
-        def forward(self, x):
-            return F.linear(x, self.weight, self.bias)   # weight is fp8
-
-We monkey-patch `torch.nn.functional.linear` so that, for MPS + FP8 operands:
-
-  1. Decode FP8 input to the compute dtype (bf16 if input is FP8, else input.dtype).
-  2. Decode FP8 weight to compute dtype.
-  3. Decode FP8 bias (if present) to compute dtype.
-  4. Call the original F.linear with the decoded tensors.
-
-Non-MPS calls and calls with no FP8 operands take a tight fast path and hit the
-original C++ kernel unchanged.
+Decodes the fp8 operands to the compute dtype first. Patch #8's Tensor.to shim cannot
+cover this: F.linear promotes dtypes in C++, so no Python `.to()` is ever called.
 """
 
 import sys
@@ -35,8 +13,7 @@ from ._common import FP8_DTYPES, decode_fp8
 
 TAG = "[AppleSilicon-FP8/linear_fp8]"
 
-# Capture the original at import time so _patched_linear can be called directly
-# in tests (without install()) and still have a valid reference to call through.
+# captured at import so _patched_linear works in tests without install()
 _original = F.linear
 _installed = False
 
@@ -51,19 +28,16 @@ def _decode_operand(t, compute_dtype):
 
 
 def _patched_linear(input, weight, bias=None):
-    # Fast path: no FP8 involved — hit the original kernel unchanged.
     if (input.dtype not in FP8_DTYPES
             and weight.dtype not in FP8_DTYPES
             and (bias is None or bias.dtype not in FP8_DTYPES)):
         return _original(input, weight, bias)
 
-    # Fast path: MPS not in play — original handles it (or fails as before).
     if input.device.type != "mps":
         return _original(input, weight, bias)
 
-    # Compute dtype: if the input itself is FP8 (rare), use bf16 so the matmul
-    # lands on the matrix units; otherwise honour the input's existing dtype so
-    # the decode is invisible to the rest of the pipeline.
+    # bf16 for an fp8 input so the matmul lands on the matrix units; otherwise keep
+    # the input's dtype so the decode is invisible downstream
     compute_dtype = torch.bfloat16 if input.dtype in FP8_DTYPES else input.dtype
 
     dec_input = _decode_operand(input, compute_dtype)
@@ -83,9 +57,7 @@ def install():
         return
 
     F.linear = _patched_linear
-    # Also patch torch.nn.functional directly on the module object so that
-    # code that has already done `from torch.nn import functional as F` picks
-    # up the patched version via the module attribute.
+    # also by module attribute, for code that imported functional under another name
     torch.nn.functional.linear = _patched_linear
     _installed = True
     print(f"{TAG} F.linear FP8 operands decoded to compute dtype on MPS.")

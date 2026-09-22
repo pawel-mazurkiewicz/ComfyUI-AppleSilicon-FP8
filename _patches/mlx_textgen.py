@@ -1,32 +1,9 @@
-"""Fix: Krea2's TextGenerate prompt expansion is slow on Apple Silicon.
+"""Fix: Krea2/LTX2 prompt-expansion TextGenerate is slow on Apple Silicon.
 
-ComfyUI's `TextGenerate` node (comfy_extras/nodes_textgen.py) calls
-`clip.generate(...)` which, for Krea2's Qwen3-VL-4B encoder, runs an eager
-autoregressive loop (comfy/text_encoders/llama.py BaseGenerate.generate,
-`tqdm("Generating tokens")`, up to max_length=512 full-4B forwards on MPS).
-On the reference fp8 run this dominated wall-clock (~50 s of 92 s).
-
-This is autoregressive token generation — exactly what MLX accelerates. We wrap
-`comfy.sd.CLIP.generate` so that, on MPS with mlx-vlm installed and a text-only
-Qwen3-VL-4B model, we:
-
-  1. decode the incoming (already chat-templated) token ids to text with
-     ComfyUI's own HF tokenizer (skip_special_tokens=False),
-  2. generate with a cached MLX Qwen3-VL-4B model,
-  3. re-encode the output text to token ids with the same HF tokenizer,
-  4. return a list[int] — the exact contract BaseGenerate.generate returns, so
-     clip.decode(ids) is unchanged.
-
-MLX only ever sees text and ids are produced/consumed by ComfyUI's tokenizer, so
-correctness does not depend on cross-tokenizer vocab alignment.
-
-Two generatable encoders are routed (see `_ROUTES`): Krea2's Qwen3-VL-4B (via mlx-vlm)
-and LTX2's Gemma3-12B prompt encoder (via mlx-lm; the "Generate Text" node, otherwise
-~20 s/token eager). Each maps to an MLX repo (`ASFP8_MLX_QWEN3VL_REPO` /
-`ASFP8_MLX_GEMMA3_REPO`). Strictly scoped: non-MPS, an unrecognised encoder, multimodal
-calls, or a missing MLX package all fall through to the original eager generate. The
-conditioning encode path (CLIPTextEncode's hidden-state tap) is untouched. Disable with
-ASFP8_DISABLE_MLX_TEXTGEN=1.
+Wraps comfy.sd.CLIP.generate so the autoregressive loop runs under MLX: decode the
+already-templated ids to text with ComfyUI's own tokenizer, generate, re-encode. MLX only
+ever sees text, so correctness never depends on cross-tokenizer vocab alignment. See
+`_ROUTES` for the encoders routed; anything else falls through to the eager generate.
 """
 
 import os
@@ -45,11 +22,8 @@ _logged_miss = False
 
 
 def _backend_for(key, sub):
-    """Identify the MLX backend for a sub-clip, robust to comfy internals: match on the
-    `_modules` key (the model's attribute name), the transformer instance's class name,
-    or a type attribute if present. Gemma3's transformer exposes none of model_type/
-    transformer_type on the instance (they live on the config class), so key/class name
-    are the reliable signals."""
+    """Identify the MLX backend for a sub-clip by `_modules` key, transformer class name
+    or type attribute. Gemma3 keeps model_type on the config class, not the instance."""
     tr = getattr(sub, "transformer", None)
     cls = type(tr).__name__ if tr is not None else ""
     mt = getattr(tr, "model_type", None)
@@ -66,10 +40,10 @@ class _Fallback(Exception):
 
 
 def _extract_text_ids(tokens):
-    """From ComfyUI's tokenize() output {key: [[(id, weight), ...]]} return
-    (list[int] ids of batch 0, has_non_int). A media/image entry has a dict in
-    slot [0] (placed by Qwen3VLTokenizer.tokenize_with_weights); any other
-    non-int entry is also treated as non-text and triggers fallback."""
+    """From ComfyUI's tokenize() output, return (batch-0 ids, has_non_int).
+
+    A media entry holds a dict rather than an int, and any non-int means fall back.
+    """
     batch0 = next(iter(tokens.values()))[0]
     ids = []
     has_non_int = False
@@ -83,13 +57,11 @@ def _extract_text_ids(tokens):
 
 
 def _qwen3vl_hf_tokenizer(cond_stage_model, sd1_tokenizer):
-    """If cond_stage_model carries a sub-clip whose transformer.model_type is
-    'qwen3vl_4b', return the matching HF tokenizer (<sub_tokenizer>.tokenizer);
-    else None. The sub-clip and sub-tokenizer share the same attribute key
-    (SD1ClipModel/SD1Tokenizer both setattr under `name`).
+    """The HF tokenizer for a 'qwen3vl_4b' sub-clip, or None.
 
-    Iterates _modules (nn.Module's registered submodule ordered dict) to avoid
-    triggering property descriptors and to stay O(submodules) rather than O(dir())."""
+    The sub-clip and sub-tokenizer share one attribute key. Iterates _modules rather
+    than dir() so no property descriptor fires.
+    """
     modules = getattr(cond_stage_model, "_modules", {})
     for key, sub in modules.items():
         transformer = getattr(sub, "transformer", None)
@@ -100,10 +72,10 @@ def _qwen3vl_hf_tokenizer(cond_stage_model, sd1_tokenizer):
 
 
 def _route(cond_stage_model, sd1_tokenizer):
-    """Find the first sub-clip whose transformer matches a known generatable model and
-    return (mlx_backend, tokenizer) for it, else (None, None). The sub-clip and its
-    tokenizer share the same attribute key. No availability check here — install()
-    already gated on a usable backend, and _clip_generate falls back on any error."""
+    """(mlx_backend, tokenizer) for the first generatable sub-clip, else (None, None).
+
+    No availability check: install() already gated on a usable backend.
+    """
     global _logged_miss
     modules = getattr(cond_stage_model, "_modules", {})
     for key, sub in modules.items():
@@ -122,14 +94,12 @@ def _route(cond_stage_model, sd1_tokenizer):
 
 
 def _decode_ids(tok, ids):
-    """ids -> templated text. HF and comfy's SentencePiece tokenizer both expose
-    decode(ids, skip_special_tokens=...)."""
+    """ids -> templated text."""
     return tok.decode(ids, skip_special_tokens=False)
 
 
 def _encode_text(tok, text):
-    """text -> ids. HF tokenizers use .encode(); comfy's SPieceTokenizer has no encode
-    and is called as tok(text) -> {'input_ids': [...]}."""
+    """text -> ids. HF tokenizers have .encode(); comfy's SPieceTokenizer is called."""
     enc = getattr(tok, "encode", None)
     if callable(enc):
         return list(enc(text))

@@ -1,37 +1,9 @@
-"""Fix: FP8 weight/bias cast crash in cast_bias_weight on MPS.
+"""Fix: FP8 weight/bias cast crash in cast_bias_weight on MPS (fp8 UNETLoader).
 
-When a model is loaded with FP8 weights (fp8_e4m3fn / fp8_e5m2) and
-manual_cast_dtype=bfloat16 (the standard UNETLoader "weight_dtype: fp8_e4m3fn"
-path on a non-CUDA box), ComfyUI's manual_cast Linear/Conv layers store the
-weight AND bias as raw FP8 tensors on the GPU and cast them up per forward.
-
-On MPS that per-forward cast crashes.  cast_bias_weight does, for the plain
-(non-vbar) path:
-
-    weight = cast_to(s.weight, None, device, ...)   # dtype=None -> stays FP8
-    bias   = cast_to(s.bias,   None, device, ...)   # dtype=None -> stays FP8
-    ...
-    bias   = bias.to(dtype=bias_dtype)              # ops.py ~371  FP8->bf16  ✗
-    ...
-    weight = weight.to(dtype=dtype)                 # ops.py ~376  FP8->bf16  ✗
-
-MPS can *store* / move FP8 tensors but cannot cast TO or FROM them on-device,
-so both .to() calls raise:
-
-    TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does
-               not have support for that dtype.
-
-(The bias crashes first, which is why clamping bias_dtype alone wasn't enough —
-the weight would have crashed on the very next line.)
-
-Fix: for the plain FP8-on-MPS case we take over cast_bias_weight entirely and
-decode weight/bias FP8 -> compute dtype via the LUT+gather path (decode_fp8 in
-_common.py), which is MPS-safe and bit-exact.  weight_function / bias_function
-(LoRA-as-function, etc.) are applied exactly as the original does.
-
-Anything we don't recognise (vbar `_v` layers, QuantizedTensor weights, non-FP8
-layers) is delegated back to the original implementation — with the historical
-bias_dtype clamp kept as a belt-and-braces fallback for those paths.
+MPS can store and move fp8 tensors but not cast them, so both of cast_bias_weight's
+per-forward `.to()` calls raise. Take the plain fp8 path over and LUT-decode instead;
+anything else (vbar `_v` layers, non-fp8 QuantizedTensors) delegates to the original
+with the bias_dtype clamp as a safety net.
 """
 
 import sys
@@ -51,13 +23,12 @@ def _get_quantized_tensor_cls():
         from comfy.quant_ops import QuantizedTensor
         return QuantizedTensor
     except Exception:
-        class _Never:  # isinstance(x, _Never) is always False
+        class _Never:  # isinstance() against this is always False
             pass
         return _Never
 
 
-# Resolved at install() time.
-_QuantizedTensor = None
+_QuantizedTensor = None   # resolved in install()
 
 
 def _effective_device(device, input_tensor):
@@ -87,11 +58,8 @@ def _needs_handling(param):
     if param is None:
         return False
     if isinstance(param, _QuantizedTensor):
-        # Only FP8-backed storage needs rescuing: MPS can neither cast nor gather
-        # on fp8, so comfy's embedding lookup would raise on the raw qdata.
-        # Other layouts (int8, int4) must keep their wrapper — comfy reaches
-        # into it for the raw storage, and a dequantized stand-in makes
-        # dequantize_int8_embedding reject the dtype outright (issue #9).
+        # only fp8 storage needs rescuing: int8/int4 layouts must keep their wrapper,
+        # because comfy reaches into it for the raw storage
         return getattr(param, "storage_dtype", None) in FP8_DTYPES
     return param.dtype in FP8_DTYPES
 
@@ -101,11 +69,9 @@ def _to_compute(param, target_dtype, device):
     if param is None:
         return None
     if param.device != device:
-        # Device move only — never a dtype cast, so FP8 survives the hop.
-        param = param.to(device=device)
+        param = param.to(device=device)   # device only, so fp8 survives the hop
     if isinstance(param, _QuantizedTensor):
-        # dequantize() routes through the comfy_kitchen eager path, which our
-        # comfykitchen_fp8 patch already made MPS-safe.
+        # dequantize() routes through the eager path comfykitchen_fp8 made MPS-safe
         return param.dequantize().to(target_dtype)
     if param.dtype in FP8_DTYPES:
         return decode_fp8(param).to(target_dtype)
@@ -115,17 +81,15 @@ def _to_compute(param, target_dtype, device):
 def _bring(param, target_dtype, device):
     """Rescue only the param that needs it.
 
-    The fast path is chosen per layer, so an fp8 bias can pull in a weight that
-    was fine as-is; dequantizing that weight would strip a wrapper comfy still
-    needs (issue #9).
+    The fast path is chosen per layer, so an fp8 bias can pull in a weight that was
+    fine as-is, and dequantizing that one would strip a wrapper comfy still needs.
     """
     if param is None:
         return None
     if _needs_handling(param):
         return _to_compute(param, target_dtype, device)
-    # Note: a passed-through QuantizedTensor reaches weight_function still wrapped,
-    # where native would have dequantized it first. Reachable only with a non-fp8
-    # QuantizedTensor weight, a raw-fp8 bias, and a LoRA on the same layer.
+    # a passed-through QuantizedTensor reaches weight_function still wrapped, where
+    # native would have dequantized it first
     if param.device != device:
         param = param.to(device=device)
     if param.dtype == target_dtype:
@@ -138,7 +102,7 @@ def _fp8_safe_bias_dtype(bias_dtype, dtype, input_tensor):
     if bias_dtype is not None:
         return torch.bfloat16 if bias_dtype in FP8_DTYPES else bias_dtype
     eff = _resolve_target_dtype(dtype, input_tensor)
-    return eff  # already non-FP8 by construction
+    return eff  # non-fp8 by construction
 
 
 def install():
@@ -199,7 +163,7 @@ def install():
                     return (w, b, (None, None, None))
                 return (w, b)
 
-        # Delegate everything else; keep the bias_dtype clamp as a safety net.
+        # delegate the rest, keeping the bias_dtype clamp as a safety net
         if dev_type == "mps":
             bias_dtype = _fp8_safe_bias_dtype(bias_dtype, dtype, input)
 

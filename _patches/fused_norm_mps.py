@@ -1,21 +1,11 @@
 """Patch #18: fused single-pass RMSNorm + affine + adaLN(scale,shift) + residual on MPS.
 
-out = residual + (rmsnorm(x) * weight) * (1 + scale) + shift   — one compile_shader kernel.
-
-Bandwidth/launch win: replaces ~4-5 separate MPS elementwise/reduction launches (each a full
-DRAM round-trip of the activation) with one kernel that reads x+residual once and writes out once,
-fp32 accumulation throughout. One threadgroup per row, 128 threads, fp32 simd_sum reduction for
-mean(x^2). The grid is z-tiled (row = z*ny + y, early-return) so dispatch is correct regardless of
-any per-dimension threadgroup cap. Being a SEPARATE fp32-reduction kernel with correct Metal
-dispatch is what keeps it correct in the >2^21-row regime where stock PyTorch MPS rms_norm returns
-garbage, so when installed it SUPERSEDES rmsnorm_mps_large.py's >2^21-row correctness fallback (which
-only fixed the bare norm and reduced over all normalized dims). The 64-bit ulong element offsets are
-additional defense-in-depth that prevents int32 element-offset overflow on truly enormous tensors
-(rows*D > 2^31, e.g. >2^23 rows at D=256) — valid, but not the primary fix for the 2^21-row bug.
-
-DEFAULT ON, gated on compile_shader (ASFP8_FUSED_NORM=off disables). Never fatal; falls back to an exact, GROUP-AWARE torch composition on
-any error, off-MPS, unsupported dtype, optional-tensor shape/device/dtype mismatch, or indivisible
-modulation grouping. `_last_backend` records which path ran ("kernel" | "fallback") for tests.
+out = residual + (rmsnorm(x) * weight) * (1 + scale) + shift, in one compile_shader pass:
+x and residual read once, out written once, fp32 accumulation throughout, one threadgroup
+per row. Being a separate fp32-reduction kernel with a z-tiled grid is also what keeps it
+correct past 2^21 rows, where stock MPS rms_norm returns garbage, so it SUPERSEDES
+rmsnorm_mps_large.py's fallback. DEFAULT ON (ASFP8_FUSED_NORM=off disables); never fatal,
+falling back to an exact group-aware torch composition, with `_last_backend` for tests.
 """
 from __future__ import annotations
 
@@ -138,7 +128,7 @@ def _expand_mod(t, D, rows):
         return g
     if rows % G == 0:
         return g.repeat_interleave(rows // G, dim=0)
-    return g  # indivisible: caller's reshape raises a clear error
+    return g  # indivisible: the caller's reshape raises a clear error
 
 
 def _reference(x, weight, eps, scale, shift, residual):
@@ -252,14 +242,14 @@ _installed = False
 def _rms_norm(input, normalized_shape, weight=None, eps=None):
     global _last_backend
     if input.device.type != "mps" or input.dtype not in _MSL_T:
-        _last_backend = "fallback"   # outer bypass: don't let a stale "kernel" spy false-positive
+        _last_backend = "fallback"   # so a stale "kernel" can't false-positive the spy
         return _orig_rms_norm(input, normalized_shape, weight, eps)
-    # Codex BLOCKER #2: reduce over ALL normalized dims -> flatten last len(normalized_shape) dims.
+    # reduce over ALL normalized dims, so flatten the last len(normalized_shape) of them
     D = 1
     for d in normalized_shape:
         D *= int(d)
     if D <= 0 or input.numel() % D != 0:
-        _last_backend = "fallback"   # outer bypass (indivisible/empty D): same spy hygiene
+        _last_backend = "fallback"
         return _orig_rms_norm(input, normalized_shape, weight, eps)
     e = eps if eps is not None else torch.finfo(input.dtype).eps
     x2d = input.contiguous().view(-1, D)
@@ -270,8 +260,6 @@ def _rms_norm(input, normalized_shape, weight=None, eps=None):
 
 def install():
     global _orig_rms_norm, _installed
-    # DEFAULT ON, gated on compile_shader (Tier A: fp32 kernel, no Metal-4.1 needed).
-    # ASFP8_FUSED_NORM=off disables; =1 forces on. See _patches/_caps.py.
     from . import _caps
     if _installed or not _caps.resolve("ASFP8_FUSED_NORM", default_on=True, cap=_caps.has_compile_shader):
         return
@@ -285,7 +273,7 @@ def install():
           f"(F.rms_norm rerouted; supersedes the >2^21-row fp32 fallback).", flush=True)
 
 
-# ---- test-only install helpers (bypass the env flag so the reroute is exercised in pytest) ----
+# ---- test-only install helpers: bypass the env flag so pytest exercises the reroute ----
 def install_for_test():
     global _orig_rms_norm, _installed
     if _installed:
