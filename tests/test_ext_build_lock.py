@@ -1,12 +1,7 @@
 """Metal-extension build locks must not wedge a later run.
 
-torch guards each build directory with a FileBaton whose lock is released in a
-`finally`. A killed ComfyUI -- or our own watchdog abandoning a build on a daemon
-thread -- never runs it, and FileBaton.wait() is an unbounded spin, so the lock
-stalls every subsequent build until someone deletes it by hand.
-
-Every shipped loader that calls cpp_extension.load needs the same treatment, so
-these run against all three.
+torch releases each FileBaton in a `finally` that a killed ComfyUI never reaches, and
+FileBaton.wait() spins unbounded. Run against all three shipped loaders.
 """
 import importlib
 import os
@@ -52,11 +47,7 @@ def test_stale_lock_is_cleared(loader, tmp_path, monkeypatch):
 
 
 def test_live_build_lock_is_preserved(loader, tmp_path, monkeypatch):
-    """A young lock may belong to a live build in another ComfyUI process.
-
-    /tmp/asfp8_build is a shared path; clearing it blindly would let two ninja
-    runs write the same .so concurrently.
-    """
+    """A young lock is preserved: it may belong to a live build in another process."""
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "600")
     lock = _plant_lock(tmp_path)
 
@@ -66,8 +57,7 @@ def test_live_build_lock_is_preserved(loader, tmp_path, monkeypatch):
 
 
 def test_timeout_message_points_at_the_build_dir(loader, tmp_path, monkeypatch):
-    """The old text suggested ASFP8_EXT_BUILD_TIMEOUT=0, which disables the
-    watchdog entirely and turns a bounded stall into an unbounded hang."""
+    """The timeout message points at the build dir, not at disabling the watchdog."""
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "0.3")
     release = threading.Event()
 
@@ -99,11 +89,7 @@ def test_abandoned_build_cleanup_drops_the_lock(loader, tmp_path):
 
 
 def test_lock_from_a_slow_but_live_build_is_preserved(loader, tmp_path, monkeypatch):
-    """We abandon a build at the timeout but never kill it.
-
-    So a lock only just past that age may still belong to a compile that is slow
-    rather than wedged; clearing it would put two ninja runs in one directory.
-    """
+    """A lock just past the timeout is preserved: we abandon a build but never kill it."""
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "60")
     lock = _plant_lock(tmp_path, age_seconds=90)
 
@@ -113,11 +99,7 @@ def test_lock_from_a_slow_but_live_build_is_preserved(loader, tmp_path, monkeypa
 
 
 def test_cleanup_leaves_a_lock_we_never_owned(loader, tmp_path):
-    """A thread stuck in FileBaton.wait() is alive but owns nothing.
-
-    Unlinking there would free another process's live lock and make its build
-    fail on release.
-    """
+    """Cleanup leaves a lock we never owned: a thread in FileBaton.wait() holds nothing."""
     lock = _plant_lock(tmp_path)
     release = threading.Event()
     thread = threading.Thread(target=release.wait, args=(30,), daemon=True)
@@ -130,16 +112,11 @@ def test_cleanup_leaves_a_lock_we_never_owned(loader, tmp_path):
 
 
 def test_concurrent_builds_do_not_corrupt_the_prepared_global(loader, monkeypatch):
-    """prepare() mutates torch's module-level TORCH_LIB_PATH.
-
-    Two overlapping build workers would each snapshot the *other's* temporary
-    value and restore that, permanently leaking it. Overlap is reachable because
-    a build we abandon on timeout keeps running while the next one starts.
-    """
+    """Concurrent builds don't corrupt TORCH_LIB_PATH, which prepare() mutates globally."""
     monkeypatch.setenv("ASFP8_EXT_BUILD_TIMEOUT", "30")
     state = {"path": "ORIGINAL"}
-    # Released only once both threads are in place, so this is a real overlap
-    # attempt rather than two runs that happened to serialise on timing.
+    # released only once both threads are in place, so the overlap is real rather than
+    # two runs that happened to serialise
     both_ready = threading.Barrier(2, timeout=30)
     tally = threading.Lock()
     active = {"now": 0, "max": 0}

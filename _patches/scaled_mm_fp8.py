@@ -1,25 +1,9 @@
 """Fix: torch._scaled_mm with FP8 inputs on MPS (FLUX, SD3.5, etc.).
 
-`torch._scaled_mm` is PyTorch's scaled matmul used for FP8 inference. MPS has no
-kernel for it with FP8 operands, so FLUX / SD3.5 and similar FP8 models fail with:
-
-    NotImplementedError: scaled_mm ... for MPS
-    TypeError: ... convert Float8_e4m3fn to the MPS backend ...
-
-We monkey-patch torch._scaled_mm so that, for MPS + FP8 operands, it:
-  1. decodes both operands FP8 -> bf16 (bit-exact; bf16 has fp32 exponent range so
-     no overflow) via the LUT+gather (MPS-safe),
-  2. runs a bf16 matmul on MPS — bf16@bf16 dispatches to the matrix units
-     (Neural Accelerators on M5+, simdgroup_matrix on M1–M4),
-  3. applies per-row/col scales and bias to the output (in fp32 to avoid rounding),
-  4. casts to out_dtype.
-
-Non-MPS or non-FP8 calls fall through to the original implementation untouched.
-
-DEFAULT ON, gated on M5/Metal-4.1 + ninja (ASFP8_FP8_EXT=off disables): for large fp8(e4m3) x fp8(e4m3) matmuls
-this seam routes both operands through a Metal 4.1 fp8-native kernel (no bf16
-decode), then applies scales/bias in fp32 — bit-exact vs the decode path, faster.
-When the flag is unset/0 the fast path is inert and numerics are unchanged.
+MPS has no fp8 kernel for it, so decode both operands to bf16 through the LUT, run the
+matmul on the matrix units, then apply scales and bias in fp32. Where the fp8-native
+Metal kernel is available (DEFAULT ON, ASFP8_FP8_EXT=off disables) large e4m3 matmuls
+skip the decode instead.
 """
 
 import os
@@ -34,9 +18,7 @@ _original = None
 _original_v2 = None
 _installed = False
 
-# torch >= 2.11 only; resolved once here rather than per call, since the v2
-# predicates sit on the per-matmul hot path. `import torch` above has already
-# pulled in torch.nn.functional, so there is no import-order window to lose.
+# torch >= 2.11 only; resolved once, since the v2 predicates sit on the hot path
 try:
     from torch.nn.functional import ScalingType as _ScalingType
 except Exception:
@@ -46,16 +28,13 @@ try:
 except Exception:
     _SwizzleType = None
 
-# fp8-native fast path (DEFAULT ON where capable; ASFP8_FP8_EXT=off disables). When the gate is
-# unset/0 this whole path is inert and torch._scaled_mm behaves exactly as the decode
-# implementation below — same numerics, zero extra work, no extension build.
 _backend = None          # the cpp module, or False once known-unavailable
 _self_checked = False
 
 
 def _compute_dtype(out_dtype):
-    """bf16 for bf16/fp16 results (rides the matrix units, bit-exact decode,
-    fp32-range so no overflow); float32 only when the caller explicitly wants f32."""
+    """bf16 for bf16/fp16 results (matrix units, and fp32 range so no overflow);
+    float32 only when the caller explicitly asks for f32."""
     if out_dtype in (torch.bfloat16, torch.float16):
         return torch.bfloat16
     return torch.float32
@@ -68,8 +47,7 @@ def _decode(t, compute_dtype):
 
 
 def _min_dim():
-    """Weight-size threshold below which the fp8-native kernel is not worth its
-    dispatch overhead; matches patch #15's knob so both share one tuning point."""
+    """Weight-size threshold below which the fp8-native kernel costs more than it saves."""
     try:
         return int(os.environ.get("ASFP8_FP8_EXT_MIN_DIM", "8192"))
     except ValueError:
@@ -77,21 +55,18 @@ def _min_dim():
 
 
 def _fast_eligible(input, other):
-    """Shape/dtype/capability predicate (no per-call device work). The fp8_ext fast
-    path is DEFAULT ON, gated on M5-class matrix units + ninja for the ObjC++
-    extension. ASFP8_FP8_EXT=off force-disables; =1 forces it on. The capability
-    probes are memoised, so this stays cheap on the hot matmul path."""
+    """Shape/dtype/capability predicate; no per-call device work, probes are memoised."""
     from . import _caps
     if not _caps.resolve("ASFP8_FP8_EXT", default_on=True, cap=_caps.kernel_gate):
         return False
-    # The kernel decodes both operands as e4m3; only route when that's exact.
+    # the kernel decodes both operands as e4m3, so only route when that is exact
     if input.dtype != torch.float8_e4m3fn or other.dtype != torch.float8_e4m3fn:
         return False
     if input.device.type != "mps" or other.device.type != "mps":
         return False
     if input.dim() != 2 or other.dim() != 2:
         return False
-    # input [M,K] @ other [K,N]; weight recovered as other.t() = [N,K].
+    # input [M,K] @ other [K,N]; weight recovered as other.t() = [N,K]
     K = int(input.shape[1])
     N = int(other.shape[1])
     return max(N, K) >= _min_dim()
@@ -111,9 +86,8 @@ def _get_backend():
     if not _self_checked:
         _self_checked = True
         try:
-            # Local generator, never torch.manual_seed: this self-check runs
-            # lazily on the FIRST fp8 matmul, i.e. mid-render, where reseeding
-            # the process RNG would land in the middle of a user's sampling.
+            # local generator, never torch.manual_seed: this runs mid-render, so
+            # reseeding the process RNG would land inside a user's sampling
             g = torch.Generator().manual_seed(0)
             a = (torch.randn(64, 8192, generator=g) * 0.3).to(torch.float8_e4m3fn)
             w = (torch.randn(8192, 8192, generator=g) * 0.3).to(torch.float8_e4m3fn)   # [N,K]
@@ -136,8 +110,7 @@ def _get_backend():
 
 
 def _fast_route(input, other, scale_a, scale_b, scale_result, bias, out_dtype):
-    """fp8xfp8 -> f32 via the Metal 4.1 kernel, then scales/bias in f32. Equivalent to
-    the decode path (bench: bit-exact) but skips two fp8->bf16 decodes. Raises on any
+    """fp8xfp8 -> f32 via the Metal 4.1 kernel, then scales/bias in f32. Raises on any
     failure so the caller delegates to the decode implementation."""
     mod = _get_backend()
     if mod is None:
@@ -145,7 +118,7 @@ def _fast_route(input, other, scale_a, scale_b, scale_result, bias, out_dtype):
     K = int(input.shape[1])
     N = int(other.shape[1])
     a_u8 = input.contiguous().view(torch.uint8)
-    # other is [K,N] (typically W.t()); the kernel wants W=[N,K] contiguous fp8 bytes.
+    # other is [K,N]; the kernel wants W=[N,K] contiguous fp8 bytes
     w_u8 = other.t().contiguous().view(torch.uint8)
     out = mod.fp8fp8_matmul2d_nt(a_u8, w_u8, K, N)   # [M,N] f32, unscaled
     if scale_a is not None:
@@ -181,9 +154,7 @@ def _mps_scaled_mm(
             bias=bias, scale_result=scale_result, use_fast_accum=use_fast_accum,
         )
 
-    # fp8-native fast path: fp8xfp8 -> f32 via the Metal 4.1 kernel. Any
-    # failure (build/parity/runtime) falls through to the decode path below, so a
-    # render never breaks. Inert unless ASFP8_FP8_EXT=1.
+    # any failure here falls through to the decode path below, so a render never breaks
     if _fast_eligible(input, other):
         try:
             return _fast_route(input, other, scale_a, scale_b, scale_result, bias, out_dtype)
@@ -192,16 +163,14 @@ def _mps_scaled_mm(
 
     compute_dtype = _compute_dtype(out_dtype)
 
-    # input: (M,K), other: (K,N) column-major — torch._scaled_mm's layout.
+    # input: (M,K), other: (K,N) column-major — torch._scaled_mm's layout
     a = _decode(input, compute_dtype)
     b = _decode(other, compute_dtype)
 
-    # bf16@bf16 -> bf16 (fp32 accumulate) on the matrix units; f32@f32 -> f32.
     out = a @ b
 
-    # Per-row/col and per-tensor scales factor out of the dot product, so apply
-    # them to the result (scale_a over rows, scale_b over cols). Compute in fp32
-    # then come back to the working dtype to avoid intermediate rounding.
+    # the scales factor out of the dot product, so apply them to the result; in fp32
+    # to avoid intermediate rounding
     if scale_a is not None or scale_b is not None or scale_result is not None:
         acc = out.to(torch.float32)
         if scale_a is not None:
@@ -213,9 +182,7 @@ def _mps_scaled_mm(
         out = acc.to(out.dtype)
 
     if bias is not None:
-        # Always add bias in f32 regardless of compute_dtype so that bf16
-        # compute does not lose precision in the bias term before the final
-        # widen (matches the old unconditional f32 bias behaviour).
+        # always in f32, so bf16 compute doesn't lose the bias term before the widen
         out = out.to(torch.float32) + bias.to(torch.float32)
     if out_dtype is not None:
         out = out.to(out_dtype)
@@ -223,8 +190,7 @@ def _mps_scaled_mm(
 
 
 def _is_tensorwise(recipe):
-    """True only for the plain TensorWise recipe, and False for the list-valued
-    microscaling recipes (NVFP4/MXFP8 pass a [BlockWise, TensorWise] pair)."""
+    """True only for the plain TensorWise recipe; NVFP4/MXFP8 pass a list-valued pair."""
     if _ScalingType is None or isinstance(recipe, (list, tuple)):
         return False
     return recipe == _ScalingType.TensorWise
@@ -254,24 +220,9 @@ def _mps_scaled_mm_v2(
 ):
     """Wrapper for torch.nn.functional.scaled_mm — the `aten::_scaled_mm_v2` seam.
 
-    torch >= 2.11 ships this public API, and comfy_kitchen prefers it on a bare
-    `hasattr` with no backend check (`scaled_mm_v2.py`), so `tensor/fp8.py`'s
-    `_fp8_scaled_mm` sends every plain-fp8 Linear here instead of through
-    `torch._scaled_mm` — leaving the patch below attached to a function nothing
-    calls.
-
-    `aten::_scaled_mm_v2` is a dead end on this platform: no MPS kernel, and no
-    CPU kernel for fp8 operands either, so ComfyUI's PYTORCH_ENABLE_MPS_FALLBACK
-    bounce raises too. `NotImplementedError` subclasses `RuntimeError`, so
-    comfy_kitchen's `except (RuntimeError, TypeError)` swallows it and quietly
-    re-runs the layer as a dequantize + bf16 linear — correct output, ~3x slower,
-    and only a logger.warning to show for it.
-
-    Plain TensorWise fp8 on MPS therefore delegates to the same machinery as the
-    legacy seam (fp8-native Metal kernel where eligible, LUT decode + bf16 matmul
-    otherwise). Microscaling recipes (NVFP4/MXFP8 BlockWise + swizzled scales),
-    list-valued scales, contraction_dim and every non-MPS or non-fp8 call fall
-    through to the original untouched.
+    comfy_kitchen prefers this API on a bare hasattr, so without this wrapper the
+    seam below goes dark. Plain TensorWise fp8 on MPS delegates to the legacy path;
+    microscaling recipes, list-valued scales and contraction_dim fall through.
     """
     is_mps = isinstance(mat_a, torch.Tensor) and mat_a.device.type == "mps"
     is_fp8 = (
@@ -301,9 +252,7 @@ def _mps_scaled_mm_v2(
         )
 
     if _original_v2 is None:
-        # Only reachable if this wrapper was bound onto F.scaled_mm without
-        # going through install(); without the original there is nothing to
-        # delegate to, and a bare NoneType call would bury that.
+        # only reachable if bound onto F.scaled_mm without going through install()
         raise RuntimeError(
             f"{TAG} F.scaled_mm wrapper is installed but has no original to "
             "delegate to — install() did not complete."
@@ -334,9 +283,8 @@ def install():
     _original = torch._scaled_mm
     torch._scaled_mm = _mps_scaled_mm
     msg = f"{TAG} torch._scaled_mm FP8 on MPS via LUT decode + bf16 matrix-unit matmul."
-    # torch >= 2.11 adds the public F.scaled_mm (aten::_scaled_mm_v2), which
-    # comfy_kitchen prefers whenever it exists — wrap it too or the seam above
-    # goes dark and fp8 silently falls back to dequant (issue #19).
+    # comfy_kitchen prefers F.scaled_mm wherever it exists, so the seam above goes
+    # dark unless this one is wrapped too
     if hasattr(torch.nn.functional, "scaled_mm"):
         _original_v2 = torch.nn.functional.scaled_mm
         torch.nn.functional.scaled_mm = _mps_scaled_mm_v2

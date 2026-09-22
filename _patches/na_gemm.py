@@ -1,19 +1,15 @@
 """Optional Neural-Accelerator bf16 GEMM via Metal Performance Primitives matmul2d.
 
-Lifted from the proven mtlflashattn dev bench (bench_matmul2d_ceiling.py). Compiles
-a tiled `mpp::tensor_ops::matmul2d` kernel through torch.mps.compile_shader (no Xcode).
-Consumes bf16 operands (FP8 is decoded to bf16 upstream; NA does not accelerate FP8)
-and returns float32. Every entry point is safe to call off-MPS / on unsupported SDKs:
-`available()` and `self_check_ok()` gate usage, and any failure disables the backend.
+Compiles a tiled `mpp::tensor_ops::matmul2d` kernel through torch.mps.compile_shader.
+Takes bf16 operands and returns float32; `available()` and `self_check_ok()` gate use,
+and any failure disables the backend.
 """
 
 import torch
 
 TAG = "[AppleSilicon-FP8/na_gemm]"
 
-# Tile config: (BM, BN, BK, NSG). 64x64x64 / 4 simdgroups passed correctness across
-# the dev sweep and is a robust default for diffusion-shaped GEMMs.
-_BM, _BN, _BK, _NSG = 64, 64, 64, 4
+_BM, _BN, _BK, _NSG = 64, 64, 64, 4   # tile: BM, BN, BK, simdgroups
 
 _GEMM_MSL = r"""
 #include <metal_stdlib>
@@ -104,8 +100,8 @@ def available():
 def reset_cache():
     """Test hook: drop the compile + numeric memos so the next call re-probes.
 
-    _caps.reset_cache() delegates here. Without it, clearing _caps' own memo just
-    re-reads this stale verdict and the promised re-probe never happens."""
+    _caps.reset_cache() delegates here, since its own memo reads through to this one.
+    """
     global _lib, _compiled, _self_check
     _lib = None
     _compiled = None
@@ -115,8 +111,7 @@ def reset_cache():
 def na_matmul(a, b):
     """C[M,N] f32 = A[M,K] @ B[K,N]; a,b are bf16, on MPS.
 
-    Inputs are made contiguous here so callers need not worry about strides
-    (e.g. a decoded-from-LUT tensor that inherited a transposed layout).
+    Made contiguous here, so a LUT-decoded operand's inherited strides are fine.
     """
     lib = _get_lib()
     if lib is None:
@@ -130,16 +125,8 @@ def na_matmul(a, b):
     sh = torch.tensor([M, N, K], dtype=torch.int32, device="mps")
     ntg_x = -(-M // _BM)
     ntg_y = -(-N // _BN)
-    # compile_shader dispatch: `threads` is the TOTAL thread count in each
-    # dimension and `group_size` is the threadgroup size.  So threadgroups in
-    # each dimension = threads / group_size.
-    #
-    # X: ntg_x * 128 total threads / group_size 128  → ntg_x threadgroups  (M tiles)
-    # Y: ntg_y * 1   total threads / group_size  1   → ntg_y threadgroups  (N tiles)
-    # Z: 1           total threads / group_size  1   → 1  threadgroup
-    #
-    # tgid.x → M-tile index, tgid.y → N-tile index — consistent with the
-    # kernel's `m0 = tgid.x * BM`, `n0 = tgid.y * BN`.
+    # `threads` is the TOTAL thread count per dimension, so threadgroups per
+    # dimension = threads / group_size: ntg_x over M tiles, ntg_y over N tiles
     lib.gemm(a, b, c, sh, threads=(ntg_x * 128, ntg_y, 1), group_size=(128, 1, 1))
     return c
 
@@ -153,9 +140,8 @@ def self_check_ok():
         _self_check = False
         return False
     try:
-        # Local generator, never torch.manual_seed: this probe runs at plugin
-        # import (conv im2col's gate), and reseeding there would move the host's
-        # RNG under every later draw in the process.
+        # local generator, never torch.manual_seed: this runs at plugin import, and
+        # reseeding there would move the host RNG under every later draw
         g = torch.Generator().manual_seed(0)
         a = (torch.randn(64, 256, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()
         b = (torch.randn(256, 96, generator=g) * 0.5).to(torch.bfloat16).to("mps").contiguous()

@@ -1,27 +1,10 @@
 """Switch: neutralize ComfyUI-WanVideoWrapper block swap on MPS.
 
-Block swap offloads transformer blocks to the CPU and streams them back to the
-GPU on demand, to fit big models into scarce NVIDIA VRAM. The swap-in
-(`block.to(self.main_device)`) relies on CUDA events to synchronize the async
-copy; on MPS that synchronization doesn't hold, so a block's parameters (e.g.
-`self.modulation`) are still on the CPU when the block computes:
-
-    RuntimeError: Expected all tensors to be on the same device, but found at
-                  least two devices, mps:0 and cpu!   (model.py get_mod: modulation + e)
-
-On Apple Silicon there is no separate VRAM — memory is unified — so block swap
-is pure downside: it adds cpu<->mps copies that save nothing and break on MPS.
-
-This wraps WanModel.forward so that, on MPS, every block (and the vace blocks)
-is made resident on main_device and the offload flags are cleared before the
-real forward runs — i.e. the model behaves as if block swap were never enabled.
-This reproduces the known-good "no block swap node" state regardless of what the
-downloaded workflow configured.
-
-Disable with ASFP8_NEUTRALIZE_BLOCKSWAP=off.
-
-Because ComfyUI-WanVideoWrapper imports after this plugin, we register a small
-post-import hook on sys.meta_path and patch WanModel as soon as its module loads.
+Block swap streams transformer blocks back from the CPU using CUDA events to sync the
+async copy, which doesn't hold on MPS, so a block computes with parameters still on the
+CPU. Unified memory makes the swap pure downside anyway, so wrap WanModel.forward and
+make every block resident with the offload flags cleared. ASFP8_NEUTRALIZE_BLOCKSWAP=off
+disables. WanVideoWrapper imports after us, hence the post-import hook.
 """
 
 import os
@@ -53,11 +36,10 @@ def _patch_wanmodel(module):
         if _enabled():
             main_dev = getattr(self, "main_device", None)
             is_mps = getattr(main_dev, "type", None) == "mps"
-            # Fall back to detecting MPS via the first block's params if needed.
             if main_dev is None:
                 is_mps = torch.backends.mps.is_available()
             if is_mps:
-                # Clear every offload knob so the real forward never streams.
+                # clear every offload knob so the real forward never streams
                 self.blocks_to_swap = 0
                 if hasattr(self, "vace_blocks_to_swap"):
                     self.vace_blocks_to_swap = 0
@@ -65,7 +47,6 @@ def _patch_wanmodel(module):
                     self.prefetch_blocks = 0
                 self.offload_txt_emb = False
                 self.offload_img_emb = False
-                # Make all blocks resident on the compute device.
                 if main_dev is not None:
                     for attr in ("blocks", "vace_blocks"):
                         mods = getattr(self, attr, None)
@@ -93,7 +74,7 @@ class _PostImportHook(importlib.abc.MetaPathFinder):
         low = fullname.lower()
         if "wanvideo" not in low or not low.endswith(self._suffix):
             return None
-        # Resolve the real spec via the other finders, then wrap its loader.
+        # resolve the real spec via the other finders, then wrap its loader
         self._busy = True
         try:
             for finder in sys.meta_path:
@@ -125,7 +106,7 @@ class _PostImportHook(importlib.abc.MetaPathFinder):
             except Exception:
                 import traceback
                 traceback.print_exc()
-            # One-shot: remove ourselves once the target module is handled.
+            # one-shot: remove ourselves once the target module is handled
             try:
                 sys.meta_path.remove(_finder)
             except ValueError:
@@ -147,7 +128,7 @@ def install():
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
 
-    # If WanVideoWrapper is already imported (re-init / load order), patch now.
+    # already imported (re-init, or a different load order): patch it now
     for name, mod in list(sys.modules.items()):
         if "wanvideo" in name.lower() and name.lower().endswith(_TARGET_SUFFIX):
             _patch_wanmodel(mod)

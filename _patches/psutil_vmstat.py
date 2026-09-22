@@ -1,18 +1,8 @@
 """Fix: psutil.virtual_memory() crashes on recent/beta macOS.
 
-On macOS releases newer than the installed psutil build (notably macOS 26/27
-developer betas), psutil's precompiled C extension fails almost every call:
-
-    RuntimeError: host_statistics64(HOST_VM_INFO64) syscall failed:
-                  (ipc/mig) array not large enough
-
-Its `vm_statistics64` struct no longer matches the kernel's. ComfyUI calls
-psutil.virtual_memory() on every node during a render (RAM-pressure cache +
-model_management), so renders crash mid-way.
-
-We probe psutil at startup; if it's unreliable, we replace psutil.virtual_memory
-with a drop-in backed by the OS's own `vm_stat` + `sysctl hw.memsize`, which don't
-use the broken syscall. On healthy machines we detect nothing wrong and do nothing.
+psutil's `vm_statistics64` struct stops matching the kernel's, so nearly every call
+raises. Probe at startup and, if it is unreliable, swap in a drop-in backed by `vm_stat`
+and `sysctl hw.memsize`, which don't use the broken syscall.
 """
 
 import collections
@@ -28,7 +18,7 @@ _svmem = collections.namedtuple(
     ["total", "available", "percent", "used", "free", "active", "inactive", "wired"],
 )
 
-_TOTAL = None  # hw.memsize is constant; cache it.
+_TOTAL = None  # hw.memsize is constant, so cache it
 
 
 def _sysctl_int(name):
@@ -68,8 +58,8 @@ def _virtual_memory_vmstat():
 def _is_broken(psutil, attempts=24):
     """True only if psutil.virtual_memory() fails for a clear majority of calls.
 
-    The macOS-beta bug fails ~99% of the time, so a majority threshold cleanly
-    detects it while never triggering on a healthy OS that has one rare hiccup.
+    The bug fails nearly every call, so a majority threshold can't mistake one hiccup
+    on a healthy OS for it.
     """
     fails = 0
     for _ in range(attempts):
@@ -95,16 +85,15 @@ def install():
         return
     mode = _mode()
     if mode == "off":
-        return  # explicitly disabled
+        return
     try:
         import psutil
     except Exception as e:
         print(f"{TAG} psutil not importable, skipping: {e}")
         return
     try:
-        # In 'auto', only act when psutil is actually broken on this machine.
         if mode == "auto" and not _is_broken(psutil):
-            return  # healthy; leave psutil completely untouched
+            return  # healthy: leave psutil completely untouched
         sample = _virtual_memory_vmstat()  # sanity-check before swapping
         psutil.virtual_memory = _virtual_memory_vmstat
         why = (

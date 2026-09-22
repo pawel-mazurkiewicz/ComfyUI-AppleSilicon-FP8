@@ -1,27 +1,12 @@
-"""Wire mtlflashattn into ComfyUI: a guarded `flash_attn` drop-in + an improved
+"""Wire mtlflashattn into ComfyUI: a guarded `flash_attn` drop-in plus a rerouted
 F.scaled_dot_product_attention on MPS.
 
-Replaces the old vendored v0 Metal kernel (memory-safe but ~3x slower than stock
-fused SDPA, so it only fired as an OOM rescue). mtlflashattn ships fast
-simdgroup_matrix (v1) and TensorOps (v2 / v2r) kernels that beat stock fused SDPA
-by 3-4x at length (more on causal), so attention can now route to it for SPEED and
-CORRECTNESS, not just to avoid OOM.
+Both integrations are independently guarded and never fatal; anything outside the SDPA
+gate, and any kernel error, falls back to stock SDPA.
 
-Two integrations, each independently guarded and never fatal:
-  1. flash_attn shim  -- `import flash_attn` resolves to the Metal kernels on MPS
-     (metal_flash_attn._shim), so models that call flash_attn_func get a native path.
-  2. improved SDPA    -- F.scaled_dot_product_attention reroutes to mtlflashattn when
-     its gate fires: correctness (max seq >= MTLFLASHATTN_SDPA_MIN_SEQ, default 4096,
-     since stock MPS fused SDPA is silently wrong past ~4k tokens), a fast TensorOps
-     tier (max seq >= MTLFLASHATTN_SDPA_FAST_MIN_SEQ, default 1024), or OOM rescue
-     (score bytes >= MTLFLASHATTN_SDPA_MIN_GB, default 12). Everything else, and any
-     kernel error, falls back to stock SDPA. Never crashes the caller.
-
-Env (kill switches / tuning):
-  MTLFLASHATTN_SDPA=off    disable the SDPA patch   (legacy alias: APPLESILICON_FP8_SDPA=off)
+  MTLFLASHATTN_SDPA=off    disable the SDPA patch   (legacy: APPLESILICON_FP8_SDPA=off)
   MTLFLASHATTN_SHIM=off    disable the flash_attn shim
   MTLFLASHATTN_SDPA_MIN_SEQ / _FAST_MIN_SEQ / _MIN_GB   gate thresholds
-     (legacy alias: APPLESILICON_FP8_SDPA_MIN_GB -> MTLFLASHATTN_SDPA_MIN_GB)
 """
 from __future__ import annotations
 
@@ -29,7 +14,7 @@ import os
 
 TAG = "[AppleSilicon-FP8/flash]"
 
-# Map the old node's env knobs onto mtlflashattn's so existing setups keep working.
+# the old node's env knobs, kept working
 _LEGACY_ENV = {
     "APPLESILICON_FP8_SDPA": "MTLFLASHATTN_SDPA",
     "APPLESILICON_FP8_SDPA_MIN_GB": "MTLFLASHATTN_SDPA_MIN_GB",
@@ -37,8 +22,7 @@ _LEGACY_ENV = {
 
 
 def _alias_legacy_env():
-    """Mirror legacy APPLESILICON_FP8_SDPA* vars onto MTLFLASHATTN_SDPA* (only if
-    the new name isn't already set, so an explicit new-name value always wins)."""
+    """Mirror the legacy vars onto the new names, unless the new one is already set."""
     for old, new in _LEGACY_ENV.items():
         val = os.environ.get(old)
         if val is not None and new not in os.environ:
@@ -54,7 +38,7 @@ def install():
         return  # no torch -> nothing to patch
     mps = getattr(torch.backends, "mps", None)
     if mps is None or not mps.is_available():
-        return  # not Apple Silicon / MPS -> no-op (keeps this a no-op everywhere else)
+        return
 
     try:
         from metal_flash_attn import _shim
@@ -69,13 +53,13 @@ def install():
 
     shim_on = False
     try:
-        shim_on = _shim.install()  # appends the guarded flash_attn meta-path finder
+        shim_on = _shim.install()
     except Exception as e:
         print(f"{TAG} flash_attn shim failed to install ({e})", flush=True)
 
     sdpa_on = False
     try:
-        sdpa_on = mfa_sdpa.install()  # gated F.scaled_dot_product_attention reroute
+        sdpa_on = mfa_sdpa.install()
     except Exception as e:
         print(f"{TAG} SDPA patch failed to install ({e})", flush=True)
 
@@ -92,7 +76,7 @@ def install():
     if parts:
         print(f"{TAG} {'; '.join(parts)}.", flush=True)
     else:
-        # Already active (e.g. shim auto-loaded via .pth) or disabled by a kill switch.
+        # already active (the shim can auto-load via .pth) or killed by env
         print(
             f"{TAG} mtlflashattn present; flash_attn/SDPA already active or "
             f"disabled via env (MTLFLASHATTN_SHIM/MTLFLASHATTN_SDPA).",

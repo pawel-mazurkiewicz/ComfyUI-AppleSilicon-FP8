@@ -1,62 +1,7 @@
-"""Fix: FP8 stochastic rounding on MPS (LoRA + FP8 base model).
+"""Fix: FP8 stochastic rounding on MPS (LoRA re-quant of an fp8 base model).
 
-When a LoRA is applied to an FP8-quantised base model, ComfyUI:
-  1. Casts the stored FP8 weight to float32 on MPS (fine).
-  2. Applies the LoRA delta in float32 (fine).
-  3. Calls comfy.float.stochastic_rounding(result, float8_e4m3fn, seed)
-     to re-quantise the patched weight back to FP8 for storage.
-
-Step 3 crashes on MPS via two possible sub-paths:
-
-  a) comfy_kitchen path  (when _CK_STOCHASTIC_ROUNDING_AVAILABLE):
-       ck.stochastic_rounding_fp8(mps_tensor, rng, fp8_dtype)
-     The eager backend ultimately does a float→FP8 cast on-device, which
-     MPS does not support.
-
-  b) Fallback path:
-       output = torch.empty_like(value, dtype=fp8_dtype)   # FP8 on MPS — OK (storage)
-       output[i:].copy_(manual_stochastic_round_to_float8(value[i:], ...))
-     manual_stochastic_round_to_float8 returns a float16 MPS tensor;
-     copy_ then has to convert float16→FP8 on-device — also unsupported.
-
-Fix: wrap comfy.float.stochastic_rounding and keep the work on the GPU where
-possible. Only the *last* step of the re-quant is unsupported on MPS — the
-float→FP8 cast — and patch #8 (tensor_to_fp8) already routes that single op via
-a LUT/CPU hop, so on path (a) the whole function runs on MPS and returns
-byte-identical FP8.
-
-Path (b) still needs the old treatment: it writes through
-``output[i:].copy_(...)``, a strided FP8 copy patch #8 does not cover (it wraps
-``.to``, not ``copy_``). So we try the native path once, and latch onto the CPU
-round-trip for the session if it raises.
-
-This matters because LoRA application re-quantises every weight it touches.
-Sending each one to the CPU in full measured ~5.6x slower at per-weight
-granularity (11.3 → 2.0 ms/weight, M5 Max), which is why loading an fp8 DiT with
-a LoRA took 80–200 s while the same model without one loaded fast (issue #29).
-
-The same module's `to_blocked` needs the same treatment (issue #8). It is the
-swizzle at the end of the NVFP4 *quantize* direction, which an ordinary NVFP4
-checkpoint load reaches with no LoRA involved:
-
-    ops.MixedPrecisionOps.Linear.set_weight
-      -> QuantizedTensor.requantize_from_float
-      -> TensorCoreNVFP4Layout.quantize
-      -> comfy.float.stochastic_round_quantize_nvfp4_by_block
-      -> to_blocked(fp8 block-scales)
-
-to_blocked pads the block-scale matrix out to a multiple of (128, 4) with
-`padded[:rows, :cols] = input_matrix`. When the columns need padding — i.e.
-in_features % 64 != 0 — that destination slice is non-contiguous, and MPS has no
-strided fp8 copy kernel:
-
-    RuntimeError: Undefined type Float8_e4m3fn
-
-(fp8_mps_strided covers the *later* reshape-after-permute in the same function,
-but not this __setitem__.) The rearrangement is pure data movement, so the CPU
-round-trip is bit-exact, and the block-scale matrix is small. MXFP8 feeds uint8
-E8M0 scales through the same function; MPS handles those natively, so the dtype
-guard leaves them alone.
+Wraps comfy.float.stochastic_rounding and to_blocked: try the GPU once, then latch onto
+a bit-exact CPU round-trip for the session if this stack can't run the op natively.
 """
 
 import torch
@@ -67,20 +12,12 @@ TAG = "[AppleSilicon-FP8/stochastic_round]"
 
 _installed = False
 
-# None = untried, True = the GPU path works here, False = this stack needs the CPU
-# round-trip. Latched: a LoRA re-quantises every weight it touches, so probing per
-# weight would put the exception cost straight back on the path #29 is about.
+# None = untried, True = GPU works here, False = this stack needs the CPU round-trip
 _native_ok = None
 
 
 def _is_transient(e):
-    """Memory pressure rather than a missing kernel.
-
-    Worth separating: a missing fp8 kernel is a property of the stack and will
-    fail for every weight, so latching is right. An allocator failure is a
-    property of the moment, and condemning the session to the 4.6x-slower path
-    over one of them would be the same silent regression #29 was.
-    """
+    """Memory pressure rather than a missing kernel, so not worth latching off."""
     oom = getattr(torch, "OutOfMemoryError", None)
     if oom is not None and isinstance(e, oom):
         return True
@@ -90,23 +27,8 @@ def _is_transient(e):
 def _requant(original, value, dtype, seed=0):
     """Re-quantise `value` to an fp8 `dtype`, keeping the maths on the GPU if it can.
 
-    Which operations lack an MPS kernel depends on which implementation comfy
-    calls, and the two differ:
-
-    - comfy_kitchen's ``stochastic_rounding_fp8`` has exactly one, the final
-      float->fp8 cast, and patch #8 (tensor_to_fp8) already routes that single op
-      via a LUT/CPU hop -- so wherever patch #8 is installed the whole function
-      runs on the GPU and returns byte-identical fp8.
-    - comfy's own fallback has a different one: it writes through
-      ``output[i:].copy_(...)``, a strided fp8 copy patch #8 does NOT cover (it
-      wraps ``.to``, not ``copy_``), so that path genuinely needs the CPU.
-
-    Since we cannot tell which one this stack will run, try the GPU once and
-    latch onto the CPU round-trip for the session if it raises. Sending every
-    tensor to the CPU unconditionally, as this patch did from S1 until #29, costs
-    ~4.6x at per-weight granularity (11.1 -> 2.4 ms/weight on an M5 Max) and is
-    why loading an fp8 DiT with a LoRA took minutes while the same model without
-    one loaded fast.
+    Whether the GPU path works depends on which implementation comfy calls, which we
+    cannot tell in advance, so try it once and latch the verdict for the session.
     """
     global _native_ok
     if value.device.type != "mps" or dtype not in FP8_DTYPES:
@@ -118,11 +40,8 @@ def _requant(original, value, dtype, seed=0):
             _native_ok = True
             return out
         except Exception as e:
-            # Deliberately broad. The alternative -- re-raising what we don't
-            # recognise -- turns a logged slowdown into a failed model load, and
-            # every fp8 path in this node is a compatibility shim whose first
-            # duty is not to break the load. The exception is reported, not
-            # swallowed, and the CPU result below is bit-exact either way.
+            # deliberately broad: the CPU fallback below is bit-exact, so re-raising
+            # would only turn a logged slowdown into a failed model load
             if _is_transient(e):
                 return original(value.cpu(), dtype, seed=seed).to(value.device)
             if _native_ok is None:
@@ -130,8 +49,7 @@ def _requant(original, value, dtype, seed=0):
                       f"using the CPU round-trip for the rest of this session.")
             _native_ok = False
 
-    # float->fp8 casts are fully supported on CPU; the fp8 result moves back as
-    # plain storage, which MPS handles.
+    # float->fp8 casts work on CPU, and the fp8 result moves back as plain storage
     return original(value.cpu(), dtype, seed=seed).to(value.device)
 
 

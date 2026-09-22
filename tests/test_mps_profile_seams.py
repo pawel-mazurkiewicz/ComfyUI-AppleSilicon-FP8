@@ -1,21 +1,7 @@
 # tests/test_mps_profile_seams.py
-"""Unit tests for the G1 additions to mps_profile.py.
+"""Unit tests for mps_profile's activation seams and its lazy RoPE scanner.
 
-Covers:
-  - F.silu / F.gelu / F.glu accumulate into 'activation' bucket on MPS tensors
-  - CPU tensors pass through unwrapped (no stats recorded — _is_mps guard)
-  - install() with ASFP8_PROFILE=1 marks F.silu/F.gelu/F.glu as _asfp8_timed
-  - _try_wrap_rope() finds and wraps module-level RoPE functions by canonical name
-  - _try_wrap_rope() wraps _ideogram4_apply_rope_lowp (KJNodes Ideogram4 path)
-  - _try_wrap_rope() patches alias occurrences by object identity (Pass 2)
-  - Functions whose id() is in _rope_wrapped_ids are not re-wrapped
-  - Already-wrapped functions (_asfp8_timed=True) are not double-wrapped
-  - Callables without __code__ (builtins, partials) are skipped safely
-  - *args-only functions (co_argcount == 0) with __code__ ARE wrapped
-  - No-target scan: _rope_wrapped_ids stays empty when no rope names found
-  - install() is a no-op when ASFP8_PROFILE != 1
-
-All tests are MPS-conditional where required; lazy-scanner tests are CPU-safe.
+MPS-conditional where required; the scanner tests are CPU-safe.
 """
 import sys
 import time
@@ -37,8 +23,7 @@ requires_mps = pytest.mark.skipif(
 # Helpers
 # ---------------------------------------------------------------------------
 def _reset(monkeypatch):
-    """Bring mps_profile back to a clean pre-install state for isolated tests.
-    Suppresses the periodic dump by setting _t_last_dump far in the future."""
+    """Bring mps_profile back to a clean pre-install state, with the periodic dump off."""
     monkeypatch.setattr(mps_profile, "_stats", {})
     monkeypatch.setattr(mps_profile, "_rope_wrapped_ids", set())
     monkeypatch.setattr(mps_profile, "_gguf_wrapped", False)
@@ -47,7 +32,7 @@ def _reset(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 1. Activation seam — numerics unchanged after wrapping
+# Activation seam — numerics unchanged after wrapping
 # ---------------------------------------------------------------------------
 @requires_mps
 def test_activation_silu_value_unchanged(monkeypatch):
@@ -84,7 +69,7 @@ def test_activation_glu_value_unchanged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2. Activation seam — stats accumulate on MPS, silent on CPU
+# Activation seam — stats accumulate on MPS, silent on CPU
 # ---------------------------------------------------------------------------
 @requires_mps
 def test_activation_stats_accumulate_on_mps(monkeypatch):
@@ -113,24 +98,16 @@ def test_activation_cpu_tensor_no_stats(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3. install() seam — F.silu/F.gelu/F.glu are marked _asfp8_timed after install
+# install() seam — F.silu/F.gelu/F.glu are marked _asfp8_timed after install
 # ---------------------------------------------------------------------------
 @requires_mps
 def test_install_wraps_activation_globals(monkeypatch):
-    """install() with ASFP8_PROFILE=1 must mark F.silu/F.gelu/F.glu as _asfp8_timed.
-
-    This test exercises Change 5 (install seam) independently of the _timed tests
-    above. It would fail if the F.* wrapping lines were accidentally omitted from
-    install() even though _timed itself works correctly.
-    """
+    """install() with ASFP8_PROFILE=1 marks F.silu/F.gelu/F.glu as _asfp8_timed."""
     monkeypatch.setenv("ASFP8_PROFILE", "1")
     monkeypatch.setattr(mps_profile, "_installed", False)
 
-    # install() globally rebinds the full set of profiled seams (matmul, linear,
-    # sdpa, conv2d/3d, layer_norm, rms_norm, bmm, silu/gelu/glu). Snapshot and
-    # restore *all* of them — restoring only the activations leaks Python timing
-    # wrappers onto torch.matmul/F.linear into later test files, which then makes
-    # torch.compile graph-break and fall back to the CPU C++ inductor backend.
+    # restore EVERY seam install() rebinds, not just the activations: a timing wrapper
+    # left on torch.matmul makes torch.compile graph-break in later test files
     _saved_torch = {name: getattr(torch, name) for name in ("matmul", "bmm")}
     _f_names = [
         "scaled_dot_product_attention", "linear", "conv2d", "conv3d",
@@ -153,7 +130,7 @@ def test_install_wraps_activation_globals(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4. Lazy RoPE scanner — canonical names
+# Lazy RoPE scanner — canonical names
 # ---------------------------------------------------------------------------
 def test_try_wrap_rope_finds_rope_apply(monkeypatch):
     """_try_wrap_rope finds rope_apply in a freshly injected module."""
@@ -209,11 +186,7 @@ def test_try_wrap_rope_finds_apply_rotary_emb(monkeypatch):
 
 
 def test_try_wrap_rope_finds_ideogram4_apply_rope_lowp(monkeypatch):
-    """Scanner finds _ideogram4_apply_rope_lowp (KJNodes Ideogram4 RoPE path).
-
-    Without this name in _ROPE_FN_NAMES, the Ideogram4 convrot run would
-    report rotary = 0% even though RoPE ran inside the KJNodes kernel.
-    """
+    """The scanner finds _ideogram4_apply_rope_lowp (the KJNodes Ideogram4 RoPE path)."""
     _reset(monkeypatch)
 
     def fake_ideogram4_rope(xq, xk, freqs, rope_2d):
@@ -230,17 +203,10 @@ def test_try_wrap_rope_finds_ideogram4_apply_rope_lowp(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. Lazy RoPE scanner — alias/identity scanning (Pass 2)
+# Lazy RoPE scanner — alias/identity scanning
 # ---------------------------------------------------------------------------
 def test_try_wrap_rope_patches_aliases_by_identity(monkeypatch):
-    """Pass 2 patches all modules holding the same function under an alias name.
-
-    Simulates: wanvideo/modules/model.py does
-        from ... import rope_apply as apply_rope_comfy1
-    then calls apply_rope_comfy1 at lines 441-451.
-    Name-only scanning would leave apply_rope_comfy1 unwrapped.
-    Identity scanning (Pass 2) must patch it too.
-    """
+    """The identity pass patches every module holding the function under an alias name."""
     _reset(monkeypatch)
 
     def fake_rope_apply(x, freqs):
@@ -265,7 +231,7 @@ def test_try_wrap_rope_patches_aliases_by_identity(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 6. Lazy RoPE scanner — deduplication and edge cases
+# Lazy RoPE scanner — deduplication and edge cases
 # ---------------------------------------------------------------------------
 def test_try_wrap_rope_skips_known_id(monkeypatch):
     """A function whose id() is in _rope_wrapped_ids is not re-wrapped."""
@@ -328,12 +294,7 @@ def test_try_wrap_rope_skips_callable_without_code(monkeypatch):
 
 
 def test_try_wrap_rope_handles_varargs_function(monkeypatch):
-    """*args-only functions (co_argcount == 0) with __code__ must be wrapped.
-
-    The original co_argcount < 1 guard was wrong: valid RoPE wrappers that
-    use only *args have co_argcount == 0 but have __code__. The correct guard
-    is __code__ is None (builtins/C-extensions), not co_argcount.
-    """
+    """An *args-only function is wrapped: the guard is __code__, never co_argcount."""
     _reset(monkeypatch)
 
     def fake_rope_varargs(*args):
@@ -354,11 +315,7 @@ def test_try_wrap_rope_handles_varargs_function(monkeypatch):
 
 
 def test_try_wrap_rope_does_not_wrap_when_no_targets(monkeypatch):
-    """_rope_wrapped_ids does not grow when no rope-named callables exist.
-
-    Injects a decoy module with non-rope attribute names, then asserts that
-    neither the decoy function nor its id appears in _rope_wrapped_ids.
-    """
+    """_rope_wrapped_ids does not grow when no rope-named callables exist."""
     _reset(monkeypatch)
 
     original_fn = lambda x: x  # noqa: E731
@@ -378,7 +335,7 @@ def test_try_wrap_rope_does_not_wrap_when_no_targets(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 7. install() guard — no-op without ASFP8_PROFILE=1
+# install() guard — no-op without ASFP8_PROFILE=1
 # ---------------------------------------------------------------------------
 def test_install_noop_without_env(monkeypatch):
     """install() must be a no-op when ASFP8_PROFILE env var is absent or not '1'."""

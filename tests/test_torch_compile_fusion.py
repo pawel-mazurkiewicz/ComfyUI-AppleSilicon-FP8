@@ -1,15 +1,7 @@
-"""Tests for Issue A: torch.compile (Inductor MPS) fusion sweep.
+"""Correctness tests for the torch.compile (Inductor MPS) fusion sweep.
 
-Correctness tests only — timing is in dev/bench_torch_compile_fusion.py.
-
-Tests are skipped on non-MPS machines. The compile step is guarded with
-try/except: if Inductor MPS raises BackendCompilerFailed (immature backend),
-the test is skipped with reason="inductor MPS compile failed" rather than
-crashing the test runner. Never fatal.
-
-NOTE: Do NOT run with ASFP8_PROFILE=1 — the mps_profile wrappers
-(F.rms_norm, F.linear, torch.matmul, etc.) are not transparent to Dynamo
-and will introduce graph breaks that mask the real fusion result.
+Skipped off MPS, and skipped rather than failed when Inductor MPS cannot compile. Do NOT
+run with ASFP8_PROFILE=1: those wrappers are opaque to Dynamo and cause graph breaks.
 """
 import pytest
 import torch
@@ -33,12 +25,7 @@ def _make_inputs(B=2, S=4096, D=1536, seed=0, device="mps", dtype=torch.float16)
 
 
 def _bw_tail(x, weight, W):
-    """Bandwidth-bound tail only: rms_norm + silu + residual (NO linear).
-
-    This is the sub-chain where fusion delivers maximum benefit. The linear
-    is excluded because it is compute-bound and breaks the pointwise fusion
-    chain — measured separately in the full-block test.
-    """
+    """rms_norm + silu + residual: the pointwise chain, without the compute-bound linear."""
     h = F.rms_norm(x, (x.shape[-1],), weight, 1e-6)
     h = F.silu(h)
     return x + h
@@ -62,16 +49,12 @@ def _try_compile(fn, **compile_kwargs):
 
 
 # ---------------------------------------------------------------------------
-# A.1.a — bandwidth-bound tail (no linear): compiled matches eager
+# bandwidth-bound tail (no linear): compiled matches eager
 # ---------------------------------------------------------------------------
 
 @_MPS
 def test_bw_tail_compiled_matches_eager():
-    """rms_norm + silu + residual: Inductor MPS compiled output must match eager.
-
-    Tolerance: atol=1e-2, rtol=1e-2 (empirical fp16 fusion noise for this chain).
-    Also asserts against manual fp32 reference to verify rms_norm accumulation.
-    """
+    """rms_norm + silu + residual compiles to the same result as eager and as fp32."""
     x, weight, W = _make_inputs()
 
     compiled_fn, err = _try_compile(_bw_tail)
@@ -112,7 +95,7 @@ def test_bw_tail_compiled_matches_eager():
 
 
 # ---------------------------------------------------------------------------
-# A.1.b — full block (with linear): compiled matches eager
+# full block (with linear): compiled matches eager
 # ---------------------------------------------------------------------------
 
 @_MPS
@@ -129,9 +112,8 @@ def test_full_block_compiled_matches_eager():
     compiled_out = compiled_fn(x, weight, W)
     torch.mps.synchronize()
 
-    # GEMM (h @ W.T) accumulates larger fp16 errors than norm+act alone.
-    # bw_tail (no GEMM) passes at atol=1e-2; full_block needs atol=0.1 for GEMM noise.
-    # 0.07 absolute difference is within normal fp16 1536-wide matmul bounds.
+    # looser than bw_tail's atol=1e-2: the GEMM accumulates more fp16 error than
+    # norm+act alone, and 0.07 is normal for a 1536-wide fp16 matmul
     torch.testing.assert_close(
         compiled_out, eager_out, atol=0.1, rtol=0.1,
         msg=lambda m: f"full_block compiled vs eager: {m}",
@@ -139,18 +121,14 @@ def test_full_block_compiled_matches_eager():
 
 
 # ---------------------------------------------------------------------------
-# A.1.c — fullgraph=True: confirm no graph breaks AND compile actually succeeds
+# fullgraph=True: confirm no graph breaks AND that compile actually succeeds
 # ---------------------------------------------------------------------------
 
 @_MPS
 def test_bw_tail_no_graph_breaks():
-    """Verify 0 graph breaks via dynamo.explain AND fullgraph=True compile succeeds.
+    """No graph breaks: explain() reports one graph AND fullgraph=True compiles.
 
-    graph_count == 1 from explain() is necessary but not sufficient (does not
-    prove fullgraph=True will succeed or that Inductor emits a fused kernel).
-    Both checks are performed:
-      1. dynamo.explain: graph_count == 1
-      2. torch.compile(..., fullgraph=True): compiles and runs without error
+    graph_count == 1 alone doesn't prove fullgraph=True will succeed, so both run.
     """
     import torch._dynamo as dynamo
 
@@ -177,7 +155,7 @@ def test_bw_tail_no_graph_breaks():
 
 
 # ---------------------------------------------------------------------------
-# A.1.d — correctness at small shapes (fast, no-warmup shapes for CI)
+# correctness at small shapes (fast, no-warmup shapes for CI)
 # ---------------------------------------------------------------------------
 
 @_MPS
@@ -208,16 +186,12 @@ def test_bw_tail_shapes(B, S, D):
 
 
 # ---------------------------------------------------------------------------
-# A.1.e — fp16 rms_norm precision: stress inputs + fp32 reference comparison
+# fp16 rms_norm precision: stress inputs against an fp32 reference
 # ---------------------------------------------------------------------------
 
 @_MPS
 def test_compiled_rms_norm_fp32_reference():
-    """Compiled rms_norm must not deviate from fp32 reference on stress inputs.
-
-    Uses large-magnitude inputs (x10 scale) to amplify fp16 vs fp32 difference.
-    Absence of NaN on random data is not evidence of fp32 accumulation.
-    """
+    """Compiled rms_norm matches the fp32 reference on large-magnitude stress inputs."""
     x, weight, W = _make_inputs()
 
     compiled_fn, err = _try_compile(_bw_tail)

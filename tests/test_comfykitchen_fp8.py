@@ -126,11 +126,7 @@ def test_install_does_not_stack_wrappers(ck_state):
 @requires_mps
 @requires_ck
 def test_core_fp8_patch_survives_a_missing_float_utils(ck_state, monkeypatch):
-    """float_utils only backs the NVFP4 to_blocked reroute.
-
-    A comfy_kitchen build without it must still get the fp8 dequant/quantize fix
-    -- the reason this patch exists -- rather than silently no-opping wholesale.
-    """
+    """A comfy_kitchen build with no float_utils still gets the fp8 dequant/quantize fix."""
     from comfy_kitchen.registry import registry
 
     eager = registry._backends.get("eager")

@@ -1,30 +1,8 @@
 """Fix: tensor.to() FP8<->float conversions on MPS (third-party fp8 Linears).
 
-ComfyUI's own layers go through comfy.ops (handled by ops_bias_fp8), but custom
-nodes that roll their own fp8 Linear cast weights/bias at runtime with a plain
-Python `.to()`, e.g. ComfyUI-WanVideoWrapper/custom_linear.py:
-
-    weight = self.weight.to(input)        # fp8 weight -> input.dtype/device
-    bias   = self.bias.to(input)          # fp8 bias   -> input.dtype/device
-
-When the source is FP8 and the target dtype is float (or vice-versa) and MPS is
-involved, this raises:
-
-    TypeError: Trying to convert Float8_e4m3fn to the MPS backend but it does not
-               have support for that dtype.
-
-MPS can *store/move* FP8 tensors but cannot cast to/from FP8 on-device. We wrap
-torch.Tensor.to so that, only when FP8 is actually involved and MPS is in play:
-
-  * FP8 -> float : decode via the LUT+gather path (decode_fp8, MPS-safe), then
-                   move to the requested device.
-  * float -> FP8 : do the unsupported cast on CPU, then move the FP8 result to
-                   the requested device (storage move is fine).
-
-Everything else (the overwhelming common case) hits a tight fast path and calls
-the original .to() unchanged. This only catches PYTHON-level .to() calls; FP8
-type-promotion that happens inside C++ ops (e.g. F.linear with an fp8 weight)
-is not visible here — see linear_fp8 / use a non-fp8 dtype for those layers.
+MPS can store and move fp8 tensors but not cast them, so wrap torch.Tensor.to: fp8 ->
+float decodes through the LUT, float -> fp8 casts on CPU and moves the storage back.
+Only catches Python-level .to(); fp8 promotion inside C++ ops belongs to linear_fp8.
 """
 
 import sys
@@ -38,14 +16,9 @@ TAG = "[AppleSilicon-FP8/tensor_to]"
 _FP8_SET = frozenset(FP8_DTYPES)
 _installed = False
 
-# `.float()` and friends are not sugar for `.to(dtype)` at the Python level —
-# they bind straight to their own aten ops, so wrapping torch.Tensor.to leaves
-# them unpatched. comfy_kitchen's W4A8 dequant calls `s_rel.float()` on group
-# scales that W4A8-mixed checkpoints store as fp8, which is how issue #16
-# surfaced (RuntimeError: Undefined type Float8_e4m3fn on newer torch, TypeError
-# "cannot convert Float8_e4m3fn to the MPS backend" on older).
-# `.double()` is deliberately absent: MPS has no float64 at all, so there is no
-# result to rescue — it must keep raising torch's own message.
+# `.float()` and friends bind straight to their own aten ops, so wrapping
+# torch.Tensor.to leaves them unpatched. `.double()` is deliberately absent: MPS has no
+# float64 to rescue a result into, so it must keep raising torch's own message.
 _DTYPE_SHORTCUTS = {
     "float": torch.float32,
     "half": torch.float16,
@@ -73,7 +46,7 @@ def _scan_target(args, kwargs, self_dtype):
 
 
 def _target_has_fp8(args, kwargs):
-    """Cheap check: is any explicit target dtype an FP8 type? (tensor-safe)"""
+    """Is any explicit target dtype an FP8 type? Cheap, and never touches tensor data."""
     kd = kwargs.get("dtype")
     if isinstance(kd, torch.dtype) and kd in _FP8_SET:
         return True
@@ -102,7 +75,6 @@ def install():
     def _patched_to(self, *args, **kwargs):
         self_fp8 = self.dtype in _FP8_SET
 
-        # Fast path: source not FP8 and no FP8 target -> never our problem.
         if not self_fp8 and not _target_has_fp8(args, kwargs):
             return _orig_to(self, *args, **kwargs)
 
@@ -119,14 +91,14 @@ def install():
         target_fp8 = target_dtype in _FP8_SET
 
         if self_fp8 and not target_fp8:
-            # FP8 -> float: LUT decode on the source device, then move.
+            # fp8 -> float: LUT decode on the source device, then move
             out = decode_fp8(self).to(target_dtype)
             if out.device != dev:
                 out = _orig_to(out, device=dev)
             return out
 
         if target_fp8 and not self_fp8:
-            # float -> FP8: cast on CPU (unsupported on MPS), then move storage.
+            # float -> fp8: cast on CPU, then move the storage
             src = self.detach()
             if src.device.type != "cpu":
                 src = _orig_to(src, device="cpu")
@@ -135,15 +107,14 @@ def install():
                 q = _orig_to(q, device=dev)
             return q
 
-        # Both FP8 (storage move) or neither FP8 (plain) -> original handles it.
+        # both fp8 (a storage move) or neither: the original handles it
         return _orig_to(self, *args, **kwargs)
 
     torch.Tensor.to = _patched_to
 
     def _make_shortcut(orig, dtype):
-        # No *args: these take memory_format keyword-only, so a positional call
-        # must stay a TypeError rather than reaching .to(), where the second
-        # positional is non_blocking.
+        # no *args: memory_format is keyword-only here, so a positional call must stay
+        # a TypeError instead of reaching .to(), whose second positional is non_blocking
         def _patched(self, **kwargs):
             if self.dtype in _FP8_SET and self.device.type == "mps":
                 return decode_fp8(self).to(dtype, **kwargs)

@@ -1,20 +1,8 @@
-"""DIAGNOSTIC (opt-in ASFP8_PROBE=1): auto-fire the issue-F (fp8 seam/scale/range) and
-issue-ROPE (rotary origin) HUMAN-gate probes during a NORMAL ComfyUI render — no manual
-`probe(model)` call, no console paste, no workflow edit. Read-only: each finding logs once,
-then stays quiet. Never fatal. Inert unless ASFP8_PROBE=1.
+"""DIAGNOSTIC (opt-in, ASFP8_PROBE=1): log the fp8 Linear seam/scale/range and the
+rotary origin during a normal render.
 
-HOW TO USE
-  Launch ComfyUI with the optimizations OFF (so the probe sees the UNMODIFIED model):
-      ASFP8_PROBE=1 <comfyui launch>     # leave ASFP8_FP8_NATIVE / ASFP8_ROPE_FAST UNSET
-  Queue ONE Flux-2-Klein-9B (fp8) render and ONE Ideogram-4 (int8) render, then read the
-  [F-PROBE ...] and [ROPE-ORIGIN ...] lines in the log. They answer:
-    - fp8 SEAM  : the class that owns the fp8 Linear.forward (MRO) + does it wrap torch._scaled_mm
-    - fp8 SCALE : scalar vs per-output-channel [N]
-    - fp8 RANGE : per-layer |x|.max() vs fp16's 65504 (the native wrapper casts bf16->half)
-    - ROPE ORIGIN: is the fired rotary the comfy_kitchen path, or model-specific (e.g. KJNodes
-                   _ideogram4_apply_rope_lowp)? Only comfy_kitchen + x.rank==4 is in scope for #21.
-
-Decision matrices live in dev/probe_F_flux_seam.py and docs/superpowers/results/{F,ROPE}-results.md.
+Read-only and never fatal; each finding logs once. Run with the optimizations OFF so the
+probe sees the unmodified model, then read the [F-PROBE] and [ROPE-ORIGIN] lines.
 """
 
 import os
@@ -32,7 +20,7 @@ def _is_fp8_weight(w):
 
 
 def _install_rope_origin():
-    """Load dev/probe_rope_runtime.py by path; it self-installs the [ROPE-ORIGIN] loggers on import."""
+    """Load dev/probe_rope_runtime.py by path; it self-installs its loggers on import."""
     import os.path as p
     import importlib.util as u
     repo_root = p.dirname(p.dirname(p.abspath(__file__)))
@@ -42,13 +30,12 @@ def _install_rope_origin():
         return
     spec = u.spec_from_file_location("_asfp8_rope_origin_probe", script)
     mod = u.module_from_spec(spec)
-    spec.loader.exec_module(mod)   # prints "[ROPE-ORIGIN] installed; ..."
+    spec.loader.exec_module(mod)
 
 
 def _install_fp8_seam(torch):
-    """Global forward hooks that dump the fp8 Linear seam/scale/range on the first fp8 layer,
-    and whether torch._scaled_mm fires INSIDE that forward (proving the forward is the
-    interceptable seam, before the activation is fp8-quantized)."""
+    """Forward hooks that dump the fp8 seam/scale/range on the first fp8 layer, plus
+    whether torch._scaled_mm fires inside that forward."""
     from torch.nn.modules.module import register_module_forward_hook, register_module_forward_pre_hook
 
     _orig_smm = torch._scaled_mm

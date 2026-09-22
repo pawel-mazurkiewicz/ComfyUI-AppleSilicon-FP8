@@ -1,16 +1,8 @@
 """Issue #8: loading an NVFP4 checkpoint on MPS dies in comfy.float.to_blocked.
 
-comfy/ops.py set_weight -> QuantizedTensor.requantize_from_float -> TensorCoreNVFP4Layout.quantize
--> comfy.float.stochastic_round_quantize_nvfp4_by_block -> to_blocked(fp8 block-scales).
-
-to_blocked pads the block-scale matrix to a multiple of (128, 4) with
-
-    padded[:rows, :cols] = input_matrix
-
-which is a *strided* fp8 copy whenever the column count needs padding (cols % 4 != 0, i.e.
-in_features % 64 != 0). MPS has no such kernel -> RuntimeError: Undefined type Float8_e4m3fn.
-_patches/fp8_mps_strided.py wraps reshape/contiguous/clone, so it covers the later swizzle but
-not this __setitem__.
+It pads the block-scale matrix with `padded[:rows, :cols] = input_matrix`, a strided fp8
+copy MPS has no kernel for. fp8_mps_strided wraps reshape/contiguous/clone, so it covers
+the later swizzle but not this __setitem__.
 """
 import os
 import sys
@@ -32,8 +24,7 @@ cf = pytest.importorskip("comfy.float")
 
 from _patches import stochastic_round_fp8 as sr  # noqa: E402
 
-# Shapes a real NVFP4 block-scale matrix takes: (out_features, in_features // 16).
-# Column padding (the broken case) happens when in_features % 64 != 0.
+# (out_features, in_features // 16); the broken case is column padding, in_features % 64
 SHAPES = [
     (130, 6),    # rows and cols padded
     (128, 6),    # cols only  -- the strided setitem
@@ -67,8 +58,7 @@ def test_to_blocked_fp8_on_mps_matches_cpu(shape, flatten):
 
 @requires_mps
 def test_to_blocked_uint8_unaffected():
-    """The MXFP8 path feeds uint8 E8M0 scales through to_blocked; MPS handles those natively
-    and the wrapper must not divert them."""
+    """uint8 E8M0 scales are left alone: MPS handles those natively."""
     sr.install()
 
     x = torch.arange(130 * 6, dtype=torch.uint8).reshape(130, 6)
@@ -81,8 +71,10 @@ def test_to_blocked_uint8_unaffected():
 
 @requires_mps
 def test_nvfp4_quantize_block_scales_match_cpu():
-    """End-to-end entry point from the issue. The fp4 payload uses a device RNG so it can't be
-    compared across devices, but the block-scale swizzle is deterministic and must be bit-exact."""
+    """NVFP4 quantize block-scales match the CPU bit-for-bit.
+
+    Only the scales: the fp4 payload uses a device RNG and can't cross devices.
+    """
     from _patches import fp8_mps_strided, tensor_to_fp8
     fp8_mps_strided.install()
     tensor_to_fp8.install()
@@ -115,8 +107,7 @@ requires_ck = pytest.mark.skipif(not _HAS_CK, reason="comfy_kitchen not installe
 @requires_mps
 @requires_ck
 def test_ck_quantize_nvfp4_on_mps_matches_cpu():
-    """comfy.quant_ops NVFP4 quantize defaults to stochastic_rounding=0, which routes to
-    comfy_kitchen's quantize_nvfp4 -> its own to_blocked. Non-stochastic, so fully comparable."""
+    """comfy_kitchen's own NVFP4 quantize matches the CPU; it defaults to non-stochastic."""
     import comfy_kitchen as ck
 
     from _patches import comfykitchen_fp8, fp8_mps_strided, tensor_to_fp8

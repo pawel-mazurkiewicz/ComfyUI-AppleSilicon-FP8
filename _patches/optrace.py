@@ -1,19 +1,8 @@
-"""DIAGNOSTIC (opt-in, ASFP8_TRACE_OPS=1): trace which low-level matmul op a model
-actually dispatches to.
+"""DIAGNOSTIC (opt-in, ASFP8_TRACE_OPS=1): trace which matmul op a model dispatches to.
 
-Mixed-precision checkpoints (e.g. a file named "..._fp8_scaled" whose metadata is
-really `int8_tensorwise` native + fp8 emulated) make it ambiguous whether the
-compute hits `torch._scaled_mm` (fp8), `torch._int_mm` (int8), or just decodes to
-bf16 and runs a plain `F.linear`. Guessing the seam has burned us; this measures it.
-
-Installs LAST (on top of whatever the other patches wrapped), so it sees every call
-the model makes. For each of `torch._scaled_mm`, `torch._int_mm`, `F.linear` it logs
-the operand dtypes/shapes on the first call and again at powers of two (so ~10 lines
-per op over a full sampling run gives the magnitude), then delegates unchanged.
-
-Pure observability — changes no numerics, builds nothing. Inert unless the flag is
-set, so it is safe to leave wired in. Run one sampling pass with ASFP8_TRACE_OPS=1
-and read which op dominates.
+Mixed-precision checkpoints make it ambiguous whether compute hits torch._scaled_mm,
+torch._int_mm or a plain F.linear. Logs operand dtypes and shapes on the first call and
+at powers of two, then delegates unchanged. Installs last, so it sees every call.
 """
 
 import os

@@ -1,9 +1,7 @@
 """MLX backend for Qwen3-VL-4B text generation (internal helper for patch #14).
 
-Isolated from the patch so `mlx` is imported lazily and the patch stays mockable.
-Loads an MLX-format Qwen3-VL-4B once and reuses it across calls. Used only for
-text-only autoregressive generation (the TextGenerate prompt-expansion step); the
-diffusion conditioning encode is untouched.
+Separate from the patch so `mlx` imports lazily and the patch stays mockable. Only for
+the text-only TextGenerate step; the diffusion conditioning encode is untouched.
 """
 
 import importlib.util
@@ -27,11 +25,9 @@ def available():
 
 def _sampler_kwargs(do_sample, temperature, top_k, top_p, min_p,
                     repetition_penalty, presence_penalty):
-    # mlx-vlm.generate takes flat sampling kwargs (Task 1 spike: max_tokens,
-    # temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty all
-    # supported). do_sample=False -> greedy (temp 0; other knobs irrelevant to argmax).
+    # mlx-vlm.generate takes flat sampling kwargs
     if not do_sample:
-        return {"temperature": 0.0}
+        return {"temperature": 0.0}   # greedy; the other knobs don't affect argmax
     return {
         "temperature": float(temperature),
         "top_p": float(top_p),
@@ -52,8 +48,7 @@ def _get_model(repo):
 
 def generate_text(prompt_text, *, max_tokens, do_sample, temperature, top_k,
                   top_p, min_p, repetition_penalty, presence_penalty=0.0, seed=None):
-    """Run text-only autoregressive generation. `prompt_text` is already templated
-    (ComfyUI applied the chat template); we pass it through verbatim."""
+    """Run text-only generation. `prompt_text` is already templated, so pass it through."""
     import mlx.core as mx
     from mlx_vlm import generate
 
@@ -63,8 +58,8 @@ def generate_text(prompt_text, *, max_tokens, do_sample, temperature, top_k,
 
     kwargs = _sampler_kwargs(do_sample, temperature, top_k, top_p, min_p,
                              repetition_penalty, presence_penalty)
-    # NOTE (Task 1 spike): pass the pre-formatted prompt positionally; generate() does
-    # not re-apply a chat template. Output `.text` is completion-only.
+    # positional: generate() does not re-apply a chat template, and `.text` is
+    # completion-only
     result = generate(model, processor, prompt_text, max_tokens=int(max_tokens),
                       verbose=False, **kwargs)
     return getattr(result, "text", result)

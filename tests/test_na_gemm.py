@@ -34,14 +34,11 @@ def test_self_check_caches_and_is_bool():
 
 @requires_mps
 def test_self_check_does_not_disturb_the_global_rng(monkeypatch):
-    """This probe became automatic in v1.3.2: conv im2col's gate runs it at plugin
-    import. Seeding the process RNG from inside a capability probe silently
-    changes every later torch.randn in the host application -- and ComfyUI is a
-    host whose whole output is a function of its seed."""
+    """The self-check leaves the global RNG alone: conv im2col's gate runs it at import,
+    and ComfyUI's whole output is a function of its seed."""
     monkeypatch.setattr(na_gemm, "_self_check", None)
-    # Pin a distinctive state first. Neighbouring tests in this file seed 0 and
-    # draw the same two shapes the probe does, so capturing whatever they left
-    # behind makes this assertion vacuously true.
+    # pin a distinctive state first: the tests around this one seed 0 and draw the same
+    # shapes the probe does, which would make the assertion vacuous
     torch.manual_seed(4242)
     before = torch.get_rng_state().clone()
 
@@ -54,9 +51,7 @@ def test_self_check_does_not_disturb_the_global_rng(monkeypatch):
 
 @requires_mps
 def test_self_check_reprobes_after_reset_cache(monkeypatch):
-    """_caps.reset_cache() promises tests a genuine re-probe. It clears its own
-    memo, so na_gemm has to drop the cached numeric verdict too -- otherwise the
-    reset returns the stale answer and a test's stubbed conditions never apply."""
+    """The self-check re-probes after reset_cache(), which _caps delegates here."""
     from _patches import _caps
 
     if not na_gemm.available():

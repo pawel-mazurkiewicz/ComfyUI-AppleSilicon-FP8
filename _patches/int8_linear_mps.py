@@ -1,34 +1,10 @@
-"""Fix: INT8 models crawl on MPS (~144 s/step) even after the _int_mm GPU patch.
+"""Fix: INT8 models crawl on MPS even after the _int_mm GPU patch.
 
-The `int8-fast` custom node's quantized Linear has two forward paths (int8_quant.py):
-
-    if x_2d.shape[0] > 16:                       # the normal case: many tokens
-        y = int8_forward_dynamic[_per_row](...)  # quantizes x to int8, then torch._int_mm
-    else:                                        # "small batch fallback"
-        w = dequantize(weight, w_scale).to(dtype) # int8 weight -> compute dtype
-        y = F.linear(x, w, bias)                  # native GEMM
-
-The wide-batch path quantizes activations to int8 and matmuls with `torch._int_mm`.
-On MPS `_int_mm` has no Metal kernel; patch #12 keeps it on the GPU but only in
-float32, which is 3-5x slower than bf16 and doubles the working set (fp32 temps on
-top of a 12 GB model -> memory pressure). Image diffusion runs thousands of tokens,
-so it's always on this slow path.
-
-The fix is the node's *own* small-batch path: dequantize the int8 weight to the
-bf16 compute dtype once and call `F.linear`, which uses MPS's native, double-buffered
-bf16 GEMM — the fastest matmul available on Apple Silicon (a custom int8 matmul2d
-kernel only beats it if fully threadgroup-staged; simple-tiled loses to MPS's own
-`a @ b` at every size). Measured 3.5-4.7x over the float32 _int_mm path on FLUX-shaped
-Linears, and accuracy is equal-or-better: it skips int8 activation quantization
-(weight-only int8), so it matches a plain bf16 forward by construction.
-
-So on MPS we route `int8_forward_dynamic` / `int8_forward_dynamic_per_row` through
-the dequantize+F.linear path for every batch size. Non-MPS keeps the original
-(Triton on CUDA, int8 `_int_mm` elsewhere).
-
-int8-fast usually imports *after* this node (custom nodes load alphabetically), so
-we patch its `int8_quant` module via a one-shot post-import hook. No-op if int8-fast
-isn't installed.
+The int8-fast node's wide-batch path quantizes activations and matmuls with _int_mm,
+which patch #12 can only keep on the GPU in float32. Route both wide-batch entry points
+through the node's own small-batch path instead — dequantize the weight once, then a
+native bf16 GEMM, which is also weight-only int8 and so matches a plain bf16 forward.
+int8-fast usually imports after us, hence the one-shot post-import hook.
 """
 
 import sys
@@ -45,7 +21,6 @@ _dequantize = None
 
 
 def _mps_linear(x, weight, weight_scale, bias, compute_dtype):
-    # Mirror int8-fast's own small-batch fallback: int8 weight -> bf16, native GEMM.
     w = _dequantize(weight, weight_scale).to(compute_dtype)
     b = bias.to(compute_dtype) if bias is not None else None
     return torch.nn.functional.linear(x, w, b)
@@ -137,6 +112,5 @@ def install():
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
     _installed = True
-    # int8-fast may already be imported (loads before us) or not yet (loads after).
-    if not _scan_loaded():
+    if not _scan_loaded():   # it may already be imported, or not yet
         sys.meta_path.insert(0, _Finder())

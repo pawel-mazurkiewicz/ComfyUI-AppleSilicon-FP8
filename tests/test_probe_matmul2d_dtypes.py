@@ -1,10 +1,7 @@
-"""Pytest for the G2 matmul2d dtype probe.
+"""Tests for the matmul2d dtype probe's table generation.
 
-The probe's table generation is the unit under test. We do NOT skip the suite when a
-candidate fails to compile — a candidate compile failure is a recorded capability finding,
-asserted as a structured row. The ONLY legitimate skips are: no MPS device, or no Xcode/
-ninja toolchain. signed_char is the control + spy: it must compile, run, and match the
-int32 reference EXACTLY (a silent fallback would leave C all-zero and fail this).
+A candidate that fails to compile is a recorded finding, not a skip: only a missing MPS
+device or toolchain skips. signed_char is the control, and must match exactly.
 """
 import pytest
 import torch
@@ -23,8 +20,7 @@ _NO_TOOLCHAIN = shutil.which("xcrun") is None
 pytestmark = [
     pytest.mark.skipif(_NO_MPS, reason="needs MPS device"),
     pytest.mark.skipif(_NO_TOOLCHAIN, reason="needs Xcode CLI tools (xcrun)"),
-    # Match the docstring: a missing ninja toolchain is a legitimate skip, not a build
-    # failure (build_extension() would return None and fail the probe_mod assertion).
+    # a missing ninja toolchain is a legitimate skip, not a recorded build failure
     pytest.mark.skipif(not _caps.ninja_available(), reason="needs ninja to build the ObjC++ extension"),
 ]
 
@@ -68,5 +64,5 @@ def test_table_generation_covers_all_candidates(probe_mod):
     section = _probe.build_section(rows)
     for d in _probe.CANDIDATES:
         assert f"| {d:<12} |" in section, f"missing row for {d}"
-    # W4A8 must NOT be claimed from this matrix (Codex MAJOR 6).
+    # W4A8 must not be claimed from this matrix
     assert "NOT W4A8" in section
