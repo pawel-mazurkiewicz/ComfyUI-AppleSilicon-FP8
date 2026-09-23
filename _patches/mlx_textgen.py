@@ -108,12 +108,15 @@ def _encode_text(tok, text):
 
 def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0,
                    top_k=50, top_p=0.95, min_p=0.0, repetition_penalty=1.0,
-                   seed=None, presence_penalty=0.0):
-    if os.environ.get("ASFP8_DISABLE_MLX_TEXTGEN") == "1":
+                   seed=None, presence_penalty=0.0, **extra):
+    def orig():
         return _orig(self, tokens, do_sample=do_sample, max_length=max_length,
                      temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
                      repetition_penalty=repetition_penalty, seed=seed,
-                     presence_penalty=presence_penalty)
+                     presence_penalty=presence_penalty, **extra)
+
+    if os.environ.get("ASFP8_DISABLE_MLX_TEXTGEN") == "1":
+        return orig()
     try:
         backend, tok = _route(self.cond_stage_model, self.tokenizer)
         if backend is None:
@@ -134,10 +137,7 @@ def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0
         pass
     except Exception as e:  # never break a render: fall back to the eager path
         print(f"{TAG} MLX generation failed ({e!r}); falling back to eager.")
-    return _orig(self, tokens, do_sample=do_sample, max_length=max_length,
-                 temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
-                 repetition_penalty=repetition_penalty, seed=seed,
-                 presence_penalty=presence_penalty)
+    return orig()
 
 
 def install():
