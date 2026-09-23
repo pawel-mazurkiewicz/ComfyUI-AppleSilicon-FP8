@@ -265,3 +265,21 @@ def test_mlx_generate_text_real():
         top_p=1.0, min_p=0.0, repetition_penalty=1.0, seed=0,
     )
     assert isinstance(out, str) and len(out.strip()) > 0
+
+
+def test_clip_generate_accepts_mtp_on_mlx_path(monkeypatch):
+    monkeypatch.setattr(mlx_textgen._mlx_qwen3vl, "generate_text", lambda p, **kw: "X")
+    clip = _qwen3vl_clip()
+    out = mlx_textgen._clip_generate(clip, {"qwen3vl_4b": [[(151644, 1.0)]]},
+                                     max_length=8, mtp=True)
+    assert out == [10, 11, 12]
+
+
+def test_clip_generate_forwards_mtp_on_fallback(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mlx_textgen, "_orig", lambda self, tokens, **kw: seen.update(kw) or ["ORIG"])
+    cond = _fake_cond_stage(t5xxl=_FakeSub("t5"))
+    clip = _FakeCLIP(_fake_sd1_tok(t5xxl=_FakeTok()), cond)
+    out = mlx_textgen._clip_generate(clip, {"t5xxl": [[(1, 1.0)]]}, mtp=False)
+    assert out == ["ORIG"]
+    assert seen["mtp"] is False
