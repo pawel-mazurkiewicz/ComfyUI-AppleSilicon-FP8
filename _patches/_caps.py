@@ -86,7 +86,7 @@ def _cpu_brand_string():
     import subprocess
     try:
         out = subprocess.check_output(
-            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"],
             stderr=subprocess.DEVNULL, timeout=5,
         )
     except Exception:
@@ -124,6 +124,11 @@ def kernel_gate():
     that is kernel_ready()'s job.
     """
     return is_mps() and has_neural_accelerators() and ninja_available()
+
+
+def shader_gate():
+    """Pre-filter for compile_shader matmul2d kernels; kernel_ready() does the real check."""
+    return has_compile_shader() and has_neural_accelerators()
 
 
 # name -> None (untried) | True (verified working) | False (verified broken)

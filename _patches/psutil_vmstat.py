@@ -22,7 +22,7 @@ _TOTAL = None  # hw.memsize is constant, so cache it
 
 
 def _sysctl_int(name):
-    return int(subprocess.check_output(["sysctl", "-n", name]).strip())
+    return int(subprocess.check_output(["/usr/sbin/sysctl", "-n", name]).strip())
 
 
 def _vm_stat():
