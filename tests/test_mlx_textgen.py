@@ -283,3 +283,97 @@ def test_clip_generate_forwards_mtp_on_fallback(monkeypatch):
     out = mlx_textgen._clip_generate(clip, {"t5xxl": [[(1, 1.0)]]}, mtp=False)
     assert out == ["ORIG"]
     assert seen["mtp"] is False
+
+
+# --- qwen35 (MOSS-Image) routing ---
+
+
+def _qwen35_sub(model_type="qwen35_9b"):
+    class Qwen35_:  # comfy sets model_type on a per-size subclass
+        pass
+    Qwen35_.model_type = model_type
+    sub = _FakeSub(None)
+    sub.transformer = Qwen35_()
+    return sub
+
+
+def _qwen35_clip(model_type="qwen35_9b"):
+    sub_tok = _FakeTok()
+    sub_tok.tokenizer = _FakeHFTok()
+    cond = _fake_cond_stage(**{model_type: _qwen35_sub(model_type)})
+    return _FakeCLIP(_fake_sd1_tok(**{model_type: sub_tok}), cond)
+
+
+def test_route_qwen35_binds_size(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mlx_textgen._mlx_qwen35, "generate_text",
+                        lambda p, **kw: seen.update(kw) or "OUT")
+    clip = _qwen35_clip("qwen35_9b")
+    backend, tok = mlx_textgen._route(clip.cond_stage_model, clip.tokenizer)
+    assert isinstance(tok, _FakeHFTok)
+    assert backend.generate_text("P", max_tokens=4) == "OUT"
+    assert seen == {"model_type": "qwen35_9b", "max_tokens": 4}
+
+
+def test_route_qwen35_unmapped_size_falls_back(monkeypatch):
+    monkeypatch.delenv("ASFP8_MLX_QWEN35_REPO", raising=False)
+    clip = _qwen35_clip("qwen35_99b")
+    assert mlx_textgen._route(clip.cond_stage_model, clip.tokenizer) == (None, None)
+
+
+def test_qwen35_repo_per_size_and_override(monkeypatch):
+    from _patches import _mlx_qwen35
+    monkeypatch.delenv("ASFP8_MLX_QWEN35_REPO", raising=False)
+    assert _mlx_qwen35.repo_id("qwen35_9b") == "mlx-community/Qwen3.5-9B-4bit"
+    assert _mlx_qwen35.repo_id("qwen35_2b") == "mlx-community/Qwen3.5-2B-4bit"
+    assert _mlx_qwen35.repo_id("qwen35_99b") is None
+    monkeypatch.setenv("ASFP8_MLX_QWEN35_REPO", "me/custom")
+    assert _mlx_qwen35.repo_id("qwen35_9b") == "me/custom"
+
+
+def test_clip_generate_routes_moss_qwen35(monkeypatch):
+    calls = {}
+
+    def fake_gen(prompt_text, **kw):
+        calls["prompt"] = prompt_text
+        calls["kw"] = kw
+        return "ENHANCED"
+
+    monkeypatch.setattr(mlx_textgen._mlx_qwen35, "generate_text", fake_gen)
+    out = mlx_textgen._clip_generate(
+        _qwen35_clip(), {"qwen35_9b": [[(248045, 1.0), (846, 1.0)]]}, do_sample=True,
+        max_length=4096, temperature=0.7, top_k=64, top_p=0.95, min_p=0.05,
+        repetition_penalty=1.05, seed=0, presence_penalty=0.5, mtp=True,
+    )
+    assert out == [10, 11, 12]
+    assert calls["prompt"] == "TEMPLATED_PROMPT"
+    assert calls["kw"]["model_type"] == "qwen35_9b"
+    assert calls["kw"]["max_tokens"] == 4096
+    assert calls["kw"]["presence_penalty"] == 0.5
+
+
+def test_mlx_lm_penalty_matches_comfy_eager():
+    mx = pytest.importorskip("mlx.core")
+    from _patches import _mlx_lm
+    assert _mlx_lm._logits_processors(1.0, 0.0) is None
+    (proc,) = _mlx_lm._logits_processors(1.25, 0.5)
+    logits = mx.array([[2.0, -2.0, 1.0, 4.0]])
+    # first call: history is the prompt tail only, nothing generated yet
+    assert proc(mx.array([3]), logits).tolist() == logits.tolist()
+    # token 1 generated twice, token 2 once; prompt token 3 stays unpenalized
+    out = proc(mx.array([3, 1, 2, 1]), logits).tolist()[0]
+    assert out == pytest.approx([2.0, -2.0 * 1.25 - 0.5, 1.0 / 1.25 - 0.5, 4.0])
+
+
+@requires_mlx_integration
+def test_mlx_qwen35_generate_text_real():
+    from _patches import _mlx_qwen35
+    assert _mlx_qwen35.available()
+    pre = "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    out = _mlx_qwen35.generate_text(
+        pre, model_type=os.environ.get("ASFP8_MLX_QWEN35_TEST_SIZE", "qwen35_9b"),
+        max_tokens=40, do_sample=False, temperature=0.0, top_k=0, top_p=1.0, min_p=0.0,
+        repetition_penalty=1.0, seed=0,
+    )
+    assert isinstance(out, str) and len(out.strip()) > 0
+    assert "<|im_end|>" not in out

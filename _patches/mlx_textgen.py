@@ -1,9 +1,9 @@
-"""Fix: Krea2/LTX2 prompt-expansion TextGenerate is slow on Apple Silicon.
+"""Fix: Krea2/LTX2/MOSS-Image prompt-expansion TextGenerate is slow on Apple Silicon.
 
 Wraps comfy.sd.CLIP.generate so the autoregressive loop runs under MLX: decode the
 already-templated ids to text with ComfyUI's own tokenizer, generate, re-encode. MLX only
 ever sees text, so correctness never depends on cross-tokenizer vocab alignment. See
-`_ROUTES` for the encoders routed; anything else falls through to the eager generate.
+`_backend_for` for the encoders routed; anything else falls through to the eager generate.
 """
 
 import os
@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-from . import _mlx_gemma3, _mlx_qwen3vl
+from . import _mlx_gemma3, _mlx_lm, _mlx_qwen35, _mlx_qwen3vl
 
 TAG = "[AppleSilicon-FP8/mlx_textgen]"
 
@@ -32,6 +32,10 @@ def _backend_for(key, sub):
         return _mlx_qwen3vl
     if key == "gemma3_12b" or tt == "gemma3" or cls.startswith("Gemma3"):
         return _mlx_gemma3
+    if isinstance(mt, str) and mt.startswith("qwen35_"):
+        return _mlx_qwen35.bind(mt)
+    if key.startswith("qwen35_"):
+        return _mlx_qwen35.bind(key)
     return None
 
 
@@ -148,7 +152,7 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-    if not (_mlx_qwen3vl.available() or _mlx_gemma3.available()):
+    if not (_mlx_qwen3vl.available() or _mlx_lm.available()):
         return
     try:
         import comfy.sd as sd
@@ -163,6 +167,7 @@ def install():
     routes = []
     if _mlx_qwen3vl.available():
         routes.append(f"qwen3vl_4b -> {_mlx_qwen3vl.repo_id()}")
-    if _mlx_gemma3.available():
+    if _mlx_lm.available():
         routes.append(f"gemma3_12b -> {_mlx_gemma3.repo_id()}")
+        routes.append(f"qwen35_* -> {_mlx_qwen35.route_label()}")
     print(f"{TAG} TextGenerate routed through MLX on Apple Silicon ({'; '.join(routes)}).")

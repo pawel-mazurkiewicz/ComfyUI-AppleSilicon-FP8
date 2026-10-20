@@ -7,6 +7,8 @@ the text-only TextGenerate step; the diffusion conditioning encode is untouched.
 import importlib.util
 import os
 
+from . import _mlx_store
+
 TAG = "[AppleSilicon-FP8/mlx_qwen3vl]"
 
 DEFAULT_REPO = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
@@ -42,7 +44,7 @@ def _get_model(repo):
     if repo not in _MODELS:
         from mlx_vlm import load  # lazy: only when MLX is actually used
         print(f"{TAG} loading MLX model {repo} (first use; downloads on cache miss).")
-        _MODELS[repo] = load(repo)
+        _MODELS[repo] = load(_mlx_store.resolve(repo, TAG))
     return _MODELS[repo]
 
 
