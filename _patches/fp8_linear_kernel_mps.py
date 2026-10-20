@@ -11,6 +11,8 @@ import sys
 
 import torch
 
+from ._common import full_precision_requested
+
 TAG = "[AppleSilicon-FP8/fp8_kernel]"
 
 _installed = False
@@ -148,7 +150,7 @@ def _try_fp8_kernel_forward(self, input):
             return None
         if not str(getattr(w, "_layout_cls", "")).startswith("TensorCoreFP8"):
             return None
-        if getattr(self, "_full_precision_mm", False):
+        if full_precision_requested(self):
             return None
         if getattr(self, "comfy_force_cast_weights", False):
             return None
