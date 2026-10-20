@@ -6,6 +6,8 @@ per row. Being a separate fp32-reduction kernel with a z-tiled grid is also what
 correct past 2^21 rows, where stock MPS rms_norm returns garbage, so it SUPERSEDES
 rmsnorm_mps_large.py's fallback. DEFAULT ON (ASFP8_FUSED_NORM=off disables); never fatal,
 falling back to an exact group-aware torch composition, with `_last_backend` for tests.
+Also reroutes comfy_kitchen.rms_adaln (MOSS-Image, LTX, SeedVR); anything the kernel
+can't take goes to the original.
 """
 from __future__ import annotations
 
@@ -258,6 +260,63 @@ def _rms_norm(input, normalized_shape, weight=None, eps=None):
     return out.view_as(input)
 
 
+# ---- comfy_kitchen.rms_adaln reroute: rmsnorm(x) * (1 + scale) + shift ----
+_orig_rms_adaln = None
+_ck = None                       # the comfy_kitchen module whose rms_adaln we replaced
+
+
+def _adaln_fusable(x, scale, shift, eps):
+    """True iff the kernel reproduces the eager result: same dtype, per-token or per-batch rows."""
+    if (not isinstance(x, torch.Tensor) or x.device.type != "mps" or x.dtype not in _MSL_T
+            or x.dim() < 2 or x.numel() == 0 or not isinstance(eps, (int, float))):
+        return False
+    if torch.compiler.is_compiling():
+        return False
+    # the kitchen op has no autograd, so a tracked input must keep the original's behaviour
+    if torch.is_grad_enabled() and any(getattr(t, "requires_grad", False) for t in (x, scale, shift)):
+        return False
+    shape = tuple(x.shape)
+    per_batch = (shape[0],) + (1,) * (len(shape) - 2) + (shape[-1],)
+    return all(isinstance(t, torch.Tensor) and t.device == x.device and t.dtype == x.dtype
+               and tuple(t.shape) in (shape, per_batch) for t in (scale, shift))
+
+
+# adapted from Illuminus7/ComfyUI-AppleSilicon-int8-Fast (MIT)
+def _rms_adaln(x, scale, shift, eps=1e-6):
+    """comfy_kitchen.rms_adaln in one pass (its eager MPS path is several)."""
+    global _last_backend
+    if _adaln_fusable(x, scale, shift, eps):
+        return fused_rmsnorm_modulate(x, None, eps, scale, shift)
+    _last_backend = "fallback"
+    return _orig_rms_adaln(x, scale, shift, eps)
+
+
+def _hook_adaln():
+    """Swap in _rms_adaln iff comfy_kitchen and a callable rms_adaln both exist; True if hooked.
+
+    The target is fully resolved before the single assignment, so a missing attribute (older
+    comfy_kitchen) leaves nothing half-installed.
+    """
+    global _orig_rms_adaln, _ck
+    try:
+        import comfy_kitchen
+    except Exception:            # absent or unimportable: the F.rms_norm reroute stands alone
+        return False
+    orig = getattr(comfy_kitchen, "rms_adaln", None)
+    if not callable(orig):
+        return False
+    _orig_rms_adaln, _ck = orig, comfy_kitchen
+    comfy_kitchen.rms_adaln = _rms_adaln
+    return True
+
+
+def _unhook_adaln():
+    global _orig_rms_adaln, _ck
+    if _ck is not None and getattr(_ck, "rms_adaln", None) is _rms_adaln:
+        _ck.rms_adaln = _orig_rms_adaln
+    _orig_rms_adaln = _ck = None
+
+
 def install():
     global _orig_rms_norm, _installed
     from . import _caps
@@ -268,9 +327,11 @@ def install():
     _orig_rms_norm = F.rms_norm
     F.rms_norm = _rms_norm
     torch.nn.functional.rms_norm = _rms_norm
+    adaln = _hook_adaln()
     _installed = True
     print(f"{TAG} fused rmsnorm+modulation kernel active on MPS "
-          f"(F.rms_norm rerouted; supersedes the >2^21-row fp32 fallback).", flush=True)
+          f"(F.rms_norm{' and comfy_kitchen.rms_adaln' if adaln else ''} rerouted; "
+          f"supersedes the >2^21-row fp32 fallback).", flush=True)
 
 
 # ---- test-only install helpers: bypass the env flag so pytest exercises the reroute ----
@@ -281,6 +342,7 @@ def install_for_test():
     _orig_rms_norm = F.rms_norm
     F.rms_norm = _rms_norm
     torch.nn.functional.rms_norm = _rms_norm
+    _hook_adaln()
     _installed = True
 
 
@@ -290,5 +352,6 @@ def uninstall_for_test():
         return
     F.rms_norm = _orig_rms_norm
     torch.nn.functional.rms_norm = _orig_rms_norm
+    _unhook_adaln()
     _orig_rms_norm = None
     _installed = False
