@@ -21,7 +21,7 @@ _installed = False
 _logged_miss = False
 
 
-def _backend_for(key, sub):
+def _backend_for(key, sub, files=None):
     """Identify the MLX backend for a sub-clip by `_modules` key, transformer class name
     or type attribute. Gemma3 keeps model_type on the config class, not the instance."""
     tr = getattr(sub, "transformer", None)
@@ -33,9 +33,9 @@ def _backend_for(key, sub):
     if key == "gemma3_12b" or tt == "gemma3" or cls.startswith("Gemma3"):
         return _mlx_gemma3
     if isinstance(mt, str) and mt.startswith("qwen35_"):
-        return _mlx_qwen35.bind(mt)
+        return _mlx_qwen35.bind(mt, files)
     if key.startswith("qwen35_"):
-        return _mlx_qwen35.bind(key)
+        return _mlx_qwen35.bind(key, files)
     return None
 
 
@@ -82,8 +82,9 @@ def _route(cond_stage_model, sd1_tokenizer):
     """
     global _logged_miss
     modules = getattr(cond_stage_model, "_modules", {})
+    files = getattr(cond_stage_model, "_asfp8_te_files", None)
     for key, sub in modules.items():
-        backend = _backend_for(key, sub)
+        backend = _backend_for(key, sub, files)
         if backend is None:
             continue
         sub_tok = getattr(sd1_tokenizer, key, None)
@@ -144,6 +145,18 @@ def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0
     return orig()
 
 
+def _tag_files(load_clip):
+    """Record the loaded file names on cond_stage_model, which CLIP.clone() shares."""
+    def wrapper(ckpt_paths, *args, **kwargs):
+        clip = load_clip(ckpt_paths, *args, **kwargs)
+        try:
+            clip.cond_stage_model._asfp8_te_files = [os.path.basename(p) for p in ckpt_paths]
+        except Exception:
+            pass
+        return clip
+    return wrapper
+
+
 def install():
     global _orig, _installed
     if _installed:
@@ -163,6 +176,8 @@ def install():
 
     _orig = sd.CLIP.generate
     sd.CLIP.generate = _clip_generate
+    if hasattr(sd, "load_clip"):
+        sd.load_clip = _tag_files(sd.load_clip)
     _installed = True
     routes = []
     if _mlx_qwen3vl.available():

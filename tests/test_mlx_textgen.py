@@ -352,6 +352,44 @@ def test_clip_generate_routes_moss_qwen35(monkeypatch):
     assert calls["kw"]["presence_penalty"] == 0.5
 
 
+@pytest.mark.parametrize("name,stock", [
+    ("qwen3.5_9b_w4a8_gptq.safetensors", True),
+    ("qwen3.5_9b_int8_convrot.safetensors", True),
+    ("qwen3.5_4b_bf16.safetensors", True),
+    ("qwen3.5_9b_uncensored_bf16.safetensors", False),
+    ("qwen3.5_9b_qwen_image_2.1_pe_t2i_w4a8.safetensors", False),
+    ("Heretical-Qwen3.5-9B-fp8.safetensors", False),
+])
+def test_qwen35_bind_only_for_stock_files(monkeypatch, name, stock):
+    monkeypatch.delenv("ASFP8_MLX_QWEN35_REPO", raising=False)
+    assert (mlx_textgen._mlx_qwen35.bind("qwen35_9b", [name]) is not None) is stock
+
+
+def test_qwen35_bind_unknown_file_and_override(monkeypatch):
+    monkeypatch.delenv("ASFP8_MLX_QWEN35_REPO", raising=False)
+    assert mlx_textgen._mlx_qwen35.bind("qwen35_9b", None) is not None
+    monkeypatch.setenv("ASFP8_MLX_QWEN35_REPO", "me/uncensored-mlx")
+    assert mlx_textgen._mlx_qwen35.bind("qwen35_9b", ["qwen3.5_9b_uncensored_bf16.safetensors"]) is not None
+
+
+def test_clip_generate_non_stock_qwen35_runs_eager(monkeypatch):
+    monkeypatch.delenv("ASFP8_MLX_QWEN35_REPO", raising=False)
+    monkeypatch.setattr(mlx_textgen, "_orig", lambda self, tokens, **kw: ["ORIG"])
+    monkeypatch.setattr(mlx_textgen._mlx_qwen35, "generate_text", lambda p, **kw: pytest.fail("MLX used"))
+    clip = _qwen35_clip()
+    clip.cond_stage_model._asfp8_te_files = ["qwen3.5_9b_uncensored_bf16.safetensors"]
+    assert mlx_textgen._clip_generate(clip, {"qwen35_9b": [[(1, 1.0)]]}, max_length=8) == ["ORIG"]
+
+
+def test_load_clip_tags_files_on_shared_cond_stage_model():
+    class _Clip:
+        def __init__(self):
+            self.cond_stage_model = _fake_cond_stage()
+    wrapped = mlx_textgen._tag_files(lambda ckpt_paths, *a, **kw: _Clip())
+    clip = wrapped(ckpt_paths=["/models/text_encoders/qwen3.5_9b_w4a8_gptq.safetensors"], clip_type=0)
+    assert clip.cond_stage_model._asfp8_te_files == ["qwen3.5_9b_w4a8_gptq.safetensors"]
+
+
 def test_mlx_lm_penalty_matches_comfy_eager():
     mx = pytest.importorskip("mlx.core")
     from _patches import _mlx_lm
