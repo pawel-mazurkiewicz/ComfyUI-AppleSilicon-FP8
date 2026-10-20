@@ -297,9 +297,15 @@ def _qwen35_sub(model_type="qwen35_9b"):
     return sub
 
 
+class _EchoHFTok(_FakeHFTok):
+    def decode(self, ids, skip_special_tokens=False):
+        assert skip_special_tokens is False
+        return "IDS:" + ",".join(map(str, ids))
+
+
 def _qwen35_clip(model_type="qwen35_9b"):
     sub_tok = _FakeTok()
-    sub_tok.tokenizer = _FakeHFTok()
+    sub_tok.tokenizer = _EchoHFTok()
     cond = _fake_cond_stage(**{model_type: _qwen35_sub(model_type)})
     return _FakeCLIP(_fake_sd1_tok(**{model_type: sub_tok}), cond)
 
@@ -310,7 +316,7 @@ def test_route_qwen35_binds_size(monkeypatch):
                         lambda p, **kw: seen.update(kw) or "OUT")
     clip = _qwen35_clip("qwen35_9b")
     backend, tok = mlx_textgen._route(clip.cond_stage_model, clip.tokenizer)
-    assert isinstance(tok, _FakeHFTok)
+    assert isinstance(tok, _EchoHFTok)
     assert backend.generate_text("P", max_tokens=4) == "OUT"
     assert seen == {"model_type": "qwen35_9b", "max_tokens": 4}
 
@@ -346,7 +352,7 @@ def test_clip_generate_routes_moss_qwen35(monkeypatch):
         repetition_penalty=1.05, seed=0, presence_penalty=0.5, mtp=True,
     )
     assert out == [10, 11, 12]
-    assert calls["prompt"] == "TEMPLATED_PROMPT"
+    assert calls["prompt"] == "IDS:248045,846"
     assert calls["kw"]["model_type"] == "qwen35_9b"
     assert calls["kw"]["max_tokens"] == 4096
     assert calls["kw"]["presence_penalty"] == 0.5

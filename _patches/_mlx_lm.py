@@ -1,10 +1,8 @@
-"""Text-only mlx_lm generation shared by the mlx_textgen backends (one cached model per repo)."""
+"""Text-only mlx_lm generation shared by the mlx_textgen backends."""
 
 import importlib.util
 
 from . import _mlx_store
-
-_MODELS = {}  # repo_id -> (model, tokenizer)
 
 
 def available():
@@ -13,11 +11,8 @@ def available():
 
 
 def _get_model(repo, tag):
-    if repo not in _MODELS:
-        from mlx_lm import load  # lazy: only when MLX is actually used
-        print(f"{tag} loading MLX model {repo} (first use; downloads on cache miss).")
-        _MODELS[repo] = load(_mlx_store.resolve(repo, tag))
-    return _MODELS[repo]
+    from mlx_lm import load  # lazy: only when MLX is actually used
+    return _mlx_store.load_cached(repo, tag, load)
 
 
 def _logits_processors(repetition_penalty, presence_penalty):
