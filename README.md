@@ -5,6 +5,9 @@
 
 **Run FP8- and INT8-quantized models on Apple Silicon (Metal / MPS) — without crashes, and faster.**
 
+**[Benchmarks: stock ComfyUI vs this node on 8 popular models →](https://github.com/pawel-mazurkiewicz/ComfyUI-AppleSilicon-FP8/blob/main/BENCHMARKS.md)**
+fp8 Krea 2 and Ideogram 4 only run with the node, prompt expansion is 264× faster and VAE decode up to 5.7× faster.
+
 ## TL;DR
 
 - **What:** one ComfyUI custom node that patches MPS at startup so FP8/INT8
