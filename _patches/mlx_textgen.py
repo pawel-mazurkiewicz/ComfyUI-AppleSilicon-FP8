@@ -1,9 +1,9 @@
-"""Fix: Krea2/LTX2 prompt-expansion TextGenerate is slow on Apple Silicon.
+"""Fix: Krea2/LTX2/MOSS-Image prompt-expansion TextGenerate is slow on Apple Silicon.
 
 Wraps comfy.sd.CLIP.generate so the autoregressive loop runs under MLX: decode the
 already-templated ids to text with ComfyUI's own tokenizer, generate, re-encode. MLX only
 ever sees text, so correctness never depends on cross-tokenizer vocab alignment. See
-`_ROUTES` for the encoders routed; anything else falls through to the eager generate.
+`_backend_for` for the encoders routed; anything else falls through to the eager generate.
 """
 
 import os
@@ -11,7 +11,7 @@ import sys
 
 import torch
 
-from . import _mlx_gemma3, _mlx_qwen3vl
+from . import _mlx_gemma3, _mlx_lm, _mlx_qwen35, _mlx_qwen3vl
 
 TAG = "[AppleSilicon-FP8/mlx_textgen]"
 
@@ -21,7 +21,7 @@ _installed = False
 _logged_miss = False
 
 
-def _backend_for(key, sub):
+def _backend_for(key, sub, files=None):
     """Identify the MLX backend for a sub-clip by `_modules` key, transformer class name
     or type attribute. Gemma3 keeps model_type on the config class, not the instance."""
     tr = getattr(sub, "transformer", None)
@@ -32,6 +32,10 @@ def _backend_for(key, sub):
         return _mlx_qwen3vl
     if key == "gemma3_12b" or tt == "gemma3" or cls.startswith("Gemma3"):
         return _mlx_gemma3
+    if isinstance(mt, str) and mt.startswith("qwen35_"):
+        return _mlx_qwen35.bind(mt, files)
+    if key.startswith("qwen35_"):
+        return _mlx_qwen35.bind(key, files)
     return None
 
 
@@ -78,8 +82,9 @@ def _route(cond_stage_model, sd1_tokenizer):
     """
     global _logged_miss
     modules = getattr(cond_stage_model, "_modules", {})
+    files = getattr(cond_stage_model, "_asfp8_te_files", None)
     for key, sub in modules.items():
-        backend = _backend_for(key, sub)
+        backend = _backend_for(key, sub, files)
         if backend is None:
             continue
         sub_tok = getattr(sd1_tokenizer, key, None)
@@ -140,6 +145,18 @@ def _clip_generate(self, tokens, do_sample=True, max_length=256, temperature=1.0
     return orig()
 
 
+def _tag_files(load_clip):
+    """Record the loaded file names on cond_stage_model, which CLIP.clone() shares."""
+    def wrapper(ckpt_paths, *args, **kwargs):
+        clip = load_clip(ckpt_paths, *args, **kwargs)
+        try:
+            clip.cond_stage_model._asfp8_te_files = [os.path.basename(p) for p in ckpt_paths]
+        except Exception:
+            pass
+        return clip
+    return wrapper
+
+
 def install():
     global _orig, _installed
     if _installed:
@@ -148,7 +165,7 @@ def install():
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-    if not (_mlx_qwen3vl.available() or _mlx_gemma3.available()):
+    if not (_mlx_qwen3vl.available() or _mlx_lm.available()):
         return
     try:
         import comfy.sd as sd
@@ -159,10 +176,13 @@ def install():
 
     _orig = sd.CLIP.generate
     sd.CLIP.generate = _clip_generate
+    if hasattr(sd, "load_clip"):
+        sd.load_clip = _tag_files(sd.load_clip)
     _installed = True
     routes = []
     if _mlx_qwen3vl.available():
         routes.append(f"qwen3vl_4b -> {_mlx_qwen3vl.repo_id()}")
-    if _mlx_gemma3.available():
+    if _mlx_lm.available():
         routes.append(f"gemma3_12b -> {_mlx_gemma3.repo_id()}")
+        routes.append(f"qwen35_* -> {_mlx_qwen35.route_label()}")
     print(f"{TAG} TextGenerate routed through MLX on Apple Silicon ({'; '.join(routes)}).")
