@@ -4,6 +4,16 @@ import torch
 from conftest import requires_mps  # repo-provided marker (tests/conftest.py)
 
 
+@pytest.fixture(autouse=True)
+def _restore_conv_state():
+    """install() rebinds F.conv2d/F.conv3d and module globals; undo it after every test."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    saved = (F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed)
+    yield
+    F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed = saved
+
+
 @requires_mps
 @pytest.mark.parametrize("H,W,Cin,kh,kw,s,p", [(16, 16, 8, 3, 3, 1, 1),
                                                (15, 17, 6, 3, 3, 2, 1),
@@ -453,3 +463,343 @@ def test_scatter_drops_extra_buffer(monkeypatch):
     assert out_flat_shape not in s_scatter, s_scatter
     assert final_shape in s_scatter, s_scatter
     assert out.shape == final_shape
+
+
+# ---------------------------------------------------------------------------
+# Single-frame conv3d -> conv2d (T == kT, no temporal padding)
+# ---------------------------------------------------------------------------
+
+_SF_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# (kernel hw, stride, padding, dilation, N, bias): the CausalConv3d shapes comfy's Wan VAE runs
+_SF_VARIANTS = {
+    "wan3x3": dict(ks=(3, 3), stride=1, padding=(0, 1, 1), dilation=1, N=1, bias=True),
+    "wan3x3_nobias_n2": dict(ks=(3, 3), stride=1, padding=(0, 1, 1), dilation=1, N=2, bias=False),
+    "spatial_stride2": dict(ks=(3, 3), stride=(1, 2, 2), padding=(0, 1, 1), dilation=1, N=1, bias=True, hw=(21, 19)),
+    "time_conv_stride_t2": dict(ks=(1, 1), stride=(2, 1, 1), padding=0, dilation=1, N=1, bias=True),
+    "int_args_1x1": dict(ks=(1, 1), stride=1, padding=0, dilation=1, N=1, bias=False),
+    "spatial_dilation": dict(ks=(3, 3), stride=1, padding=(0, 2, 2), dilation=(1, 2, 2), N=1, bias=True),
+}
+
+
+def _rel_rms(out, ref):
+    return ((out.float().cpu() - ref).norm() / ref.norm()).item()
+
+
+def _sf_tol(dtype, ref):
+    # one rounding of the fp32 result to `dtype` is the best any kernel can do
+    if dtype == torch.float32:
+        return 1e-5
+    return 1.15 * _rel_rms(ref.to(dtype), ref)
+
+
+def _sf_inputs(dtype, kT, v, Cin=16, Cout=24, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    H, W = v.get("hw", (20, 20))
+    kh, kw = v["ks"]
+    x = torch.randn(v["N"], Cin, kT, H, W, generator=g).to(dtype)
+    w = (torch.randn(Cout, Cin, kT, kh, kw, generator=g) / (Cin * kT * kh * kw) ** 0.5).to(dtype)
+    b = torch.randn(Cout, generator=g).to(dtype) if v["bias"] else None
+    return x, w, b
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", _SF_DTYPES)
+@pytest.mark.parametrize("kT", [1, 3])
+@pytest.mark.parametrize("name", list(_SF_VARIANTS))
+def test_single_frame_matches_conv3d(dtype, kT, name):
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    v = _SF_VARIANTS[name]
+    x, w, b = _sf_inputs(dtype, kT, v)
+    ref = F.conv3d(x.float(), w.float(), None if b is None else b.float(),
+                   v["stride"], v["padding"], v["dilation"])
+    xm, wm, bm = x.to("mps"), w.to("mps"), None if b is None else b.to("mps")
+    assert cm._single_frame_ok(xm, wm, v["stride"], v["padding"], v["dilation"], 1)
+    out = cm._single_frame_conv3d(xm, wm, bm, v["stride"], v["padding"], v["dilation"], 1)
+    stock = F.conv3d(xm, wm, bm, v["stride"], v["padding"], v["dilation"])
+    torch.mps.synchronize()
+    assert out.shape == ref.shape and out.dtype == dtype
+    assert out.is_contiguous() == stock.is_contiguous()
+    assert _rel_rms(out, ref) <= _sf_tol(dtype, ref), (_rel_rms(out, ref), _sf_tol(dtype, ref))
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", _SF_DTYPES)
+@pytest.mark.parametrize("kT", [1, 3])
+def test_single_frame_no_worse_than_stock_conv3d(dtype, kT):
+    """Folding the taps accumulates once, so error stays at or below stock MPS conv3d's.
+
+    Summing per-tap bf16 conv2d outputs measured ~1.4x stock error at kT=3.
+    """
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    v = _SF_VARIANTS["wan3x3"]
+    x, w, b = _sf_inputs(dtype, kT, v, Cin=96, Cout=96)
+    ref = F.conv3d(x.float(), w.float(), b.float(), 1, (0, 1, 1))
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    out = cm._single_frame_conv3d(xm, wm, bm, 1, (0, 1, 1), 1, 1)
+    stock = F.conv3d(xm, wm, bm, 1, (0, 1, 1))
+    torch.mps.synchronize()
+    assert _rel_rms(out, ref) <= max(_rel_rms(stock, ref) * 1.05, 1e-6)
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", _SF_DTYPES)
+@pytest.mark.parametrize("Cout,T", [(3, 1), (32, 1), (3, 2), (32, 2)])
+def test_single_frame_strided_view_weight(dtype, Cout, T):
+    """comfy's causal_zero passes weight[:, :, -T:], a strided view at a storage offset;
+    MPS conv2d returns garbage for those without the .contiguous() (fp32, few channels)."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    g = torch.Generator().manual_seed(0)
+    C = 32
+    x = torch.randn(1, C, T, 20, 20, generator=g).to(dtype).to("mps")
+    wfull = (torch.randn(Cout, C, 3, 3, 3, generator=g) / 30).to(dtype).to("mps")
+    w = wfull[:, :, -T:]
+    assert not w.is_contiguous() and w.storage_offset() > 0
+    ref = F.conv3d(x.float().cpu(), w.float().cpu(), None, 1, (0, 1, 1))
+    out = cm._single_frame_conv3d(x, w, None, 1, (0, 1, 1), 1, 1)
+    torch.mps.synchronize()
+    assert _rel_rms(out, ref) <= _sf_tol(dtype, ref)
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", _SF_DTYPES)
+@pytest.mark.parametrize("kT", [1, 3])
+def test_single_frame_noncontiguous_input(dtype, kT):
+    """An input sliced out of a longer clip (strided view, storage offset) is handled."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    g = torch.Generator().manual_seed(0)
+    big = torch.randn(2, 16, 7, 20, 20, generator=g).to(dtype).to("mps")
+    x = big[:, :, 2:2 + kT]
+    assert not x.is_contiguous()
+    w = (torch.randn(24, 16, kT, 3, 3, generator=g) / 20).to(dtype).to("mps")
+    ref = F.conv3d(x.float().cpu(), w.float().cpu(), None, 1, (0, 1, 1))
+    out = cm._single_frame_conv3d(x, w, None, 1, (0, 1, 1), 1, 1)
+    torch.mps.synchronize()
+    assert _rel_rms(out, ref) <= _sf_tol(dtype, ref)
+
+
+def _sf_args(**over):
+    """An eligible one-frame conv3d on MPS, with overrides; returns (x, w, kwargs)."""
+    a = dict(x=(1, 8, 3, 12, 12), w=(8, 8, 3, 3, 3), dtype=torch.bfloat16, wdtype=None, device="mps",
+             stride=1, padding=(0, 1, 1), dilation=1, groups=1)
+    a.update(over)
+    x = torch.zeros(*a["x"], dtype=a["dtype"], device=a["device"])
+    w = torch.zeros(*a["w"], dtype=a["wdtype"] or a["dtype"], device=a["device"])
+    return x, w, {k: a[k] for k in ("stride", "padding", "dilation", "groups")}
+
+
+_SF_REJECTS = {
+    "T_ne_kT": dict(x=(1, 8, 5, 12, 12)),
+    "temporal_padding": dict(padding=(1, 1, 1)),
+    "padding_same": dict(padding="same"),
+    "padding_valid": dict(padding="valid"),
+    "temporal_dilation": dict(x=(1, 8, 1, 12, 12), w=(8, 8, 1, 3, 3), dilation=(2, 1, 1)),
+    "grouped": dict(w=(8, 4, 3, 3, 3), groups=2),
+    "dtype_mismatch": dict(wdtype=torch.float32),
+    "unbatched_4d": dict(x=(8, 3, 12, 12)),
+    "empty_batch": dict(x=(0, 8, 3, 12, 12)),
+    "stride_wrong_len": dict(stride=(1, 1)),
+    "channel_mismatch": dict(w=(8, 6, 3, 3, 3)),
+}
+
+
+@requires_mps
+def test_single_frame_ok_accepts_eligible():
+    import _patches.conv_im2col_mps as cm
+    x, w, kw = _sf_args()
+    assert cm._single_frame_ok(x, w, kw["stride"], kw["padding"], kw["dilation"], kw["groups"]) is True
+
+
+@requires_mps
+@pytest.mark.parametrize("name", list(_SF_REJECTS))
+def test_single_frame_not_engaged(name, monkeypatch):
+    """Anything that is not a plain one-frame conv3d on MPS goes to the original conv."""
+    import _patches.conv_im2col_mps as cm
+    x, w, kw = _sf_args(**_SF_REJECTS[name])
+    assert cm._single_frame_ok(x, w, kw["stride"], kw["padding"], kw["dilation"], kw["groups"]) is False
+    sentinel = object()
+    hit = {"sf": 0}
+
+    def spy(*a, **k):
+        hit["sf"] += 1
+    wrapped = cm._make_wrap(lambda *a, **k: sentinel, 3, im2col=False, single_frame=True)
+    monkeypatch.setattr(cm, "_single_frame_conv3d", spy)
+    assert wrapped(x, w, None, **kw) is sentinel
+    assert hit["sf"] == 0
+
+
+def test_single_frame_inert_on_cpu():
+    import _patches.conv_im2col_mps as cm
+    sentinel = object()
+    x, w, kw = _sf_args(x=(1, 8, 1, 12, 12), w=(8, 8, 1, 3, 3), device="cpu", dtype=torch.float32)
+    on = cm._make_wrap(lambda *a, **k: sentinel, 3, im2col=False, single_frame=True)
+    assert on(x, w, None, **kw) is sentinel
+    assert cm._single_frame_ok(x, w, kw["stride"], kw["padding"], kw["dilation"], kw["groups"]) is False
+
+
+@requires_mps
+def test_single_frame_wrapper_flag_off_delegates():
+    import _patches.conv_im2col_mps as cm
+    sentinel = object()
+    x, w, kw = _sf_args(x=(1, 8, 1, 12, 12), w=(8, 8, 1, 3, 3))
+    assert cm._single_frame_ok(x, w, kw["stride"], kw["padding"], kw["dilation"], kw["groups"])
+    off = cm._make_wrap(lambda *a, **k: sentinel, 3, im2col=False, single_frame=False)
+    assert off(x, w, None, **kw) is sentinel
+
+
+@requires_mps
+def test_single_frame_wrapper_engages_and_skips_orig():
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    x, w, kw = _sf_args(x=(1, 8, 1, 12, 12), w=(8, 8, 1, 3, 3))
+    wrapped = cm._make_wrap(_boom_fallback, 3, im2col=False, single_frame=True)
+    out = wrapped(x, w, None, **kw)
+    assert out.shape == (1, 8, 1, 12, 12)
+
+
+@requires_mps
+def test_single_frame_stock_conv2d_is_the_captured_original(monkeypatch):
+    """With conv2d wrapped by install(), the fold must call the captured original, not re-enter it."""
+    import _patches.conv_im2col_mps as cm
+    seen = []
+
+    def fake_orig2d(*a, **k):
+        seen.append(1)
+        return torch.zeros(1, 8, 12, 12, device="mps", dtype=torch.bfloat16)
+    monkeypatch.setattr(cm, "_orig_conv2d", fake_orig2d)
+    monkeypatch.setattr(torch.nn.functional, "conv2d", _boom_fallback)
+    x, w, kw = _sf_args(x=(1, 8, 1, 12, 12), w=(8, 8, 1, 3, 3))
+    cm._single_frame_conv3d(x, w, None, kw["stride"], kw["padding"], kw["dilation"], 1)
+    assert seen == [1]
+
+
+# install(): the single-frame path has its own gate, independent of matmul2d / M5
+
+def _fresh_install_state(monkeypatch, gate):
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.delenv("ASFP8_CONV_IM2COL", raising=False)
+    monkeypatch.delenv("ASFP8_CONV_SINGLE_FRAME", raising=False)
+    monkeypatch.setattr(cm, "_installed_ranks", set())
+    monkeypatch.setattr(cm, "_orig_conv2d", None)
+    monkeypatch.setattr(cm, "_orig_conv3d", None)
+    monkeypatch.setattr(cm, "_sf_installed", False)
+    monkeypatch.setattr(cm, "_gate", lambda: gate)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    return cm
+
+
+def test_install_single_frame_without_matmul2d(monkeypatch):
+    """No matmul2d (non-M5): im2col stays off, the single-frame wrapper still installs."""
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=False)
+    c2, c3 = F.conv2d, F.conv3d
+    cm.install()
+    assert cm._installed_ranks == set()
+    assert cm._sf_installed is True
+    assert F.conv2d is c2 and F.conv3d is not c3
+    assert cm._orig_conv3d is c3
+
+
+@requires_mps
+def test_install_without_matmul2d_routes_only_one_frame(monkeypatch):
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=False)
+    cm.install()
+    calls = {"sf": 0}
+    real = cm._single_frame_conv3d
+
+    def spy(*a, **k):
+        calls["sf"] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(cm, "_single_frame_conv3d", spy)
+    monkeypatch.setattr(cm, "conv_im2col", _boom_fallback)
+    x1 = torch.randn(1, 8, 1, 12, 12, device="mps", dtype=torch.bfloat16)
+    w1 = torch.randn(8, 8, 1, 3, 3, device="mps", dtype=torch.bfloat16)
+    F.conv3d(x1, w1, None, 1, (0, 1, 1))
+    assert calls["sf"] == 1
+    x5 = torch.randn(1, 8, 5, 12, 12, device="mps", dtype=torch.bfloat16)
+    w3 = torch.randn(8, 8, 3, 3, 3, device="mps", dtype=torch.bfloat16)
+    out = F.conv3d(x5, w3, None, 1, 1)          # multi-frame: stock, not im2col, not single-frame
+    torch.mps.synchronize()
+    assert calls["sf"] == 1 and out.shape == (1, 8, 5, 12, 12)
+
+
+@requires_mps
+def test_install_with_matmul2d_keeps_im2col_for_multi_frame(monkeypatch):
+    """Both paths on: one-frame goes to single-frame first, multi-frame still to im2col."""
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=True)
+    cm.install()
+    assert cm._installed_ranks == {3} and cm._sf_installed is True
+    sf, im = object(), object()
+    monkeypatch.setattr(cm, "_single_frame_conv3d", lambda *a, **k: sf)
+    monkeypatch.setattr(cm, "conv_im2col", lambda *a, **k: im)
+    x1 = torch.zeros(1, 8, 1, 12, 12, device="mps", dtype=torch.bfloat16)
+    w1 = torch.zeros(8, 8, 1, 3, 3, device="mps", dtype=torch.bfloat16)
+    assert F.conv3d(x1, w1, None, 1, (0, 1, 1)) is sf
+    x5 = torch.zeros(1, 8, 5, 12, 12, device="mps", dtype=torch.bfloat16)
+    w3 = torch.zeros(8, 8, 3, 3, 3, device="mps", dtype=torch.bfloat16)
+    assert F.conv3d(x5, w3, None, 1, 1) is im
+
+
+@requires_mps
+def test_install_single_frame_flag_off_keeps_im2col(monkeypatch):
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=True)
+    monkeypatch.setenv("ASFP8_CONV_SINGLE_FRAME", "off")
+    cm.install()
+    assert cm._installed_ranks == {3} and cm._sf_installed is False
+    im = object()
+    monkeypatch.setattr(cm, "conv_im2col", lambda *a, **k: im)
+    x1 = torch.zeros(1, 8, 1, 12, 12, device="mps", dtype=torch.bfloat16)
+    w1 = torch.zeros(8, 8, 1, 3, 3, device="mps", dtype=torch.bfloat16)
+    assert F.conv3d(x1, w1, None, 1, (0, 1, 1)) is im        # pre-port behavior
+
+
+@pytest.mark.parametrize("env,val,gate", [("ASFP8_CONV_SINGLE_FRAME", "off", False),
+                                          ("ASFP8_CONV_SINGLE_FRAME", "0", False),
+                                          ("ASFP8_CONV_IM2COL", "off", False),
+                                          ("ASFP8_CONV_IM2COL", "off", True)])
+def test_install_kill_switches(monkeypatch, env, val, gate):
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=gate)
+    monkeypatch.setenv(env, val)
+    c2, c3 = F.conv2d, F.conv3d
+    cm.install()
+    assert cm._installed_ranks == set() and cm._sf_installed is False
+    assert F.conv2d is c2 and F.conv3d is c3
+
+
+def test_install_inert_without_mps_or_off_darwin(monkeypatch):
+    import sys
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=True)
+    c2, c3 = F.conv2d, F.conv3d
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False, raising=False)
+    cm.install()
+    assert F.conv2d is c2 and F.conv3d is c3 and not cm._sf_installed and not cm._installed_ranks
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    with monkeypatch.context() as m:
+        m.setattr(sys, "platform", "linux")
+        cm.install()
+    assert F.conv2d is c2 and F.conv3d is c3 and not cm._sf_installed and not cm._installed_ranks
+
+
+def test_install_upgrade_rewraps_original_not_wrapper(monkeypatch):
+    """single-frame-only install, then an im2col-capable one: F.conv3d wraps the true original."""
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=False)
+    orig3 = F.conv3d
+    cm.install()
+    first = F.conv3d
+    monkeypatch.setattr(cm, "_gate", lambda: True)
+    cm.install()
+    assert F.conv3d is not first and cm._installed_ranks == {3} and cm._sf_installed is True
+    assert cm._orig_conv3d is orig3
+    assert orig3 in [c.cell_contents for c in F.conv3d.__closure__]
+    second = F.conv3d
+    cm.install()                                  # nothing new to install: no re-wrap
+    assert F.conv3d is second

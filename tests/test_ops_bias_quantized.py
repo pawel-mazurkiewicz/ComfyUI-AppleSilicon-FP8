@@ -15,7 +15,8 @@ import torch
 # importable by default
 _CANDIDATES = [
     os.environ.get("ASFP8_COMFY_PATH"),
-    "/Users/pawelma/ComfyUI-Installs/ComfyUI/ComfyUI",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
+    os.path.expanduser("~/ComfyUI-Installs/ComfyUI/ComfyUI"),
 ]
 for _c in _CANDIDATES:
     if _c and os.path.isdir(os.path.join(_c, "comfy")) and _c not in sys.path:

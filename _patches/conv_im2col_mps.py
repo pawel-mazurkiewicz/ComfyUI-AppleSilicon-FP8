@@ -4,6 +4,8 @@ im2col gather -> NT matmul2d + fused bias, looping over output-pixel tiles so th
 lowered patch buffer stays under ASFP8_CONV_TILE_MB. conv3d is ON by default; conv2d
 is not (stock conv2d is already at roofline). ASFP8_CONV_IM2COL=off kills it, =2d or
 =2d,3d opts conv2d in. Any compile/kernel/shape failure falls back to stock conv.
+Separately, one-frame conv3d (T == kT, e.g. Wan VAE causal_zero) runs as conv2d on any MPS
+machine, no matmul2d needed; ASFP8_CONV_SINGLE_FRAME=off disables just that.
 """
 import os
 
@@ -435,11 +437,52 @@ def _wanted_ranks():
     return {3}   # "3d", the default, and anything unrecognized
 
 
-def _make_wrap(orig, rank):
+# ---------------------------------------------------------------------------
+# Single-frame conv3d -> conv2d. Needs no matmul2d, so it has its own gate.
+# ---------------------------------------------------------------------------
+
+_SF_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _triple(v):
+    if isinstance(v, int):
+        return (v,) * 3
+    v = tuple(v)
+    return v * 3 if len(v) == 1 else v
+
+
+def _single_frame_ok(x, weight, stride, padding, dilation, groups):
+    """True iff conv3d is T_in == kT with no temporal padding, i.e. exactly one output frame."""
+    if (isinstance(padding, str) or x.device.type != "mps" or weight.device.type != "mps"
+            or x.dtype not in _SF_DTYPES or weight.dtype != x.dtype or groups != 1
+            or x.dim() != 5 or weight.dim() != 5 or x.numel() == 0 or weight.numel() == 0
+            or x.shape[1] != weight.shape[1] or x.shape[2] != weight.shape[2]):
+        return False
+    s, p, d = _triple(stride), _triple(padding), _triple(dilation)
+    return len(s) == len(p) == len(d) == 3 and p[0] == 0 and d[0] == 1
+
+
+def _stock_conv2d(*args):
+    return (_orig_conv2d if _orig_conv2d is not None else F.conv2d)(*args)
+
+
+def _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups):
+    """One-frame conv3d (T == kT, no temporal pad) as one conv2d with the kT taps folded into channels."""
+    # ported from Illuminus7/ComfyUI-AppleSilicon-int8-Fast (MIT); folded, not summed, so bf16 rounds once
+    s, p, d = _triple(stride), _triple(padding), _triple(dilation)
+    N, C, T, H, W = x.shape
+    # contiguous: MPS conv2d gives garbage for a strided-view weight at a storage offset (causal_zero slice)
+    wf = weight.reshape(weight.shape[0], C * T, weight.shape[3], weight.shape[4]).contiguous()
+    return _stock_conv2d(x.reshape(N, C * T, H, W), wf, bias, s[1:], p[1:], d[1:], groups).unsqueeze(2)
+
+
+def _make_wrap(orig, rank, im2col=True, single_frame=False):
     """Module-level so fallback tests can build the wrapper closure without MPS/install()."""
     def conv(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         try:
-            if weight.dim() - 2 == rank and _supported(x, weight, dilation, groups, x.dtype):
+            if single_frame and rank == 3 and _single_frame_ok(x, weight, stride, padding, dilation, groups):
+                return _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups)
+            if im2col and weight.dim() - 2 == rank and _supported(x, weight, dilation, groups, x.dtype):
                 return conv_im2col(x, weight, bias, stride, padding, dilation, groups)
         except Exception as e:
             print(f"{TAG} conv{rank}d fell back ({e!r})")
@@ -447,21 +490,43 @@ def _make_wrap(orig, rank):
     return conv
 
 
+_sf_installed = False
+
+
+def _single_frame_wanted():
+    # IM2COL=off kills the whole module; SINGLE_FRAME=off just this path
+    if _mode() in _CONV_OFF:
+        return False
+    return os.environ.get("ASFP8_CONV_SINGLE_FRAME", "1").strip().lower() not in _CONV_OFF
+
+
 def install():
-    global _orig_conv2d, _orig_conv3d
+    global _orig_conv2d, _orig_conv3d, _sf_installed
     import sys
-    if sys.platform != "darwin" or not _gate():
+    if sys.platform != "darwin":
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
+    want = _wanted_ranks() if _gate() else set()   # im2col needs matmul2d; single-frame does not
+    sf = _single_frame_wanted()
+    if not want and not sf:
+        return
     if _orig_conv2d is None:
         _orig_conv2d, _orig_conv3d = F.conv2d, F.conv3d   # capture true originals once
-    want = _wanted_ranks()
     if 2 in want and 2 not in _installed_ranks:
         F.conv2d = _make_wrap(_orig_conv2d, 2)
         _installed_ranks.add(2)
+    rewrap3 = False
     if 3 in want and 3 not in _installed_ranks:
-        F.conv3d = _make_wrap(_orig_conv3d, 3)
         _installed_ranks.add(3)
-    print(f"{TAG} conv im2col+matmul2d active on MPS (ranks={sorted(_installed_ranks)}, "
-          f"tile={_TILE_BYTES // 1024**2}MB).")
+        rewrap3 = True
+    if sf and not _sf_installed:
+        _sf_installed = True
+        rewrap3 = True
+    if rewrap3:
+        F.conv3d = _make_wrap(_orig_conv3d, 3, im2col=3 in _installed_ranks, single_frame=_sf_installed)
+    if _installed_ranks:
+        print(f"{TAG} conv im2col+matmul2d active on MPS (ranks={sorted(_installed_ranks)}, "
+              f"tile={_TILE_BYTES // 1024**2}MB).")
+    if _sf_installed:
+        print(f"{TAG} single-frame conv3d -> conv2d active on MPS.")

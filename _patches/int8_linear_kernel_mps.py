@@ -9,6 +9,8 @@ import sys
 
 import torch
 
+from ._common import full_precision_requested
+
 TAG = "[AppleSilicon-FP8/int8_kernel]"
 
 _installed = False
@@ -232,6 +234,15 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
     return out.reshape(*shp[:-1], w_gate.shape[0])
 
 
+def _max_tokens():
+    # past ~2k rows comfy's bf16 dequant GEMM beats the W8A8 path on M5 (it wins below)
+    import os
+    try:
+        return int(os.environ.get("ASFP8_INT8_KERNEL_MAX_TOKENS", "2048"))
+    except ValueError:
+        return 2048
+
+
 def _try_int8_kernel_forward(self, input):
     """Return the layer output via the kernel W8A8 path, or None to fall back.
 
@@ -245,6 +256,8 @@ def _try_int8_kernel_forward(self, input):
             return None
         if isinstance(input, QuantizedTensor):
             return None
+        if input.numel() > _max_tokens() * input.shape[-1]:
+            return None
 
         w = self.weight
         if not isinstance(w, QuantizedTensor) or getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
@@ -253,7 +266,7 @@ def _try_int8_kernel_forward(self, input):
         # latch mark_kernel_failed for the session
         if w.device.type != "mps":
             return None
-        if getattr(self, "_full_precision_mm", False):
+        if full_precision_requested(self):
             return None
         # deliberately no comfy_force_cast_weights check: on a quantized weight that
         # cast IS the per-call dequant/un-rotation this path exists to bypass
@@ -338,7 +351,7 @@ def _maybe_dequant_weight(self, input):
         if w is None or getattr(w, "device", None) is None or w.device.type != "mps":
             return
         self._asfp8_deq_done = True
-        if getattr(self, "_full_precision_mm", False):
+        if full_precision_requested(self):
             return
         if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
             return

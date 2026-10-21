@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="400" viewBox="0 0 880 400" role="img" aria-label="How many times faster each stage runs with this node than on stock ComfyUI">
+<line x1="300.0" x2="300.0" y1="10" y2="366" stroke="#d1d9e0" stroke-width="1"/>
+<text x="300.0" y="386.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1×</text>
+<line x1="466.7" x2="466.7" y1="10" y2="366" stroke="#d1d9e0" stroke-width="1"/>
+<text x="466.7" y="386.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">10×</text>
+<line x1="633.3" x2="633.3" y1="10" y2="366" stroke="#d1d9e0" stroke-width="1"/>
+<text x="633.3" y="386.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">100×</text>
+<line x1="800.0" x2="800.0" y1="10" y2="366" stroke="#d1d9e0" stroke-width="1"/>
+<text x="800.0" y="386.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1000×</text>
+<text x="0.0" y="36.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Prompt expansion</text>
+<text x="0.0" y="54.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">MOSS-Image, per token: 4.33 s → 16 ms</text>
+<rect x="300" y="28" width="403.6" height="18" rx="3" fill="#2a78d6"/>
+<text x="711.6" y="42.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">264×</text>
+<text x="0.0" y="86.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Text encode, first run</text>
+<text x="0.0" y="104.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">FLUX.2 Klein: 9.71 s → 0.97 s</text>
+<rect x="300" y="78" width="167.0" height="18" rx="3" fill="#2a78d6"/>
+<text x="475.0" y="92.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">10×</text>
+<text x="0.0" y="136.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Text encode, first run</text>
+<text x="0.0" y="154.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Qwen-Image: 11.3 s → 1.61 s</text>
+<rect x="300" y="128" width="141.0" height="18" rx="3" fill="#2a78d6"/>
+<text x="449.0" y="142.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">7.0×</text>
+<text x="0.0" y="186.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Text encode, first run</text>
+<text x="0.0" y="204.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">MOSS-Image: 28.2 s → 5.25 s</text>
+<rect x="300" y="178" width="121.8" height="18" rx="3" fill="#2a78d6"/>
+<text x="429.8" y="192.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">5.4×</text>
+<text x="0.0" y="236.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">VAE decode</text>
+<text x="0.0" y="254.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Qwen-Image 1328²: 2.07 s → 0.36 s</text>
+<rect x="300" y="228" width="126.2" height="18" rx="3" fill="#2a78d6"/>
+<text x="434.2" y="242.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">5.7×</text>
+<text x="0.0" y="286.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">VAE decode</text>
+<text x="0.0" y="304.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Krea 2 1024²: 1.23 s → 0.22 s</text>
+<rect x="300" y="278" width="126.1" height="18" rx="3" fill="#2a78d6"/>
+<text x="434.1" y="292.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">5.7×</text>
+<text x="0.0" y="336.0" fill="#1f2328" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Sampling step</text>
+<text x="0.0" y="354.0" fill="#59636e" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Krea 2 int4: 6.65 s → 4.19 s</text>
+<rect x="300" y="328" width="33.5" height="18" rx="3" fill="#2a78d6"/>
+<text x="341.5" y="342.0" fill="#1f2328" font-size="14" font-weight="700" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.6×</text>
+</svg>

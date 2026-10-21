@@ -11,6 +11,8 @@ import sys
 
 import torch
 
+from ._common import full_precision_requested
+
 TAG = "[AppleSilicon-FP8/int4_linear]"
 
 _installed = False
@@ -160,7 +162,79 @@ def install():
 
     ck_convrot.convrot_w4a4_linear = convrot_w4a4_linear_mps
     _patched = True
+    _wrap_linear_factory()
     print(f"{TAG} ConvRot W4A4 (int4) Linear on MPS -> W4A16 rotated-basis fast path.")
+
+
+_seam_failed = False
+
+
+def _try_int4_forward(self, input):
+    """The W4A16 path for a ConvRot W4A4 layer, or None to fall back.
+
+    comfy marks convrot_w4a4 full-precision on MPS, so its forward dequantizes and
+    un-rotates the weight per call and never reaches convrot_w4a4_linear.
+    """
+    global _seam_failed
+    try:
+        from comfy_kitchen.tensor import QuantizedTensor
+
+        if not isinstance(input, torch.Tensor) or input.device.type != "mps":
+            return None
+        if isinstance(input, QuantizedTensor):
+            return None
+        w = self.weight
+        if not isinstance(w, QuantizedTensor) or getattr(w, "_layout_cls", None) != "TensorCoreConvRotW4A4Layout":
+            return None
+        if w.device.type != "mps" or getattr(w._params, "transposed", False):
+            return None
+        if full_precision_requested(self):
+            return None
+        if len(getattr(self, "weight_function", [])) or len(getattr(self, "bias_function", [])):
+            return None
+        params = w._params
+        return sys.modules["comfy_kitchen.tensor.convrot_w4a4"].convrot_w4a4_linear(
+            input, w._qdata, params.scale, bias=self.bias,
+            convrot_groupsize=params.convrot_groupsize,
+            quant_group_size=params.quant_group_size,
+            linear_dtype=getattr(params, "linear_dtype", "int4"))
+    except Exception as e:
+        _seam_failed = True
+        print(f"{TAG} Linear seam failed ({e!r}); using comfy's int4 path.")
+        return None
+
+
+def _wrap_linear_factory():
+    # pick_operations() calls the factory by module name at model load
+    try:
+        import comfy.ops as ops
+    except ImportError:
+        return
+    orig_factory = getattr(ops, "mixed_precision_ops", None)
+    if orig_factory is None or getattr(orig_factory, "_asfp8_int4_wrapped", False):
+        return
+
+    def wrapped_factory(*a, **k):
+        cls = orig_factory(*a, **k)
+        linear_cls = getattr(cls, "Linear", None)
+        if linear_cls is not None and not getattr(linear_cls, "_asfp8_int4_patched", False):
+            orig_forward = linear_cls.forward
+
+            def forward(self, input, *args, **kwargs):
+                if not _seam_failed:
+                    res = _try_int4_forward(self, input)
+                    if res is not None:
+                        return res
+                return orig_forward(self, input, *args, **kwargs)
+
+            linear_cls.forward = forward
+            linear_cls._asfp8_int4_patched = True
+        return cls
+
+    wrapped_factory._asfp8_int4_wrapped = True
+    # the int8 seam's install() checks this marker on whatever factory it finds
+    wrapped_factory._asfp8_wrapped = getattr(orig_factory, "_asfp8_wrapped", False)
+    ops.mixed_precision_ops = wrapped_factory
 
 
 def uninstall():
