@@ -31,3 +31,15 @@ def decode_fp8(t, out_dtype=torch.float32):
         # MPS can't .contiguous() an FP8 tensor, so do it on CPU
         idx = t.cpu().contiguous().view(torch.uint8).to(torch.long).to(device)
     return lut[idx]
+
+
+def full_precision_requested(layer):
+    """True only when the checkpoint asks this layer for full precision.
+
+    comfy also forces _full_precision_mm on formats it can't run on MPS, which are the
+    layers our kernels exist for.
+    """
+    cfg = getattr(layer, "_full_precision_mm_config", None)
+    if cfg is None:  # comfy before the per-layer config attribute
+        return bool(getattr(layer, "_full_precision_mm", False))
+    return bool(cfg)

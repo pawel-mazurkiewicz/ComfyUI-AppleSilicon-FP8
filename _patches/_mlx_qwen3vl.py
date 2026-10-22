@@ -7,11 +7,12 @@ the text-only TextGenerate step; the diffusion conditioning encode is untouched.
 import importlib.util
 import os
 
+from . import _mlx_store
+
 TAG = "[AppleSilicon-FP8/mlx_qwen3vl]"
 
 DEFAULT_REPO = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 
-_MODELS = {}  # repo_id -> (model, processor)
 
 
 def repo_id():
@@ -39,11 +40,8 @@ def _sampler_kwargs(do_sample, temperature, top_k, top_p, min_p,
 
 
 def _get_model(repo):
-    if repo not in _MODELS:
-        from mlx_vlm import load  # lazy: only when MLX is actually used
-        print(f"{TAG} loading MLX model {repo} (first use; downloads on cache miss).")
-        _MODELS[repo] = load(repo)
-    return _MODELS[repo]
+    from mlx_vlm import load  # lazy: only when MLX is actually used
+    return _mlx_store.load_cached(repo, TAG, load)
 
 
 def generate_text(prompt_text, *, max_tokens, do_sample, temperature, top_k,

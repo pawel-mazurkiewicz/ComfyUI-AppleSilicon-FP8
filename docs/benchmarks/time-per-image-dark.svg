@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="532" viewBox="0 0 880 532" role="img" aria-label="Seconds per image, stock ComfyUI vs this node">
+<rect x="268" y="10" width="12" height="12" rx="2" fill="#d95926"/>
+<text x="286.0" y="21.0" fill="#9198a1" font-size="13" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Stock ComfyUI</text>
+<rect x="408" y="10" width="12" height="12" rx="2" fill="#3987e5"/>
+<text x="426.0" y="21.0" fill="#9198a1" font-size="13" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">With this node</text>
+<text x="876.0" y="21.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">speedup</text>
+<line x1="0" x2="880" y1="44.0" y2="44.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="69.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Krea 2 Turbo</text>
+<text x="0.0" y="88.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">int4 ConvRot · 8 steps · 1024²</text>
+<rect x="268" y="58" width="432.0" height="14" rx="3" fill="#d95926"/>
+<text x="708.0" y="69.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">54.6 s</text>
+<rect x="268" y="76" width="267.1" height="14" rx="3" fill="#3987e5"/>
+<text x="543.1" y="87.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">33.8 s</text>
+<text x="876.0" y="80.0" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.62×</text>
+<line x1="0" x2="880" y1="104.0" y2="104.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="129.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Krea 2 Turbo</text>
+<text x="0.0" y="148.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">int8 ConvRot · 8 steps · 1024²</text>
+<rect x="268" y="118" width="432.0" height="14" rx="3" fill="#d95926"/>
+<text x="708.0" y="129.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">40.8 s</text>
+<rect x="268" y="136" width="407.6" height="14" rx="3" fill="#3987e5"/>
+<text x="683.6" y="147.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">38.5 s</text>
+<text x="876.0" y="140.0" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.05×</text>
+<line x1="0" x2="880" y1="164.0" y2="164.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="189.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Krea 2 Turbo</text>
+<text x="0.0" y="208.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">fp8 · 8 steps · 1024²</text>
+<text x="268.0" y="189.5" fill="#f85149" font-size="12" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">✕  fails on stock ComfyUI</text>
+<rect x="268" y="196" width="432.0" height="14" rx="3" fill="#3987e5"/>
+<text x="708.0" y="207.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">32.3 s</text>
+<text x="876.0" y="200.0" fill="#e6edf3" font-size="13" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">only with node</text>
+<line x1="0" x2="880" y1="224.0" y2="224.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="249.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">MOSS-Image SFT</text>
+<text x="0.0" y="268.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">int8 ConvRot · 25 steps · 1024²</text>
+<rect x="268" y="238" width="432.0" height="14" rx="3" fill="#d95926"/>
+<text x="708.0" y="249.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">125.2 s</text>
+<rect x="268" y="256" width="401.8" height="14" rx="3" fill="#3987e5"/>
+<text x="677.8" y="267.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">116.5 s</text>
+<text x="876.0" y="260.0" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.07×</text>
+<line x1="0" x2="880" y1="284.0" y2="284.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="309.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Ideogram 4</text>
+<text x="0.0" y="328.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">fp8 · 20 steps · 1024²</text>
+<text x="268.0" y="309.5" fill="#f85149" font-size="12" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">✕  fails on stock ComfyUI</text>
+<rect x="268" y="316" width="432.0" height="14" rx="3" fill="#3987e5"/>
+<text x="708.0" y="327.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">141.8 s</text>
+<text x="876.0" y="320.0" fill="#e6edf3" font-size="13" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">only with node</text>
+<line x1="0" x2="880" y1="344.0" y2="344.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="369.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Ideogram 4</text>
+<text x="0.0" y="388.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">int8 · 20 steps · 1024²</text>
+<text x="268.0" y="369.5" fill="#f85149" font-size="12" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">✕  fails on stock ComfyUI</text>
+<rect x="268" y="376" width="432.0" height="14" rx="3" fill="#3987e5"/>
+<text x="708.0" y="387.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">156.7 s</text>
+<text x="876.0" y="380.0" fill="#e6edf3" font-size="13" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">only with node</text>
+<line x1="0" x2="880" y1="404.0" y2="404.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="429.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">Qwen-Image 2512</text>
+<text x="0.0" y="448.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">fp8 + Lightning LoRA · 4 steps · 1328²</text>
+<rect x="268" y="418" width="432.0" height="14" rx="3" fill="#d95926"/>
+<text x="708.0" y="429.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">19.9 s</text>
+<rect x="268" y="436" width="400.4" height="14" rx="3" fill="#3987e5"/>
+<text x="676.4" y="447.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">18.4 s</text>
+<text x="876.0" y="440.0" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.08×</text>
+<line x1="0" x2="880" y1="464.0" y2="464.0" stroke="#3d444d" stroke-width="1"/>
+<text x="0.0" y="489.0" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">FLUX.2 Klein 9B</text>
+<text x="0.0" y="508.0" fill="#9198a1" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">bf16 · 4 steps · 1024²</text>
+<rect x="268" y="478" width="432.0" height="14" rx="3" fill="#d95926"/>
+<text x="708.0" y="489.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">9.4 s</text>
+<rect x="268" y="496" width="404.9" height="14" rx="3" fill="#3987e5"/>
+<text x="680.9" y="507.5" fill="#e6edf3" font-size="12" font-weight="400" text-anchor="start" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">8.8 s</text>
+<text x="876.0" y="500.0" fill="#e6edf3" font-size="15" font-weight="700" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">1.06×</text>
+<line x1="0" x2="880" y1="524.0" y2="524.0" stroke="#3d444d" stroke-width="1"/>
+</svg>

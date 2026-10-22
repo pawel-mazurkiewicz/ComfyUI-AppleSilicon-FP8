@@ -11,7 +11,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {}
 if __spec__ is not None and __spec__.parent:
     # __spec__.parent is "" when imported directly (pytest --import-mode=importlib),
     # where the relative imports below would fail.
-    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, fp8_mps_strided, rope_fast_mps, probe_runtime, optrace, mps_profile, fused_norm_mps
+    from ._patches import comfykitchen_fp8, linear_fp8, ops_bias_fp8, psutil_vmstat, rmsnorm_mps_large, scaled_mm_fp8, flash_attn_mtl, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, fp8_mps_strided, rope_fast_mps, probe_runtime, optrace, mps_profile, fused_norm_mps, wan_vae_norm_mps, na3d_mps
 
     # optional patch: not present in every checkout
     try:
@@ -32,7 +32,7 @@ if __spec__ is not None and __spec__.parent:
         print(f"[AppleSilicon-FP8] capability probe failed: {_e}", flush=True)
 
     # optrace installs last so it sees the seams every other patch wrapped
-    for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, fused_norm_mps, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, int4_linear_mps, fp8_linear_kernel_mps, conv_im2col_mps, mlx_textgen, rope_fast_mps, probe_runtime, optrace, mps_profile):
+    for _patch in (psutil_vmstat, fp8_mps_strided, comfykitchen_fp8, scaled_mm_fp8, ops_bias_fp8, stochastic_round_fp8, tensor_to_fp8, wan_blockswap_mps, rmsnorm_mps_large, fused_norm_mps, flash_attn_mtl, linear_fp8, te_device_mps, int_mm_mps, int8_linear_mps, int8_linear_kernel_mps, int4_linear_mps, fp8_linear_kernel_mps, conv_im2col_mps, wan_vae_norm_mps, na3d_mps, mlx_textgen, rope_fast_mps, probe_runtime, optrace, mps_profile):
         if _patch is None:   # optional patch absent from this checkout
             continue
         _short = _patch.__name__.rsplit(".", 1)[-1]
