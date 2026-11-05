@@ -322,6 +322,108 @@ def test_int8_linear_fused_activation_matches_reference(M, convrot, bias, act):
         f"M={M} convrot={convrot} bias={bias} {act}: max|d|={d.max().item():.4g}"
 
 
+class _CountingKernel:
+    """Forwards to the real extension, counting i8_matmul2d_nt_fused_cs calls."""
+
+    def __init__(self, mod):
+        self._mod = mod
+        self.cs_calls = 0
+
+    def __getattr__(self, name):
+        attr = getattr(self._mod, name)
+        if name != "i8_matmul2d_nt_fused_cs":
+            return attr
+
+        def counted(*a, **k):
+            self.cs_calls += 1
+            return attr(*a, **k)
+        return counted
+
+
+def _channelwise_setup(monkeypatch):
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # original _int_mm -> CPU
+    from _patches.int8_ext import loader
+    from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
+    mod = loader.module()
+    assert mod is not None, "int8 kernel failed to build"
+    mod.warmup()
+    spy = _CountingKernel(mod)
+    monkeypatch.setattr(patch, "_kernel", spy)
+    monkeypatch.setattr(patch, "_orig_int8_linear", orig_int8_linear)
+    return mod, spy, orig_int8_linear
+
+
+@requires_int8_ext
+def test_kernel_channelwise_matches_original_bit_exact(monkeypatch):
+    """Per-output-channel weight scales ([N] and [N,1]) through the fused epilogue are
+    bit-identical to comfy_kitchen and to the chunked int32 path."""
+    mod, spy, orig_int8_linear = _channelwise_setup(monkeypatch)
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(7)
+
+    def unfused_cs(x, w, ws, b, convrot):
+        if convrot:
+            h = _build_hadamard(256, device=x.device, dtype=x.dtype)
+            x = _rotate_activation(x, h, 256)
+        shp = x.shape
+        x8, xs = quantize_int8_rowwise(x.reshape(-1, x.shape[-1]))
+        C = mod.i8_matmul2d_nt(x8.contiguous(), w.contiguous()).float()
+        out = (C * (xs * ws.view(1, -1))).to(torch.bfloat16)
+        if b is not None:
+            out = out + b.to(out.dtype)
+        return out.reshape(*shp[:-1], w.shape[0])
+
+    def run(M, K, N, convrot, bias, ws_col=False, bias_dtype=torch.bfloat16):
+        x = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+        w = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+        ws = (torch.rand(N, generator=g) * 0.01 + 0.001).to(dev)
+        if ws_col:
+            ws = ws.view(N, 1)
+        b = torch.randn(N, generator=g, dtype=bias_dtype).to(dev) if bias else None
+        calls = spy.cs_calls
+        ref = orig_int8_linear(x, w, ws, b, torch.bfloat16, convrot, 256)
+        out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, convrot, 256)
+        tag = f"M={M} K={K} N={N} convrot={convrot} bias={bias} ws_col={ws_col}"
+        assert spy.cs_calls == calls + 1, f"fused_cs not called ({spy.cs_calls} calls) {tag}"
+        assert torch.equal(ref, out), f"fused_cs mismatch {tag}"
+        assert torch.equal(out, unfused_cs(x, w, ws, b, convrot)), f"fused_cs!=unfused {tag}"
+
+    for ws_col in (False, True):
+        run(256, 2560, 1024, convrot=False, bias=False, ws_col=ws_col)
+        run(256, 2560, 1024, convrot=False, bias=True, ws_col=ws_col)
+        run(512, 6144, 6144, convrot=True, bias=False, ws_col=ws_col)
+    run(64, 2560, 1024, convrot=False, bias=True, bias_dtype=torch.float32)
+
+
+@requires_int8_ext
+@pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("M", [1, 300])
+def test_int8_linear_channelwise_activation_matches_reference(monkeypatch, M, bias, act):
+    """Per-channel fused activation == torch activation of the stock int8_linear."""
+    _, spy, orig_int8_linear = _channelwise_setup(monkeypatch)
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(11)
+    K, N = 2560, 1024
+    x = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+    w = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+    ws = (torch.rand(N, generator=g) * 0.01 + 0.001).to(dev)
+    b = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+
+    ref = patch._apply_act(orig_int8_linear(x, w, ws, b, torch.bfloat16, False, 256), act)
+    out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, False, 256, act=act)
+    torch.mps.synchronize()
+    assert spy.cs_calls == 1, "per-channel activation did not run the fused_cs kernel"
+    assert out.shape == ref.shape
+    d = (out.float() - ref.float()).abs()
+    assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
+        f"M={M} bias={bias} {act}: max|d|={d.max().item():.4g}"
+
+
 def test_wrapper_fallback_applies_activation(monkeypatch):
     """The no-kernel fallback still applies the requested activation."""
     monkeypatch.setattr(patch, "_kernel", None)  # force the early fallback branch

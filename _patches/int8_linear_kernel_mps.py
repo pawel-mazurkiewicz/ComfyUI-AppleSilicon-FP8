@@ -169,6 +169,23 @@ def _int8_linear_kernel(
         )
         return result.reshape(*orig_shape[:-1], weight.shape[0])
 
+    N = weight.shape[0]
+    if (
+        out_dtype == torch.bfloat16
+        and weight_scale.numel() == N
+        and hasattr(_kernel, "i8_matmul2d_nt_fused_cs")
+    ):
+        bias_arg = bias.to(torch.bfloat16) if bias is not None else None
+        result = _kernel.i8_matmul2d_nt_fused_cs(
+            x_8.contiguous(),
+            weight.contiguous(),
+            x_scale.reshape(-1).float().contiguous(),
+            weight_scale.float().contiguous(),
+            bias_arg,
+            code,
+        )
+        return result.reshape(*orig_shape[:-1], N)
+
     # C[M,N] int32 = x_8[M,K] @ weight[N,K]^T  (NT: weight in stored layout)
     result = _kernel.i8_matmul2d_nt(x_8.contiguous(), weight.contiguous())
 
