@@ -405,6 +405,61 @@ def test_kernel_channelwise_matches_original_bit_exact(monkeypatch):
 
 
 @requires_int8_ext
+def test_int8_linear_bit_exact_with_native_quant(monkeypatch):
+    """Both kernel entry points quantize with int8_quant_mps and stay bit-identical:
+    linear vs comfy_kitchen int8_linear, SwiGLU vs itself with the kitchen quant."""
+    from _patches import int8_quant_mps as qmod
+    _caps._kernel_ready.pop(qmod.NAME, None)
+    monkeypatch.delenv("ASFP8_INT8_NATIVE_QUANT", raising=False)
+    _, _, orig_int8_linear = _channelwise_setup(monkeypatch)
+    assert qmod.verify()
+    native, real_native = [], qmod._native
+    monkeypatch.setattr(qmod, "_native", lambda x2d: native.append(1) or real_native(x2d))
+
+    dev = "mps"
+    g = torch.Generator().manual_seed(7)
+
+    def scales(n, per_channel):
+        return (torch.rand(n if per_channel else 1, generator=g) * 0.01 + 0.001).to(dev)
+
+    def run(M, K, N, convrot, bias, per_channel, three_d=False):
+        shape = (2, M, K) if three_d else (M, K)
+        x = (torch.randn(shape, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+        w = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+        ws = scales(N, per_channel)
+        b = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+        n0 = len(native)
+        ref = orig_int8_linear(x, w, ws, b, torch.bfloat16, convrot, 256)
+        out = patch._int8_linear_kernel(x, w, ws, b, torch.bfloat16, convrot, 256)
+        tag = f"M={M} K={K} N={N} convrot={convrot} bias={bias} per_channel={per_channel}"
+        assert len(native) == n0 + 1, f"native quant did not run {tag}"
+        assert torch.equal(ref, out), f"mismatch {tag}"
+
+    for pc in (False, True):
+        run(256, 2560, 1024, convrot=False, bias=False, per_channel=pc)
+        run(256, 2560, 1024, convrot=False, bias=True, per_channel=pc)
+        run(512, 6144, 6144, convrot=True, bias=False, per_channel=pc)
+        run(512, 6144, 6144, convrot=True, bias=True, per_channel=pc)
+        run(188, 4096, 2560, convrot=True, bias=True, per_channel=pc, three_d=True)
+        run(1, 6144, 6144, convrot=True, bias=False, per_channel=pc)
+
+    for pc, convrot, K in ((False, False, 2576), (True, True, 2560)):
+        M, N = 300, 1024
+        x = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
+        wg = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+        wu = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
+        sg, su = scales(N, pc), scales(N, pc)
+        n0 = len(native)
+        out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, convrot, 256)
+        assert len(native) == n0 + 1, f"SwiGLU did not use the native quant per_channel={pc}"
+        monkeypatch.setenv("ASFP8_INT8_NATIVE_QUANT", "off")
+        ref = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, convrot, 256)
+        monkeypatch.delenv("ASFP8_INT8_NATIVE_QUANT")
+        assert len(native) == n0 + 1
+        assert torch.equal(out, ref), f"SwiGLU mismatch per_channel={pc}"
+
+
+@requires_int8_ext
 @pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("M", [1, 300])

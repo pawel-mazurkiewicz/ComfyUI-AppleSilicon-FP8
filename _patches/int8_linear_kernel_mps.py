@@ -9,6 +9,7 @@ import sys
 
 import torch
 
+from . import int8_quant_mps
 from ._common import full_precision_requested
 
 TAG = "[AppleSilicon-FP8/int8_kernel]"
@@ -141,7 +142,6 @@ def _int8_linear_kernel(
             act,
         )
 
-    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
     from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
 
     if convrot:
@@ -151,7 +151,7 @@ def _int8_linear_kernel(
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
-    x_8, x_scale = quantize_int8_rowwise(x_2d)
+    x_8, x_scale = int8_quant_mps.quantize_rowwise(x_2d)
     weight_scale = weight_scale.view(-1)
 
     # fused fast path: fold float(C)*row_scale[m] (+bias) into the kernel's store
@@ -238,14 +238,13 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                                 convrot, convrot_groupsize, act="none")
         return g * u
 
-    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
     from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
     if convrot:
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
     shp = x.shape
     x2 = x.reshape(-1, x.shape[-1])
-    x8, xs = quantize_int8_rowwise(x2)
+    x8, xs = int8_quant_mps.quantize_rowwise(x2)
     xs = xs.reshape(-1).float()
     bg = bias_gate.to(torch.bfloat16) if bias_gate is not None else None
     bu = bias_up.to(torch.bfloat16) if bias_up is not None else None
