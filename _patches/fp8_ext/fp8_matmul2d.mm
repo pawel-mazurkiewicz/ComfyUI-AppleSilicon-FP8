@@ -283,7 +283,6 @@ torch::Tensor fp8fp8_matmul2d_nt(torch::Tensor a_u8, torch::Tensor w_u8, int64_t
                 threadsPerThreadgroup:MTLSizeMake(NSG * 32, 1, 1)];
         }
     });
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
     return C;
 }
 
@@ -323,7 +322,6 @@ torch::Tensor fp8_matmul2d(torch::Tensor a, torch::Tensor w_u8, int64_t N) {
                 threadsPerThreadgroup:MTLSizeMake(NSG * 32, 1, 1)];
         }
     });
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
     return C;
 }
 
@@ -363,7 +361,6 @@ torch::Tensor fp8_matmul2d_nt(torch::Tensor a, torch::Tensor w_u8, int64_t N) {
                 threadsPerThreadgroup:MTLSizeMake(NSG * 32, 1, 1)];
         }
     });
-    stream->synchronize(SyncType::COMMIT_AND_WAIT);
     return C;
 }
 
