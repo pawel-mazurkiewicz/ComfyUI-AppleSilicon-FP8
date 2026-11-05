@@ -104,6 +104,27 @@ def test_cache_holds_no_strong_ref(monkeypatch):
 
 
 @requires_mps
+def test_cache_released_when_input_dies():
+    x = _x()
+    patch._rotate_quant(x, False, 256)
+    assert patch._ACT_CACHE is not None
+    del x
+    gc.collect()
+    assert patch._ACT_CACHE is None
+
+
+@requires_mps
+def test_older_tensor_dying_keeps_newer_entry():
+    a, b = _x(), _x()
+    patch._rotate_quant(a, False, 256)
+    patch._rotate_quant(b, False, 256)
+    entry = patch._ACT_CACHE
+    del a
+    gc.collect()
+    assert patch._ACT_CACHE is entry and entry[0][0]() is b
+
+
+@requires_mps
 def test_inference_tensor_hits_by_identity(monkeypatch):
     calls = _spy(monkeypatch)
     with torch.inference_mode():

@@ -112,9 +112,16 @@ def _verify():
     return _ensure_kernel() is not None and _self_check()
 
 
+def _drop_act_cache(ref):
+    # identity: a newer entry keyed on another tensor must survive this one dying
+    global _ACT_CACHE
+    if _ACT_CACHE is not None and _ACT_CACHE[0][0] is ref:
+        _ACT_CACHE = None
+
+
 def _act_key(x, convrot, gs):
     # identity, not _version: inference tensors have none
-    return (weakref.ref(x), x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype,
+    return (weakref.ref(x, _drop_act_cache), x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype,
             convrot, gs, None if x.is_inference() else x._version)
 
 
