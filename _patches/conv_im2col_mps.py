@@ -550,7 +550,7 @@ def _folded_conv3d(x, weight, bias, stride, padding, dilation, groups):
     # contiguous: MPS conv2d gives garbage for a strided-view weight
     wf = weight.reshape(Co, C * kT, kH, kW).contiguous()
     n_chunk = _fold_chunk_frames(N, C, kT, x.shape[3], x.shape[4], x.element_size(), _fold_budget_bytes())
-    chunks = []
+    out = None
     for o0 in range(0, T_out, n_chunk):
         o = torch.arange(o0, min(o0 + n_chunk, T_out), device=x.device)
         idx = o[:, None] * s[0] + torch.arange(kT, device=x.device)[None, :] * d[0]   # [n, kT]
@@ -559,8 +559,10 @@ def _folded_conv3d(x, weight, bias, stride, padding, dilation, groups):
         # permute keeps the folded channel index c*kT + t, the same order wf uses
         g = g.permute(0, 2, 1, 3, 4, 5).reshape(N * n, C * kT, x.shape[3], x.shape[4])
         y = _stock_conv2d(g, wf, bias, s[1:], p[1:], d[1:], 1)                           # [N*n,Co,Ho,Wo]
-        chunks.append(y.reshape(N, n, Co, y.shape[2], y.shape[3]).permute(0, 2, 1, 3, 4))
-    return torch.cat(chunks, dim=2).contiguous()
+        if out is None:
+            out = x.new_empty((N, Co, T_out, y.shape[2], y.shape[3]))
+        out[:, :, o0:o0 + n].copy_(y.reshape(N, n, Co, y.shape[2], y.shape[3]).permute(0, 2, 1, 3, 4))
+    return out
 
 
 def install():

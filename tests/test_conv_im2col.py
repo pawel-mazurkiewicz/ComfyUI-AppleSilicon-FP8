@@ -945,6 +945,36 @@ def test_fold_chunked_equals_unchunked(monkeypatch):
 
 
 @requires_mps
+@pytest.mark.parametrize("T,kT,stride,padding,dilation", _FOLD_CASES[:3])
+def test_fold_preallocated_output_matches(monkeypatch, T, kT, stride, padding, dilation):
+    """Chunks land in one preallocated output: equal to a per-chunk torch.cat, no cat, contiguous."""
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(torch.bfloat16, T, kT)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "0.01")      # one output frame per chunk
+    ys = []
+    real = cm._stock_conv2d
+
+    def spy(*a, **k):
+        ys.append(real(*a, **k))
+        return ys[-1]
+    monkeypatch.setattr(cm, "_stock_conv2d", spy)
+    real_cat = torch.cat
+
+    def no_cat(*a, **k):
+        raise AssertionError("fold must not concatenate chunks")
+    monkeypatch.setattr(torch, "cat", no_cat)
+    out = cm._folded_conv3d(xm, wm, bm, stride, padding, dilation, 1)
+    monkeypatch.setattr(torch, "cat", real_cat)
+    torch.mps.synchronize()
+    N, Co = x.shape[0], w.shape[0]
+    assert len(ys) > 1
+    ref = real_cat([y.reshape(N, y.shape[0] // N, Co, *y.shape[2:]).permute(0, 2, 1, 3, 4) for y in ys], dim=2)
+    assert out.is_contiguous() and out.shape == ref.shape
+    assert torch.equal(out, ref.contiguous())
+
+
+@requires_mps
 @pytest.mark.parametrize("val", ["off", "0", "false", "none", "no"])
 def test_fold_off_switch(monkeypatch, val):
     """ASFP8_CONV_FOLD is read per call, so a wrapper built while on still honours a later off."""
