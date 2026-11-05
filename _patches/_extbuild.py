@@ -20,14 +20,18 @@ BUILD_TIMEOUT_DEFAULT = 600.0
 BUILD_ROOT_DEFAULT = "/tmp/asfp8_build"
 
 _prereq_warned = False
+_root_warned = False
 
 
 def build_root() -> str:
     """Root for every JIT build (ASFP8_BUILD_ROOT); the default is space-free."""
     root = os.environ.get("ASFP8_BUILD_ROOT") or BUILD_ROOT_DEFAULT
     if " " in root:
-        print(f"[asfp8] ASFP8_BUILD_ROOT={root!r} contains a space; the linker needs a "
-              f"space-free path, building under {BUILD_ROOT_DEFAULT} instead.", flush=True)
+        global _root_warned
+        if not _root_warned:
+            _root_warned = True
+            print(f"[asfp8] ASFP8_BUILD_ROOT={root!r} contains a space; the linker needs a "
+                  f"space-free path, building under {BUILD_ROOT_DEFAULT} instead.", flush=True)
         return BUILD_ROOT_DEFAULT
     return root
 

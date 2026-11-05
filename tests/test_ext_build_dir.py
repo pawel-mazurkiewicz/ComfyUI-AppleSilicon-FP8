@@ -49,9 +49,18 @@ def test_build_root_env_override(monkeypatch):
 
 
 def test_build_root_rejects_spaces(monkeypatch, capsys):
+    monkeypatch.setattr(_extbuild, "_root_warned", False, raising=False)
     monkeypatch.setenv("ASFP8_BUILD_ROOT", "/tmp/a b")
     assert _extbuild.build_root() == "/tmp/asfp8_build"
     assert "space" in capsys.readouterr().out
+
+
+def test_build_root_space_warning_once(monkeypatch, capsys):
+    monkeypatch.setattr(_extbuild, "_root_warned", False, raising=False)
+    monkeypatch.setenv("ASFP8_BUILD_ROOT", "/tmp/a b")
+    assert _extbuild.build_root() == "/tmp/asfp8_build"
+    assert _extbuild.build_root() == "/tmp/asfp8_build"
+    assert capsys.readouterr().out.count("contains a space") == 1
 
 
 def test_warn_missing_prereqs_once(monkeypatch, capsys):
