@@ -323,19 +323,25 @@ def test_int8_linear_fused_activation_matches_reference(M, convrot, bias, act):
 
 
 class _CountingKernel:
-    """Forwards to the real extension, counting i8_matmul2d_nt_fused_cs calls."""
+    """Forwards to the real extension, counting per-channel and plain-matmul calls."""
+
+    _COUNTED = ("i8_matmul2d_nt_fused_cs", "i8_matmul2d_nt_swiglu_cs", "i8_matmul2d_nt")
 
     def __init__(self, mod):
         self._mod = mod
-        self.cs_calls = 0
+        self.counts = dict.fromkeys(self._COUNTED, 0)
+
+    @property
+    def cs_calls(self):
+        return self.counts["i8_matmul2d_nt_fused_cs"]
 
     def __getattr__(self, name):
         attr = getattr(self._mod, name)
-        if name != "i8_matmul2d_nt_fused_cs":
+        if name not in self._COUNTED:
             return attr
 
         def counted(*a, **k):
-            self.cs_calls += 1
+            self.counts[name] += 1
             return attr(*a, **k)
         return counted
 
@@ -524,34 +530,42 @@ def test_int8_swiglu_matches_reference(M, K, convrot, bias, act):
 
 
 @requires_int8_ext
-def test_int8_swiglu_nonscalar_scale_falls_back_correctly():
-    """Length-N weight scales route through the per-branch path, not the fused gate."""
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    from _patches.int8_ext import loader
-    from comfy_kitchen.backends.eager.quantization import int8_linear as orig_int8_linear
-    mod = loader.module()
-    assert mod is not None
-    mod.warmup()
-    patch._kernel = mod
-    patch._orig_int8_linear = orig_int8_linear
+@pytest.mark.parametrize("act", ["silu", "gelu_tanh"])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("ws_col", [False, True])
+@pytest.mark.parametrize("M", [1, 300])
+def test_int8_swiglu_channelwise_fused(monkeypatch, M, ws_col, bias, act):
+    """Per-channel gate/up scales ([N] and [N,1]) run the single fused gate kernel and
+    match act(stock gate) * stock up."""
+    mod, spy, orig_int8_linear = _channelwise_setup(monkeypatch)
 
     dev = "mps"
     g = torch.Generator().manual_seed(7)
-    M, K, N = 64, 2560, 1024
+    K, N = 2560, 1024
     x  = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to(dev)
     wg = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
     wu = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to(dev)
-    sg = (torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)  # per-channel
+    sg = (torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
     su = (torch.rand(N, generator=g, dtype=torch.float32) * 0.01 + 0.001).to(dev)
+    if ws_col:
+        sg, su = sg.view(N, 1), su.view(N, 1)
+    bg = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
+    bu = torch.randn(N, generator=g, dtype=torch.bfloat16).to(dev) if bias else None
 
-    lin_g = patch._int8_linear_kernel(x, wg, sg, None, torch.bfloat16, False, 256, act="none")
-    lin_u = patch._int8_linear_kernel(x, wu, su, None, torch.bfloat16, False, 256, act="none")
-    ref = torch.nn.functional.silu(lin_g) * lin_u
-    out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, False, 256, act="silu")
+    lin_g = orig_int8_linear(x, wg, sg, bg, torch.bfloat16, False, 256).float()
+    lin_u = orig_int8_linear(x, wu, su, bu, torch.bfloat16, False, 256).float()
+    gate = torch.nn.functional.silu(lin_g) if act == "silu" \
+        else torch.nn.functional.gelu(lin_g, approximate="tanh")
+    ref = (gate * lin_u).to(torch.bfloat16)
+
+    spy.counts = dict.fromkeys(spy.counts, 0)
+    out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, bg, bu, False, 256, act=act)
     torch.mps.synchronize()
+    assert spy.counts["i8_matmul2d_nt_swiglu_cs"] == 1, "fused swiglu_cs kernel did not run"
+    assert spy.counts["i8_matmul2d_nt"] == 0, "per-branch int32 matmul ran"
     assert out.shape == ref.shape
     assert torch.allclose(out, ref, atol=2e-3, rtol=8e-3), \
-        f"nonscalar: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
+        f"M={M} ws_col={ws_col} bias={bias} {act}: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
 
 
 @requires_mps

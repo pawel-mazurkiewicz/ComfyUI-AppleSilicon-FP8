@@ -211,8 +211,9 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                         convrot=False, convrot_groupsize=256, act="silu"):
     """Fused gated linear: H = act(x@w_gate^T + bias_gate) * (x@w_up^T + bias_up).
 
-    The single-pass kernel needs scalar weight scales; per-channel scales route through
-    _int8_linear_kernel per branch. act in {"silu","gelu_tanh"}, never "none".
+    The single-pass kernel takes scalar or per-output-channel (length N) weight scales;
+    other layouts route through _int8_linear_kernel per branch. act in
+    {"silu","gelu_tanh"}, never "none".
     """
     if act == "none":
         raise ValueError("_int8_swiglu_kernel requires a real gate activation, not 'none'")
@@ -222,10 +223,15 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
             f"gate/up weights must match: {tuple(w_gate.shape)} vs {tuple(w_up.shape)}"
         )
 
+    n_out = w_gate.shape[0]
     scalar_scales = (ws_gate.numel() == 1 and ws_up.numel() == 1)
+    channel_scales = (not scalar_scales and ws_gate.numel() == n_out
+                      and ws_up.numel() == n_out)
     fused_ok = (_kernel is not None and x.device.type == "mps" and w_gate.dtype == torch.int8
-                and w_up.dtype == torch.int8 and scalar_scales
-                and hasattr(_kernel, "i8_matmul2d_nt_swiglu"))
+                and w_up.dtype == torch.int8
+                and hasattr(_kernel, "i8_matmul2d_nt_swiglu" if scalar_scales
+                            else "i8_matmul2d_nt_swiglu_cs")
+                and (scalar_scales or channel_scales))
     if not fused_ok:
         g = _int8_linear_kernel(x, w_gate, ws_gate, bias_gate, torch.bfloat16,
                                 convrot, convrot_groupsize, act=act)  # activation applied here
@@ -242,12 +248,17 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
     x2 = x.reshape(-1, x.shape[-1])
     x8, xs = quantize_int8_rowwise(x2)
     xs = xs.reshape(-1).float()
-    rsg = (ws_gate.view(-1).float() * xs).contiguous()  # scalar * [M] -> [M] (valid: scalar_scales)
-    rsu = (ws_up.view(-1).float() * xs).contiguous()
     bg = bias_gate.to(torch.bfloat16) if bias_gate is not None else None
     bu = bias_up.to(torch.bfloat16) if bias_up is not None else None
-    out = _kernel.i8_matmul2d_nt_swiglu(x8.contiguous(), w_gate.contiguous(),
-            w_up.contiguous(), rsg, rsu, bg, bu, _act_code(act))
+    if scalar_scales:
+        rsg = (ws_gate.view(-1).float() * xs).contiguous()  # scalar * [M] -> [M]
+        rsu = (ws_up.view(-1).float() * xs).contiguous()
+        out = _kernel.i8_matmul2d_nt_swiglu(x8.contiguous(), w_gate.contiguous(),
+                w_up.contiguous(), rsg, rsu, bg, bu, _act_code(act))
+    else:
+        out = _kernel.i8_matmul2d_nt_swiglu_cs(x8.contiguous(), w_gate.contiguous(),
+                w_up.contiguous(), xs.contiguous(), ws_gate.view(-1).float().contiguous(),
+                ws_up.view(-1).float().contiguous(), bg, bu, _act_code(act))
     return out.reshape(*shp[:-1], w_gate.shape[0])
 
 
