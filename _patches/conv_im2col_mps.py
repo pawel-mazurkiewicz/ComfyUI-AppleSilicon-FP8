@@ -6,6 +6,8 @@ is not (stock conv2d is already at roofline). ASFP8_CONV_IM2COL=off kills it, =2
 =2d,3d opts conv2d in. Any compile/kernel/shape failure falls back to stock conv.
 Separately, one-frame conv3d (T == kT, e.g. Wan VAE causal_zero) runs as conv2d on any MPS
 machine, no matmul2d needed; ASFP8_CONV_SINGLE_FRAME=off disables just that.
+Multi-frame conv3d folds its kT temporal taps into the input channels of one conv2d, chunked
+over output frames under ASFP8_CONV_FOLD_MB; ASFP8_CONV_FOLD=off disables just that.
 """
 import os
 
@@ -476,7 +478,7 @@ def _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups):
     return _stock_conv2d(x.reshape(N, C * T, H, W), wf, bias, s[1:], p[1:], d[1:], groups).unsqueeze(2)
 
 
-def _make_wrap(orig, rank, im2col=True, single_frame=False):
+def _make_wrap(orig, rank, im2col=True, single_frame=False, fold=False):
     """Module-level so fallback tests can build the wrapper closure without MPS/install()."""
     def conv(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
         try:
@@ -484,6 +486,9 @@ def _make_wrap(orig, rank, im2col=True, single_frame=False):
                 return _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups)
             if im2col and weight.dim() - 2 == rank and _supported(x, weight, dilation, groups, x.dtype):
                 return conv_im2col(x, weight, bias, stride, padding, dilation, groups)
+            if (fold and rank == 3 and _fold_wanted()
+                    and _fold_ok(x, weight, stride, padding, dilation, groups)):
+                return _folded_conv3d(x, weight, bias, stride, padding, dilation, groups)
         except Exception as e:
             print(f"{TAG} conv{rank}d fell back ({e!r})")
         return orig(x, weight, bias, stride, padding, dilation, groups)
@@ -491,6 +496,7 @@ def _make_wrap(orig, rank, im2col=True, single_frame=False):
 
 
 _sf_installed = False
+_fold_installed = False
 
 
 def _single_frame_wanted():
@@ -500,16 +506,75 @@ def _single_frame_wanted():
     return os.environ.get("ASFP8_CONV_SINGLE_FRAME", "1").strip().lower() not in _CONV_OFF
 
 
+def _fold_wanted():
+    # read per call, so the switch works on an already-installed wrapper
+    if _mode() in _CONV_OFF:
+        return False
+    return os.environ.get("ASFP8_CONV_FOLD", "1").strip().lower() not in _CONV_OFF
+
+
+def _fold_ok(x, weight, stride, padding, dilation, groups):
+    """True iff conv3d can run as conv2d with its kT temporal taps folded into channels."""
+    if (isinstance(padding, str) or x.device.type != "mps" or weight.device.type != "mps"
+            or x.dtype not in _SF_DTYPES or weight.dtype != x.dtype or groups != 1
+            or x.dim() != 5 or weight.dim() != 5 or x.numel() == 0 or weight.numel() == 0
+            or x.shape[1] != weight.shape[1]):
+        return False
+    s, p, d = _triple(stride), _triple(padding), _triple(dilation)
+    return len(s) == len(p) == len(d) == 3
+
+
+def _fold_chunk_frames(N, C, kT, H, W, elem_bytes, budget_bytes):
+    """Output frames per chunk so the gathered input stays inside the budget (N counts)."""
+    return max(1, int(budget_bytes // (N * C * kT * H * W * elem_bytes)))
+
+
+def _fold_budget_bytes():
+    # per call, never raising: an unparsable budget falls back to the default
+    try:
+        return float(os.environ.get("ASFP8_CONV_FOLD_MB", "512")) * 1024 * 1024
+    except (TypeError, ValueError):
+        return 512 * 1024 * 1024
+
+
+def _folded_conv3d(x, weight, bias, stride, padding, dilation, groups):
+    """Multi-frame conv3d as one conv2d over kT taps folded into channels, chunked over T_out."""
+    # re-asserted for direct callers; folded not summed, so one accumulate and one rounding
+    assert groups == 1 and weight.dim() == 5
+    s, p, d = _triple(stride), _triple(padding), _triple(dilation)
+    N, C, T, H, W = x.shape
+    Co, _, kT, kH, kW = weight.shape
+    if p[0]:
+        x = F.pad(x, (0, 0, 0, 0, p[0], p[0]))
+    T_out = (x.shape[2] - d[0] * (kT - 1) - 1) // s[0] + 1
+    # contiguous: MPS conv2d gives garbage for a strided-view weight
+    wf = weight.reshape(Co, C * kT, kH, kW).contiguous()
+    n_chunk = _fold_chunk_frames(N, C, kT, x.shape[3], x.shape[4], x.element_size(), _fold_budget_bytes())
+    chunks = []
+    for o0 in range(0, T_out, n_chunk):
+        o = torch.arange(o0, min(o0 + n_chunk, T_out), device=x.device)
+        idx = o[:, None] * s[0] + torch.arange(kT, device=x.device)[None, :] * d[0]   # [n, kT]
+        g = x[:, :, idx]                                                                  # [N,C,n,kT,H,W]
+        n = idx.shape[0]
+        # permute keeps the folded channel index c*kT + t, the same order wf uses
+        g = g.permute(0, 2, 1, 3, 4, 5).reshape(N * n, C * kT, x.shape[3], x.shape[4])
+        y = _stock_conv2d(g, wf, bias, s[1:], p[1:], d[1:], 1)                           # [N*n,Co,Ho,Wo]
+        chunks.append(y.reshape(N, n, Co, y.shape[2], y.shape[3]).permute(0, 2, 1, 3, 4))
+    return torch.cat(chunks, dim=2).contiguous()
+
+
 def install():
-    global _orig_conv2d, _orig_conv3d, _sf_installed
+    global _orig_conv2d, _orig_conv3d, _sf_installed, _fold_installed
     import sys
     if sys.platform != "darwin":
         return
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         return
-    want = _wanted_ranks() if _gate() else set()   # im2col needs matmul2d; single-frame does not
+    # im2col needs matmul2d; single-frame and the tap-fold do not
+    want = _wanted_ranks() if _gate() else set()
     sf = _single_frame_wanted()
-    if not want and not sf:
+    fold = _fold_wanted()
+    if not want and not sf and not fold:
         return
     if _orig_conv2d is None:
         _orig_conv2d, _orig_conv3d = F.conv2d, F.conv3d   # capture true originals once
@@ -523,10 +588,16 @@ def install():
     if sf and not _sf_installed:
         _sf_installed = True
         rewrap3 = True
+    if fold and not _fold_installed:
+        _fold_installed = True
+        rewrap3 = True
     if rewrap3:
-        F.conv3d = _make_wrap(_orig_conv3d, 3, im2col=3 in _installed_ranks, single_frame=_sf_installed)
+        F.conv3d = _make_wrap(_orig_conv3d, 3, im2col=3 in _installed_ranks,
+                              single_frame=_sf_installed, fold=_fold_installed)
     if _installed_ranks:
         print(f"{TAG} conv im2col+matmul2d active on MPS (ranks={sorted(_installed_ranks)}, "
               f"tile={_TILE_BYTES // 1024**2}MB).")
     if _sf_installed:
         print(f"{TAG} single-frame conv3d -> conv2d active on MPS.")
+    if _fold_installed:
+        print(f"{TAG} multi-frame conv3d tap-fold active on MPS.")
