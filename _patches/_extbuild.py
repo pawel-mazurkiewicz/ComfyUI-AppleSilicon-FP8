@@ -6,12 +6,71 @@ process stalls every later build.
 """
 
 import atexit
+import hashlib
 import os
+import shutil
+import sys
 import threading
 import time
 
 # seconds for one cold build (ASFP8_EXT_BUILD_TIMEOUT; <=0 disables the watchdog)
 BUILD_TIMEOUT_DEFAULT = 600.0
+
+# space-free build root; the repo itself lives under a path with spaces
+BUILD_ROOT_DEFAULT = "/tmp/asfp8_build"
+
+_prereq_warned = False
+
+
+def build_root() -> str:
+    """Root for every JIT build (ASFP8_BUILD_ROOT); the default is space-free."""
+    root = os.environ.get("ASFP8_BUILD_ROOT") or BUILD_ROOT_DEFAULT
+    if " " in root:
+        print(f"[asfp8] ASFP8_BUILD_ROOT={root!r} contains a space; the linker needs a "
+              f"space-free path, building under {BUILD_ROOT_DEFAULT} instead.", flush=True)
+        return BUILD_ROOT_DEFAULT
+    return root
+
+
+def build_dir_for(ext: str) -> str:
+    """Build dir for one extension, tagged by the torch build it was compiled against.
+
+    torch rebuilds on source or flag changes but not on a torch upgrade, so the tag is
+    what keeps a .so built against the old torch from being loaded by the new one. Read
+    the versions at call time so they stay patchable.
+    """
+    import torch
+
+    tag = hashlib.sha1(
+        f"{torch.__version__}|{torch.version.git_version}|{sys.version}".encode()
+    ).hexdigest()[:10]
+    return os.path.join(build_root(), f"{ext}-{tag}")
+
+
+def warn_missing_prereqs(tag: str) -> bool:
+    """False when a build prerequisite is missing, naming each one once per process."""
+    global _prereq_warned
+
+    import torch
+
+    missing = []
+    if shutil.which("ninja") is None:
+        missing.append(f'ninja not found on PATH: "{sys.executable}" -m pip install ninja')
+    header = os.path.join(os.path.dirname(torch.__file__), "include", "torch", "extension.h")
+    if not os.path.exists(header):
+        missing.append(f"{header} is missing: reinstall torch: the torch/include headers "
+                       "are missing")
+    if not missing:
+        return True
+    if not _prereq_warned:
+        _prereq_warned = True
+        print("\n".join(
+            [f"{tag} *** MISSING BUILD PREREQUISITES *** the Metal extension cannot be "
+             f"built; the fast path stays off until these are fixed"]
+            + [f"  - {item}" for item in missing]
+            + ["  (warned once per process)"]
+        ), flush=True)
+    return False
 
 
 def _build_timeout():

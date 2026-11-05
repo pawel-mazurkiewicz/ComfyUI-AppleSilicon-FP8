@@ -243,6 +243,42 @@ def test_fast_route_parity_with_decode(monkeypatch, M, K, N):
     assert rel < 5e-2, f"fp8-native scaled rel {rel:.4f} at {(M,K,N)}"
 
 
+@requires_mps
+def test_fp8_ext_ordering_without_sync():
+    """Dispatches on torch's MPS stream stay ordered after the inputs are freed."""
+    from _patches.fp8_ext.loader import module
+    mod = module()
+    if mod is None:
+        pytest.skip("fp8 extension unavailable")
+
+    def inputs(i):
+        g = torch.Generator().manual_seed(i)
+        a = (torch.randn(256, 1024, generator=g) * 0.3).to(torch.float8_e4m3fn)
+        w = (torch.randn(1024, 1024, generator=g) * 0.3).to(torch.float8_e4m3fn)
+        return (a.view(torch.uint8).to("mps").contiguous(),
+                w.view(torch.uint8).to("mps").contiguous())
+
+    refs = []
+    for i in range(30):
+        a, w = inputs(i)
+        out = mod.fp8fp8_matmul2d_nt(a, w, 1024, 1024)
+        torch.mps.synchronize()
+        refs.append(out.cpu())
+
+    outs = []
+    for i in range(30):
+        a, w = inputs(i)
+        outs.append(mod.fp8fp8_matmul2d_nt(a, w, 1024, 1024))
+        del a, w
+        # byte 255 is NaN in e4m3; these provoke reuse of the freed input memory
+        junk = torch.full((256, 1024), 255, dtype=torch.uint8, device="mps")
+        junk2 = torch.full((1024, 1024), 255, dtype=torch.uint8, device="mps")
+
+    torch.mps.synchronize()
+    for i in range(30):
+        assert torch.equal(outs[i].cpu(), refs[i]), f"mismatch at i={i}"
+
+
 # --- the F.scaled_mm / aten::_scaled_mm_v2 seam (issue #19) ---
 
 
