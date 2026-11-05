@@ -975,6 +975,27 @@ def test_fold_preallocated_output_matches(monkeypatch, T, kT, stride, padding, d
 
 
 @requires_mps
+def test_fold_failure_latches_once(monkeypatch, capsys):
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setattr(cm, "_fold_failed", False, raising=False)
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("fold broke")
+    monkeypatch.setattr(cm, "_folded_conv3d", boom)
+    x, w, b = _fold_inputs(torch.bfloat16, 5, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    wrapped = cm._make_wrap(lambda *a: "orig", 3, im2col=False, single_frame=False, fold=True)
+    kw = dict(stride=1, padding=(1, 1, 1), dilation=1, groups=1)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
+    assert wrapped(xm, wm, bm, **kw) == "orig"
+    assert wrapped(xm, wm, bm, **kw) == "orig"
+    assert calls == [1]
+    assert capsys.readouterr().out.count(cm.TAG) == 1
+
+
+@requires_mps
 @pytest.mark.parametrize("val", ["off", "0", "false", "none", "no"])
 def test_fold_off_switch(monkeypatch, val):
     """ASFP8_CONV_FOLD is read per call, so a wrapper built while on still honours a later off."""

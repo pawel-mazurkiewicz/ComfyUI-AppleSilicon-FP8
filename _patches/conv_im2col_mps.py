@@ -481,14 +481,19 @@ def _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups):
 def _make_wrap(orig, rank, im2col=True, single_frame=False, fold=False):
     """Module-level so fallback tests can build the wrapper closure without MPS/install()."""
     def conv(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+        global _fold_failed
         try:
             if single_frame and rank == 3 and _single_frame_ok(x, weight, stride, padding, dilation, groups):
                 return _single_frame_conv3d(x, weight, bias, stride, padding, dilation, groups)
             if im2col and weight.dim() - 2 == rank and _supported(x, weight, dilation, groups, x.dtype):
                 return conv_im2col(x, weight, bias, stride, padding, dilation, groups)
-            if (fold and rank == 3 and _fold_wanted()
+            if (fold and rank == 3 and not _fold_failed and _fold_wanted()
                     and _fold_ok(x, weight, stride, padding, dilation, groups)):
-                return _folded_conv3d(x, weight, bias, stride, padding, dilation, groups)
+                try:
+                    return _folded_conv3d(x, weight, bias, stride, padding, dilation, groups)
+                except Exception as e:
+                    _fold_failed = True
+                    print(f"{TAG} conv3d fold disabled for this session ({e!r})")
         except Exception as e:
             print(f"{TAG} conv{rank}d fell back ({e!r})")
         return orig(x, weight, bias, stride, padding, dilation, groups)
@@ -497,6 +502,7 @@ def _make_wrap(orig, rank, im2col=True, single_frame=False, fold=False):
 
 _sf_installed = False
 _fold_installed = False
+_fold_failed = False
 
 
 def _single_frame_wanted():
