@@ -87,12 +87,12 @@ inline void nax_frag_store_int32(const thread int32_t *src, device int32_t *dst,
 // the per-row factor (weight_scale * x_row_scale), round to OutT, then a
 // SEPARATE OutT-precision bias add (bf16 + bf16) — so it is bit-identical
 // to chunk.float()*scale -> .to(bf16) -> + bias.to(bf16).
-template <typename OutT>
+template <typename OutT, bool HasCol>
 inline void nax_frag_store_dequant(const thread int32_t *src, device OutT *dst,
                                    int ld, short2 sc, short off_m, short off_n,
                                    uint M, uint N, uint m_base, uint n_base,
                                    const device float *row_scale,
-                                   const device float *col_scale, bool has_col,
+                                   const device float *col_scale,
                                    const device OutT *bias, bool has_bias) {
   for (short i = 0; i < 2; i++) {
     for (short j = 0; j < kElemCols; j++) {
@@ -100,7 +100,8 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device OutT *dst,
       uint ni = n_base + sc.x + off_n + j;
       if (mi < M && ni < N) {
         // scale product first, as stock does: float(acc)*x*w would round differently
-        float s = has_col ? row_scale[mi] * col_scale[ni] : row_scale[mi];
+        float s = row_scale[mi];
+        if constexpr (HasCol) s = s * col_scale[ni];
         float acc = float(src[i * kElemCols + j]) * s;
         OutT r = OutT(acc);
         if (has_bias) {
@@ -118,19 +119,20 @@ inline void nax_frag_store_dequant(const thread int32_t *src, device OutT *dst,
 //   0=none, 1=silu (x*sigmoid(x)), 2=gelu-tanh (F.gelu approximate='tanh').
 // Activation is applied AFTER rescale+bias (FFN convention), in fp32 on the
 // bf16-rounded post-bias value, then rounded back to OutT.
-template <typename OutT>
+template <typename OutT, bool HasCol>
 inline void nax_frag_store_dequant_act(const thread int32_t *src, device OutT *dst,
                                        int ld, short2 sc, short off_m, short off_n,
                                        uint M, uint N, uint m_base, uint n_base,
                                        const device float *row_scale,
-                                       const device float *col_scale, bool has_col,
+                                       const device float *col_scale,
                                        const device OutT *bias, bool has_bias, uint act) {
   for (short i = 0; i < 2; i++) {
     for (short j = 0; j < kElemCols; j++) {
       uint mi = m_base + sc.y + off_m + i * kElemRowsJump;
       uint ni = n_base + sc.x + off_n + j;
       if (mi < M && ni < N) {
-        float s = has_col ? row_scale[mi] * col_scale[ni] : row_scale[mi];
+        float s = row_scale[mi];
+        if constexpr (HasCol) s = s * col_scale[ni];
         float acc = float(src[i * kElemCols + j]) * s;
         OutT r = OutT(acc);
         if (has_bias) { r = r + bias[ni]; }
@@ -156,12 +158,12 @@ inline void nax_frag_store_dequant_act(const thread int32_t *src, device OutT *d
 // gate/up being two int32 register accumulators for the SAME (m,n) tile from two
 // GEMMs (B=Wg, B=Wu). act: 1=silu (SwiGLU), 2=gelu-tanh (GEGLU). GELU via the exp
 // identity (precise::tanh is low-accuracy; see nax_frag_store_dequant_act).
-template <typename OutT>
+template <typename OutT, bool HasCol>
 inline void nax_frag_store_swiglu(const thread int32_t *gate, const thread int32_t *up,
                                   device OutT *dst, int ld, short2 sc, short off_m, short off_n,
                                   uint M, uint N, uint m_base, uint n_base,
                                   const device float *rs_g, const device float *rs_u,
-                                  const device float *cs_g, const device float *cs_u, bool has_col,
+                                  const device float *cs_g, const device float *cs_u,
                                   const device OutT *bias_g, const device OutT *bias_u,
                                   bool hb_g, bool hb_u, uint act) {
   for (short i = 0; i < 2; i++) {
@@ -170,8 +172,8 @@ inline void nax_frag_store_swiglu(const thread int32_t *gate, const thread int32
       uint ni = n_base + sc.x + off_n + j;
       if (mi < M && ni < N) {
         short e = i * kElemCols + j;
-        float sg = has_col ? rs_g[mi] * cs_g[ni] : rs_g[mi];  // product first, as in the dequant store
-        float su = has_col ? rs_u[mi] * cs_u[ni] : rs_u[mi];
+        float sg = rs_g[mi], su = rs_u[mi];
+        if constexpr (HasCol) { sg = sg * cs_g[ni]; su = su * cs_u[ni]; }  // product first
         OutT g = OutT(float(gate[e]) * sg); if (hb_g) g = g + bias_g[ni];
         OutT u = OutT(float(up[e])   * su); if (hb_u) u = u + bias_u[ni];
         float gf = float(g);
@@ -400,8 +402,7 @@ kernel void int8_matmul_int32_small(
 
 // ── Fused (dequant + bias + act) entry points, bf16 output ──────
 // One body for every tile shape and scale layout. HasCol selects
-// scale = row_scale[m] * col_scale[n] (per-channel) over row_scale[m] alone; the
-// scalar instantiations never read buffer(13).
+// scale = row_scale[m] * col_scale[n] (per-channel) over row_scale[m] alone.
 template <int BM, int WM, bool HasCol>
 [[kernel]] void int8_matmul_fused_t(
     const device int8_t *A [[buffer(0)]], const device int8_t *B [[buffer(1)]],
@@ -429,14 +430,14 @@ template <int BM, int WM, bool HasCol>
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
       if (act == 0u)
-        nax_frag_store_dequant<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+        nax_frag_store_dequant<bfloat, HasCol>(c_frags[mm * TN + nn], Dp, int(N), sc,
                                        short(mm * 16), short(nn * 16), M, N,
-                                       m_base, n_base, row_scale, col_scale, HasCol,
+                                       m_base, n_base, row_scale, col_scale,
                                        bias, has_bias != 0u);
       else
-        nax_frag_store_dequant_act<bfloat>(c_frags[mm * TN + nn], Dp, int(N), sc,
+        nax_frag_store_dequant_act<bfloat, HasCol>(c_frags[mm * TN + nn], Dp, int(N), sc,
                                            short(mm * 16), short(nn * 16), M, N,
-                                           m_base, n_base, row_scale, col_scale, HasCol,
+                                           m_base, n_base, row_scale, col_scale,
                                            bias, has_bias != 0u, act);
 }
 
@@ -477,8 +478,8 @@ template <int BM, int WM, bool HasCol>
   device bfloat *Dp = D + m_base * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
-      nax_frag_store_swiglu<bfloat>(cg[mm * TN + nn], cu[mm * TN + nn], Dp, int(N), sc,
-        short(mm * 16), short(nn * 16), M, N, m_base, n_base, rs_g, rs_u, cs_g, cs_u, HasCol,
+      nax_frag_store_swiglu<bfloat, HasCol>(cg[mm * TN + nn], cu[mm * TN + nn], Dp, int(N), sc,
+        short(mm * 16), short(nn * 16), M, N, m_base, n_base, rs_g, rs_u, cs_g, cs_u,
         bias_g, bias_u, hb_g != 0u, hb_u != 0u, act);
 }
 

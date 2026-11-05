@@ -568,6 +568,37 @@ def test_int8_swiglu_channelwise_fused(monkeypatch, M, ws_col, bias, act):
         f"M={M} ws_col={ws_col} bias={bias} {act}: max|d|={(out.float()-ref.float()).abs().max().item():.4g}"
 
 
+@requires_int8_ext
+def test_int8_kernels_pass_metal_validation():
+    """Every entry point binds all the buffers its kernel reads (Metal API validation)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import torch\n"
+        "from _patches.int8_ext import loader\n"
+        "m = loader.module()\n"
+        "assert m is not None\n"
+        "M, K, N = 8, 256, 128\n"
+        "a = torch.randint(-128, 128, (M, K), dtype=torch.int8).to('mps')\n"
+        "bg = torch.randint(-128, 128, (N, K), dtype=torch.int8).to('mps')\n"
+        "bu = torch.randint(-128, 128, (N, K), dtype=torch.int8).to('mps')\n"
+        "xs = (torch.rand(M) * 0.01 + 0.001).to('mps')\n"
+        "ws = (torch.rand(N) * 0.01 + 0.001).to('mps')\n"
+        "wu = (torch.rand(N) * 0.01 + 0.001).to('mps')\n"
+        "m.i8_matmul2d_nt_fused(a, bg, xs, None, 0)\n"
+        "m.i8_matmul2d_nt_fused_cs(a, bg, xs, ws, None, 1)\n"
+        "m.i8_matmul2d_nt_swiglu(a, bg, bu, xs, xs, None, None, 1)\n"
+        "m.i8_matmul2d_nt_swiglu_cs(a, bg, bu, xs, ws, wu, None, None, 1)\n"
+        "torch.mps.synchronize()\n"
+    )
+    env = dict(os.environ, MTL_DEBUG_LAYER="1", PYTORCH_ENABLE_MPS_FALLBACK="1")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proc = subprocess.run([sys.executable, "-c", code], cwd=repo, env=env,
+                          capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+
+
 @requires_mps
 def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
     """A Metal library the toolchain rejects on first use is latched off, not recompiled

@@ -227,11 +227,10 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
     scalar_scales = (ws_gate.numel() == 1 and ws_up.numel() == 1)
     channel_scales = (not scalar_scales and ws_gate.numel() == n_out
                       and ws_up.numel() == n_out)
+    fn = "i8_matmul2d_nt_swiglu" if scalar_scales else "i8_matmul2d_nt_swiglu_cs"
     fused_ok = (_kernel is not None and x.device.type == "mps" and w_gate.dtype == torch.int8
-                and w_up.dtype == torch.int8
-                and hasattr(_kernel, "i8_matmul2d_nt_swiglu" if scalar_scales
-                            else "i8_matmul2d_nt_swiglu_cs")
-                and (scalar_scales or channel_scales))
+                and w_up.dtype == torch.int8 and (scalar_scales or channel_scales)
+                and hasattr(_kernel, fn))
     if not fused_ok:
         g = _int8_linear_kernel(x, w_gate, ws_gate, bias_gate, torch.bfloat16,
                                 convrot, convrot_groupsize, act=act)  # activation applied here
