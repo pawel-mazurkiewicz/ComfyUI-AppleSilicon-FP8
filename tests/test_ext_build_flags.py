@@ -19,7 +19,7 @@ def test_build_does_not_pin_the_cxx_standard(loader, tmp_path, monkeypatch):
     for flag in ("ASFP8_INT8_EXT", "ASFP8_FP8_EXT", "ASFP8_FP8_NATIVE", "ASFP8_INT4_EXT"):
         monkeypatch.setenv(flag, "1")
     monkeypatch.setattr(loader.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(loader, "_NOSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("ASFP8_BUILD_ROOT", str(tmp_path))
     monkeypatch.setattr(loader, "_tried", False)
     monkeypatch.setattr(loader, "_mod", None)
     seen = {}
@@ -32,6 +32,7 @@ def test_build_does_not_pin_the_cxx_standard(loader, tmp_path, monkeypatch):
     monkeypatch.setattr(loader, "_cpp_load_guarded", fake_build)
 
     assert loader.module() is built
+    assert seen["build_directory"] == loader.build_dir_for(loader.__name__.split(".")[1])
     cflags = seen["extra_cflags"]
     assert "-ObjC++" in cflags
     assert not [f for f in cflags if f.startswith("-std=")], (
