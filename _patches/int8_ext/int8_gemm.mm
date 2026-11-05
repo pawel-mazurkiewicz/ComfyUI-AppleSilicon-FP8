@@ -219,8 +219,8 @@ bool w8a8_gemm_compute(
   uint m_base = tid_y * BM + sg_row * SM;
   uint n_base = tid_x * BN + sg_col * SN;
 
-  const device int8_t *sg_A = A + m_base * K;
-  const device int8_t *sg_B = B + n_base * K;
+  const device int8_t *sg_A = A + ulong(m_base) * K;
+  const device int8_t *sg_B = B + ulong(n_base) * K;
 
   constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
       16, 32, 16, false, true, true,
@@ -369,7 +369,7 @@ kernel void int8_matmul_int32(
           A, B, c_frags, sc, m_base, n_base, M, N, K, swizzle_log, tiles_m,
           tiles_n, tgid, sgid, lid))
     return;
-  device int32_t *D = C + m_base * N + n_base;
+  device int32_t *D = C + ulong(m_base) * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
       nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm * 16),
@@ -393,7 +393,7 @@ kernel void int8_matmul_int32_small(
           A, B, c_frags, sc, m_base, n_base, M, N, K, swizzle_log, tiles_m,
           tiles_n, tgid, sgid, lid))
     return;
-  device int32_t *D = C + m_base * N + n_base;
+  device int32_t *D = C + ulong(m_base) * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
       nax_frag_store_int32(c_frags[mm * TN + nn], D, int(N), sc, short(mm * 16),
@@ -426,7 +426,7 @@ template <int BM, int WM, bool HasCol>
           A, B, c_frags, sc, m_base, n_base, M, N, K, swizzle_log, tiles_m,
           tiles_n, tgid, sgid, lid))
     return;
-  device bfloat *Dp = D + m_base * N + n_base;
+  device bfloat *Dp = D + ulong(m_base) * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
       if (act == 0u)
@@ -475,7 +475,7 @@ template <int BM, int WM, bool HasCol>
   bool ok2 = w8a8_gemm_compute<BM, 128, 512, 32, WM, 4>(A, Bu, cu, sc2, mb2, nb2, M, N, K,
         swizzle_log, tiles_m, tiles_n, tgid, sgid, lid);
   if (!ok2 || sc2.x != sc.x || sc2.y != sc.y || mb2 != m_base || nb2 != n_base) return;
-  device bfloat *Dp = D + m_base * N + n_base;
+  device bfloat *Dp = D + ulong(m_base) * N + n_base;
   for (short mm = 0; mm < TM; mm++)
     for (short nn = 0; nn < TN; nn++)
       nax_frag_store_swiglu<bfloat, HasCol>(cg[mm * TN + nn], cu[mm * TN + nn], Dp, int(N), sc,

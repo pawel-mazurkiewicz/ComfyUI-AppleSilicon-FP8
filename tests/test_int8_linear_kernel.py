@@ -1073,3 +1073,63 @@ def test_dequant_leaves_an_offloaded_weight_on_the_cpu(monkeypatch):
     assert not getattr(layer, "_asfp8_deq_done", False), (
         "a transient offload latched the layer out of ever dequantising"
     )
+
+
+def test_default_token_cap_is_65536(monkeypatch):
+    monkeypatch.delenv("ASFP8_INT8_KERNEL_MAX_TOKENS", raising=False)
+    assert patch._max_tokens() == 65536
+
+
+@requires_mps
+def test_unfused_large_m_falls_back(monkeypatch):
+    """Calls that would take the int32-materialising fallback keep the 2048-row cap."""
+    from comfy_kitchen.tensor import QuantizedTensor
+
+    class FakeKernel:
+        def i8_matmul2d_nt_fused(self, *a): ...
+        def i8_matmul2d_nt_fused_cs(self, *a): ...
+
+    monkeypatch.delenv("ASFP8_INT8_KERNEL_MAX_TOKENS", raising=False)
+    monkeypatch.setattr(patch, "_kernel", FakeKernel())
+    monkeypatch.setattr(_caps, "kernel_ready", lambda *a: True)
+    routed = object()
+    monkeypatch.setattr(patch, "_int8_linear_kernel", lambda *a, **k: routed)
+
+    qw = QuantizedTensor.from_float(
+        (torch.randn(64, 128) * 0.1).to(torch.bfloat16), "TensorWiseINT8Layout"
+    ).to("mps")
+
+    class Holder:
+        weight = qw
+        bias = None
+        _full_precision_mm = False
+        comfy_force_cast_weights = False
+        weight_function = []
+        bias_function = []
+
+    def x(m, dt):
+        return torch.zeros(m, 128, dtype=dt, device="mps")
+
+    assert patch._try_int8_kernel_forward(Holder(), x(4096, torch.float16)) is None
+    assert patch._try_int8_kernel_forward(Holder(), x(2048, torch.float16)) is routed
+    assert patch._try_int8_kernel_forward(Holder(), x(4096, torch.bfloat16)) is routed
+    # no fused kernels in the build: the bf16 call is unfused too
+    monkeypatch.setattr(patch, "_kernel", object())
+    assert patch._try_int8_kernel_forward(Holder(), x(4096, torch.bfloat16)) is None
+
+
+@requires_int8_ext
+def test_fused_cs_large_m_matches_chunked(monkeypatch):
+    mod, _, _ = _channelwise_setup(monkeypatch)
+    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
+
+    g = torch.Generator().manual_seed(11)
+    M, K, N = 20000, 256, 256
+    x = (torch.randn(M, K, generator=g, dtype=torch.bfloat16) * 0.5).to("mps")
+    w = torch.randint(-128, 128, (N, K), generator=g, dtype=torch.int8).to("mps")
+    ws = (torch.rand(N, generator=g) * 0.01 + 0.001).to("mps")
+    out = patch._int8_linear_kernel(x, w, ws, None, torch.bfloat16, False, 256)
+    x8, xs = quantize_int8_rowwise(x)
+    C = mod.i8_matmul2d_nt(x8.contiguous(), w.contiguous()).float()
+    ref = (C * (xs * ws.view(1, -1))).to(torch.bfloat16)
+    assert torch.equal(out, ref)
