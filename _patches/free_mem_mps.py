@@ -29,7 +29,7 @@ def _mlx_held():
         try:
             return mx.metal.get_active_memory() + mx.metal.get_cache_memory()
         except Exception:
-            return 0
+            raise  # fail closed: unreadable MLX counters must not inflate the pool
 
 
 def _reusable_pool():

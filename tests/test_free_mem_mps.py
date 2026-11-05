@@ -143,3 +143,20 @@ def test_mlx_metal_namespace_fallback(env, monkeypatch):
     env.state.update(driver=40 * GiB, current=22 * GiB)
     free_mem_mps.install()
     assert env.get_free_memory(torch.device("mps"), True) == (21 * GiB, 11 * GiB)
+
+
+def test_mlx_counter_failure_falls_back_to_original(env, monkeypatch, capsys):
+    def boom():
+        raise RuntimeError("no counter")
+
+    mlx = types.ModuleType("mlx.core")
+    mlx.get_active_memory = boom
+    mlx.get_cache_memory = boom
+    mlx.metal = types.SimpleNamespace(get_active_memory=boom, get_cache_memory=boom)
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx)
+    free_mem_mps.install()
+    capsys.readouterr()
+    mps = torch.device("mps")
+    assert env.get_free_memory(mps) == "orig"
+    assert env.get_free_memory(mps) == "orig"
+    assert capsys.readouterr().out.count(free_mem_mps.TAG) == 1
