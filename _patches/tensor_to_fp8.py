@@ -31,6 +31,9 @@ def _scan_target(args, kwargs, self_dtype):
     target_dtype = kwargs.get("dtype")
     target_device = kwargs.get("device")
     for a in args:
+        if isinstance(a, bool):
+            # bool is an int subclass; positional non_blocking/copy are not devices
+            continue
         if isinstance(a, torch.dtype):
             target_dtype = a
         elif isinstance(a, torch.Tensor):
