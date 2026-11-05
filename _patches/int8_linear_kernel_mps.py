@@ -290,12 +290,12 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
 
 
 def _max_tokens():
-    # past ~2k rows comfy's bf16 dequant GEMM beats the W8A8 path on M5 (it wins below)
+    # W8A8 beat bf16 dequant GEMM at every size measured up to 16k rows on M5 (dev/bench_int8_crossover.py)
     import os
     try:
-        return int(os.environ.get("ASFP8_INT8_KERNEL_MAX_TOKENS", "2048"))
+        return int(os.environ.get("ASFP8_INT8_KERNEL_MAX_TOKENS", "65536"))
     except ValueError:
-        return 2048
+        return 65536
 
 
 def _try_int8_kernel_forward(self, input):
