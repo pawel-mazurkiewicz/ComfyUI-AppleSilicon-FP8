@@ -31,6 +31,7 @@ def env(monkeypatch):
     monkeypatch.setattr(torch.mps, "driver_allocated_memory", lambda: state["driver"])
     monkeypatch.setattr(torch.mps, "current_allocated_memory", lambda: state["current"])
     monkeypatch.setattr(free_mem_mps, "_supported", lambda: True)
+    monkeypatch.setattr(free_mem_mps, "_failed", False, raising=False)
     monkeypatch.delenv("ASFP8_FREE_MEM", raising=False)
     monkeypatch.delitem(sys.modules, "mlx.core", raising=False)
     mm.calls, mm.state = calls, state
@@ -115,3 +116,30 @@ def test_counter_failure_falls_back_to_original(env, monkeypatch):
     free_mem_mps.install()
     monkeypatch.setattr(torch.mps, "driver_allocated_memory", boom)
     assert env.get_free_memory(torch.device("mps")) == "orig"
+
+
+def test_counter_failure_latches_once(env, monkeypatch, capsys):
+    seen = []
+
+    def boom():
+        seen.append(1)
+        raise RuntimeError("no mps")
+
+    free_mem_mps.install()
+    capsys.readouterr()
+    monkeypatch.setattr(torch.mps, "driver_allocated_memory", boom)
+    mps = torch.device("mps")
+    assert env.get_free_memory(mps) == "orig"
+    assert env.get_free_memory(mps) == "orig"
+    assert len(seen) == 1
+    assert capsys.readouterr().out.count(free_mem_mps.TAG) == 1
+
+
+def test_mlx_metal_namespace_fallback(env, monkeypatch):
+    metal = types.SimpleNamespace(get_active_memory=lambda: 6 * GiB, get_cache_memory=lambda: 1 * GiB)
+    mlx = types.ModuleType("mlx.core")
+    mlx.metal = metal
+    monkeypatch.setitem(sys.modules, "mlx.core", mlx)
+    env.state.update(driver=40 * GiB, current=22 * GiB)
+    free_mem_mps.install()
+    assert env.get_free_memory(torch.device("mps"), True) == (21 * GiB, 11 * GiB)

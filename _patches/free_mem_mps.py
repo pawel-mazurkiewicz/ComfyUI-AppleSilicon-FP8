@@ -37,6 +37,15 @@ def _reusable_pool():
     return max(0, held - _mlx_held())
 
 
+_failed = False
+
+
+def _latch_off(exc):
+    global _failed
+    _failed = True
+    print(f"{TAG} disabled for this session after {type(exc).__name__}: {exc}", flush=True)
+
+
 def _supported():
     return sys.platform == "darwin" and torch.backends.mps.is_available()
 
@@ -57,14 +66,15 @@ def install():
 
     def get_free_memory(dev=None, torch_free_too=False):
         d = mm.get_torch_device() if dev is None else dev
-        if getattr(d, "type", None) != "mps" or not _enabled():
+        if getattr(d, "type", None) != "mps" or _failed or not _enabled():
             return original(dev, torch_free_too)
         try:
             import comfy.system_memory as sm
 
             pool = _reusable_pool()
             total = sm.virtual_memory_available() + pool
-        except Exception:
+        except Exception as e:
+            _latch_off(e)
             return original(dev, torch_free_too)
         return (total, pool) if torch_free_too else total
 
