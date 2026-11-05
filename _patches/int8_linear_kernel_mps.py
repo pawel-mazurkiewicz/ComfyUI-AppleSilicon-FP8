@@ -147,6 +147,20 @@ def _rotate_quant(x, convrot, gs):
     return x8, x_scale
 
 
+_UNFUSED_MAX_TOKENS = 2048  # the unfused path materialises int32 [M,N] plus a copy
+
+
+def _fused_variant(kernel, out_dtype, scale_numel, n):
+    """Kernel entry that folds the rescale into the GEMM store, or None for the unfused path."""
+    if kernel is None or out_dtype != torch.bfloat16:
+        return None
+    if scale_numel == 1 and hasattr(kernel, "i8_matmul2d_nt_fused"):
+        return "i8_matmul2d_nt_fused"
+    if scale_numel == n and hasattr(kernel, "i8_matmul2d_nt_fused_cs"):
+        return "i8_matmul2d_nt_fused_cs"
+    return None
+
+
 def _int8_linear_kernel(
     x,
     weight,
@@ -190,11 +204,8 @@ def _int8_linear_kernel(
 
     # fused fast path: fold float(C)*row_scale[m] (+bias) into the kernel's store
     # epilogue, which is bit-identical to the chunked path below
-    if (
-        out_dtype == torch.bfloat16
-        and weight_scale.numel() == 1
-        and hasattr(_kernel, "i8_matmul2d_nt_fused")
-    ):
+    variant = _fused_variant(_kernel, out_dtype, weight_scale.numel(), weight.shape[0])
+    if variant == "i8_matmul2d_nt_fused":
         row_scale = (weight_scale.float() * x_scale.reshape(-1).float()).contiguous()
         bias_arg = bias.to(torch.bfloat16) if bias is not None else None
         # the activation is fused in-kernel here; do NOT also call _apply_act
@@ -204,11 +215,7 @@ def _int8_linear_kernel(
         return result.reshape(*orig_shape[:-1], weight.shape[0])
 
     N = weight.shape[0]
-    if (
-        out_dtype == torch.bfloat16
-        and weight_scale.numel() == N
-        and hasattr(_kernel, "i8_matmul2d_nt_fused_cs")
-    ):
+    if variant == "i8_matmul2d_nt_fused_cs":
         bias_arg = bias.to(torch.bfloat16) if bias is not None else None
         result = _kernel.i8_matmul2d_nt_fused_cs(
             x_8.contiguous(),
@@ -341,6 +348,10 @@ def _try_int8_kernel_forward(self, input):
         convrot = getattr(params, "convrot", False)
         gs = getattr(params, "convrot_groupsize", 256)
         bias = self.bias
+
+        if (input.numel() > _UNFUSED_MAX_TOKENS * input.shape[-1]
+                and _fused_variant(_kernel, input.dtype, scale.numel(), qdata.shape[0]) is None):
+            return None
 
         return _int8_linear_kernel(input, qdata, scale, bias, input.dtype, convrot, gs)
     except Exception as e:
