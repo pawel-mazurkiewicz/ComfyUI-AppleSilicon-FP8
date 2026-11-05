@@ -5,7 +5,9 @@ skipping both comfy's lossy tensorwise pre-quant and the per-step fp32 weight de
 and un-rotation. DEFAULT ON, gated on M5/Metal-4.1 + ninja; ASFP8_INT8_EXT=off disables.
 """
 
+import os
 import sys
+import weakref
 
 import torch
 
@@ -20,6 +22,10 @@ _kernel = None
 _kernel_tried = False
 _self_checked = False
 _self_ok = False
+
+# one slot: q/k/v and gate/up read the same activation, so the 2nd and 3rd calls reuse it
+_ACT_CACHE = None
+_ACT_CACHE_OFF = ("off", "0", "false", "none", "no")
 
 # gelu-erf is absent everywhere (kernel store, pybind, here): Metal has no `erf`
 _ACT = {"none": 0, "silu": 1, "gelu_tanh": 2}
@@ -106,6 +112,41 @@ def _verify():
     return _ensure_kernel() is not None and _self_check()
 
 
+def _act_key(x, convrot, gs):
+    # identity, not _version: inference tensors have none
+    return (weakref.ref(x), x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype,
+            convrot, gs, None if x.is_inference() else x._version)
+
+
+def _rotate_quant(x, convrot, gs):
+    """(int8, row scale) of x.reshape(-1, K), Hadamard-rotated first when convrot.
+
+    Both depend on x alone, so the projections of one input rotate and quantize it once.
+    The slot holds a weakref, never x; a miss overwrites it. ASFP8_INT8_ACT_CACHE=off
+    recomputes every call.
+    """
+    global _ACT_CACHE
+    caching = os.environ.get("ASFP8_INT8_ACT_CACHE", "1").strip().lower() not in _ACT_CACHE_OFF
+    key = _act_key(x, convrot, gs)
+    entry = _ACT_CACHE if caching else None
+    if entry is not None:
+        ck, x8, x_scale = entry
+        # ck[0]() is x: identity, since tensor == is elementwise and ids get recycled
+        if ck[0]() is x and ck[1:] == key[1:]:
+            return x8, x_scale
+
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+    if convrot:
+        h = _build_hadamard(gs, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, gs)
+
+    x8, x_scale = int8_quant_mps.quantize_rowwise(x.reshape(-1, x.shape[-1]))
+    if caching:
+        _ACT_CACHE = (key, x8, x_scale)
+    return x8, x_scale
+
+
 def _int8_linear_kernel(
     x,
     weight,
@@ -142,16 +183,9 @@ def _int8_linear_kernel(
             act,
         )
 
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
-
-    if convrot:
-        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, h, convrot_groupsize)
-
+    # rotation preserves shape, so orig_shape is x's shape before it
     orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1])
-
-    x_8, x_scale = int8_quant_mps.quantize_rowwise(x_2d)
+    x_8, x_scale = _rotate_quant(x, convrot, convrot_groupsize)
     weight_scale = weight_scale.view(-1)
 
     # fused fast path: fold float(C)*row_scale[m] (+bias) into the kernel's store
@@ -238,13 +272,8 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                                 convrot, convrot_groupsize, act="none")
         return g * u
 
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
-    if convrot:
-        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, h, convrot_groupsize)
     shp = x.shape
-    x2 = x.reshape(-1, x.shape[-1])
-    x8, xs = int8_quant_mps.quantize_rowwise(x2)
+    x8, xs = _rotate_quant(x, convrot, convrot_groupsize)
     xs = xs.reshape(-1).float()
     bg = bias_gate.to(torch.bfloat16) if bias_gate is not None else None
     bu = bias_up.to(torch.bfloat16) if bias_up is not None else None
