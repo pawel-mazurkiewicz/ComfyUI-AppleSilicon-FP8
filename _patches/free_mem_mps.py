@@ -1,8 +1,8 @@
 """Count PyTorch's reusable MPS allocator pool as free memory.
 
 Stock ComfyUI reports psutil "available" for MPS, which cannot see memory this process
-already holds in the allocator pool, so it evicts models it could keep. Disable with
-ASFP8_FREE_MEM=off.
+already holds in the allocator pool, so it evicts models it could keep. Opt-in:
+ASFP8_FREE_MEM=1.
 """
 
 import os
@@ -11,11 +11,11 @@ import sys
 import torch
 
 TAG = "[AppleSilicon-FP8/free-mem]"
-_OFF = ("off", "0", "false", "none", "no")
+_ON = ("1", "on", "true", "yes")
 
 
 def _enabled():
-    return os.environ.get("ASFP8_FREE_MEM", "").strip().lower() not in _OFF
+    return os.environ.get("ASFP8_FREE_MEM", "").strip().lower() in _ON
 
 
 def _mlx_held():

@@ -32,7 +32,7 @@ def env(monkeypatch):
     monkeypatch.setattr(torch.mps, "current_allocated_memory", lambda: state["current"])
     monkeypatch.setattr(free_mem_mps, "_supported", lambda: True)
     monkeypatch.setattr(free_mem_mps, "_failed", False, raising=False)
-    monkeypatch.delenv("ASFP8_FREE_MEM", raising=False)
+    monkeypatch.setenv("ASFP8_FREE_MEM", "1")
     monkeypatch.delitem(sys.modules, "mlx.core", raising=False)
     mm.calls, mm.state = calls, state
     return mm
@@ -73,15 +73,33 @@ def test_cpu_device_untouched(env):
     assert env.calls == [(torch.device("cpu"), True)]
 
 
-def test_off_switch(env, monkeypatch):
-    free_mem_mps.install()
-    monkeypatch.setenv("ASFP8_FREE_MEM", "off")
-    assert env.get_free_memory(torch.device("mps")) == "orig"
-
-
-def test_off_switch_at_install_leaves_original(env, monkeypatch):
+def test_default_is_off(env, monkeypatch):
     original = env.get_free_memory
-    monkeypatch.setenv("ASFP8_FREE_MEM", "0")
+    monkeypatch.delenv("ASFP8_FREE_MEM", raising=False)
+    assert not free_mem_mps.install()
+    assert env.get_free_memory is original
+
+
+def test_env_switch(env, monkeypatch):
+    original = env.get_free_memory
+    mps = torch.device("mps")
+    # unset: no wrap, original behaviour
+    monkeypatch.delenv("ASFP8_FREE_MEM", raising=False)
+    assert not free_mem_mps.install()
+    assert env.get_free_memory is original
+    assert env.get_free_memory(mps) == "orig"
+    # "1": active
+    monkeypatch.setenv("ASFP8_FREE_MEM", "1")
+    assert free_mem_mps.install()
+    assert env.get_free_memory(mps) == 18 * GiB
+    # "off" after install: inactive
+    monkeypatch.setenv("ASFP8_FREE_MEM", "off")
+    assert env.get_free_memory(mps) == "orig"
+
+
+def test_off_value_at_install_leaves_original(env, monkeypatch):
+    original = env.get_free_memory
+    monkeypatch.setenv("ASFP8_FREE_MEM", "off")
     assert not free_mem_mps.install()
     assert env.get_free_memory is original
 
