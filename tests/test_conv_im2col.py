@@ -902,9 +902,11 @@ def test_fold_equals_single_frame_when_T_eq_kT():
 
 
 def test_fold_chunking_counts_batch():
-    """Frames per chunk split the budget across the whole gathered chunk, N included."""
+    """Frames per chunk split the budget across the gathered chunk and its folded copy, N included."""
     import _patches.conv_im2col_mps as cm
-    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, 2 * 4 * 3 * 8 * 8 * 2 * 5) == 5
+    frame = 2 * 4 * 3 * 8 * 8 * 2            # N*C*kT*H*W*elem_bytes
+    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, 2 * frame * 5) == 5
+    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, frame * 5) == 2
     assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, 1) == 1
 
 
@@ -932,7 +934,7 @@ def test_fold_chunked_equals_unchunked(monkeypatch):
     monkeypatch.setattr(cm, "_stock_conv2d", spy)
     monkeypatch.delenv("ASFP8_CONV_FOLD_MB", raising=False)
     a = cm._folded_conv3d(xm, wm, bm, **kw)
-    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "0.7")      # 9 frames still fit: one conv2d
+    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "1.5")      # 9 frames (two copies each) still fit: one conv2d
     same_batch = cm._folded_conv3d(xm, wm, bm, **kw)
     monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "0.01")      # one output frame per conv2d
     b = cm._folded_conv3d(xm, wm, bm, **kw)

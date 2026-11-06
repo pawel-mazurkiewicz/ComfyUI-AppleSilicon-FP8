@@ -531,8 +531,8 @@ def _fold_ok(x, weight, stride, padding, dilation, groups):
 
 
 def _fold_chunk_frames(N, C, kT, H, W, elem_bytes, budget_bytes):
-    """Output frames per chunk so the gathered input stays inside the budget (N counts)."""
-    return max(1, int(budget_bytes // (N * C * kT * H * W * elem_bytes)))
+    """Output frames per chunk so the gathered input and its folded copy stay inside the budget."""
+    return max(1, int(budget_bytes // (2 * N * C * kT * H * W * elem_bytes)))
 
 
 def _fold_budget_bytes():
