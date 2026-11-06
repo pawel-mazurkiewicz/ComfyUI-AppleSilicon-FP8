@@ -529,6 +529,8 @@ def _fold_ok(x, weight, stride, padding, dilation, groups):
     s, p, d = _triple(stride), _triple(padding), _triple(dilation)
     if not len(s) == len(p) == len(d) == 3:
         return False
+    if p[0] < 0 or d[0] < 1:   # stock rejects these; F.pad would crop instead
+        return False
     # shorter than the dilated kernel: stock raises its own error, not a fold failure
     return x.shape[2] + 2 * p[0] - d[0] * (weight.shape[2] - 1) - 1 >= 0
 
@@ -571,7 +573,7 @@ def _folded_conv3d(x, weight, bias, stride, padding, dilation, groups):
         g = g.permute(0, 2, 1, 3, 4, 5).reshape(N * n, C * kT, x.shape[3], x.shape[4])
         y = _stock_conv2d(g, wf, bias, s[1:], p[1:], d[1:], 1)                           # [N*n,Co,Ho,Wo]
         if out is None:
-            out = x.new_empty((N, Co, T_out, y.shape[2], y.shape[3]))
+            out = y.new_empty((N, Co, T_out, y.shape[2], y.shape[3]))
         out[:, :, o0:o0 + n].copy_(y.reshape(N, n, Co, y.shape[2], y.shape[3]).permute(0, 2, 1, 3, 4))
     return out
 

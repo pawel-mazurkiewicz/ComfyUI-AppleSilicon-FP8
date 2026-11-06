@@ -1062,3 +1062,22 @@ def test_folded_conv3d_rejects_too_short_input():
     x, w, b = _fold_inputs(torch.bfloat16, 2, 3)
     with pytest.raises(ValueError):
         cm._folded_conv3d(x.to("mps"), w.to("mps"), b.to("mps"), 1, (0, 1, 1), 1, 1)
+
+
+@requires_mps
+@pytest.mark.parametrize("padding,dilation", [((-1, 1, 1), (2, 1, 1)), ((0, 1, 1), (0, 1, 1))])
+def test_fold_rejects_negative_temporal_padding_and_zero_dilation(padding, dilation):
+    import _patches.conv_im2col_mps as cm
+    x, w, _ = _fold_inputs(torch.bfloat16, 7, 3)
+    assert cm._fold_ok(x.to("mps"), w.to("mps"), 1, padding, dilation, 1) is False
+
+
+@requires_mps
+def test_folded_output_takes_conv_result_dtype(monkeypatch):
+    """Under autocast conv2d returns a lower dtype than x; the folded buffer must follow it."""
+    import _patches.conv_im2col_mps as cm
+    real = cm._stock_conv2d
+    monkeypatch.setattr(cm, "_stock_conv2d", lambda *a: real(*a).to(torch.float16))
+    x, w, b = _fold_inputs(torch.float32, 5, 3)
+    out = cm._folded_conv3d(x.to("mps"), w.to("mps"), b.to("mps"), 1, (0, 1, 1), 1, 1)
+    assert out.dtype == torch.float16
