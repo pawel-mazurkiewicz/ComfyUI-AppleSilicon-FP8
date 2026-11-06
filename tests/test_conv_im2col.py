@@ -9,9 +9,11 @@ def _restore_conv_state():
     """install() rebinds F.conv2d/F.conv3d and module globals; undo it after every test."""
     import torch.nn.functional as F
     import _patches.conv_im2col_mps as cm
-    saved = (F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed)
+    saved = (F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed,
+             getattr(cm, "_fold_installed", False))
     yield
-    F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed = saved
+    (F.conv2d, F.conv3d, cm._installed_ranks, cm._orig_conv2d, cm._orig_conv3d, cm._sf_installed,
+     cm._fold_installed) = saved
 
 
 @requires_mps
@@ -682,12 +684,15 @@ def _fresh_install_state(monkeypatch, gate):
     import _patches.conv_im2col_mps as cm
     monkeypatch.delenv("ASFP8_CONV_IM2COL", raising=False)
     monkeypatch.delenv("ASFP8_CONV_SINGLE_FRAME", raising=False)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
     monkeypatch.setattr(cm, "_installed_ranks", set())
     monkeypatch.setattr(cm, "_orig_conv2d", None)
     monkeypatch.setattr(cm, "_orig_conv3d", None)
     monkeypatch.setattr(cm, "_sf_installed", False)
+    monkeypatch.setattr(cm, "_fold_installed", False)
     monkeypatch.setattr(cm, "_gate", lambda: gate)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr("sys.platform", "darwin")   # install() is a no-op elsewhere
     return cm
 
 
@@ -767,10 +772,53 @@ def test_install_kill_switches(monkeypatch, env, val, gate):
     import torch.nn.functional as F
     cm = _fresh_install_state(monkeypatch, gate=gate)
     monkeypatch.setenv(env, val)
+    if env != "ASFP8_CONV_IM2COL":
+        monkeypatch.setenv("ASFP8_CONV_FOLD", "off")     # the fold wraps conv3d on its own gate
     c2, c3 = F.conv2d, F.conv3d
     cm.install()
     assert cm._installed_ranks == set() and cm._sf_installed is False
     assert F.conv2d is c2 and F.conv3d is c3
+
+
+def test_fold_installs_conv3d_wrapper_without_matmul2d(monkeypatch, capsys):
+    """FOLD alone (no matmul2d, SINGLE_FRAME=off) still wraps conv3d, over the true original."""
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=False)
+    monkeypatch.setenv("ASFP8_CONV_SINGLE_FRAME", "off")
+    orig3 = F.conv3d
+    orig2 = F.conv2d
+    cm.install()
+    assert cm._fold_installed is True and cm._sf_installed is False and cm._installed_ranks == set()
+    assert F.conv2d is orig2                             # conv2d untouched, fold is conv3d only
+    assert F.conv3d is not orig3 and cm._orig_conv3d is orig3
+    assert orig3 in [c.cell_contents for c in F.conv3d.__closure__]
+    assert "multi-frame conv3d tap-fold active on MPS." in capsys.readouterr().out
+    third = F.conv3d
+    cm.install()                                   # idempotent: no second wrap
+    assert F.conv3d is third
+
+
+@requires_mps
+@pytest.mark.parametrize("val", ["off", "0", "false", "none", "no"])
+def test_fold_kill_switch_leaves_other_paths(monkeypatch, val):
+    """FOLD=off with no matmul2d: single-frame still installs and routes, multi-frame stays stock."""
+    import torch.nn.functional as F
+    cm = _fresh_install_state(monkeypatch, gate=False)
+    monkeypatch.setenv("ASFP8_CONV_FOLD", val)
+    cm.install()
+    assert cm._fold_installed is False and cm._sf_installed is True
+    hits = {"fold": 0}
+
+    def spy(*a, **k):
+        hits["fold"] += 1
+    monkeypatch.setattr(cm, "_folded_conv3d", spy)
+    x5 = torch.zeros(1, 8, 5, 12, 12, device="mps", dtype=torch.bfloat16)
+    w3 = torch.zeros(8, 8, 3, 3, 3, device="mps", dtype=torch.bfloat16)
+    out = F.conv3d(x5, w3, None, 1, 1)
+    assert out.shape == (1, 8, 5, 12, 12) and hits["fold"] == 0
+    x1 = torch.zeros(1, 8, 1, 12, 12, device="mps", dtype=torch.bfloat16)
+    w1 = torch.zeros(8, 8, 1, 3, 3, device="mps", dtype=torch.bfloat16)
+    assert F.conv3d(x1, w1, None, 1, (0, 1, 1)).shape == (1, 8, 1, 12, 12)
 
 
 def test_install_inert_without_mps_or_off_darwin(monkeypatch):
@@ -803,3 +851,234 @@ def test_install_upgrade_rewraps_original_not_wrapper(monkeypatch):
     second = F.conv3d
     cm.install()                                  # nothing new to install: no re-wrap
     assert F.conv3d is second
+
+
+# ---------------------------------------------------------------------------
+# Multi-frame conv3d tap-fold -> one conv2d (any MPS, chunked by memory budget)
+# ---------------------------------------------------------------------------
+
+_FOLD_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# (T, kT, stride, padding, dilation): temporal pad / stride / dilation all move
+_FOLD_CASES = [(5, 3, 1, (1, 1, 1), 1),
+               (9, 3, (2, 1, 1), (0, 1, 1), 1),
+               (7, 3, 1, (1, 1, 1), (2, 1, 1)),
+               (4, 1, 1, 0, 1)]
+
+
+def _fold_inputs(dtype, T, kT, N=2, C=16, Co=24, HW=20, kh=3, kw=3, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(N, C, T, HW, HW, generator=g).to(dtype)
+    w = (torch.randn(Co, C, kT, kh, kw, generator=g) / (C * kT * kh * kw) ** 0.5).to(dtype)
+    b = torch.randn(Co, generator=g).to(dtype)
+    return x, w, b
+
+
+@requires_mps
+@pytest.mark.parametrize("dtype", _FOLD_DTYPES)
+@pytest.mark.parametrize("T,kT,stride,padding,dilation", _FOLD_CASES)
+def test_fold_matches_conv3d(dtype, T, kT, stride, padding, dilation):
+    """Folded multi-frame conv3d is no worse than stock MPS conv3d in the same dtype."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(dtype, T, kT)
+    ref = F.conv3d(x.float().cpu(), w.float().cpu(), b.float().cpu(), stride, padding, dilation)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    assert cm._fold_ok(xm, wm, stride, padding, dilation, 1)
+    stock = (cm._orig_conv3d or F.conv3d)(xm, wm, bm, stride, padding, dilation)
+    out = cm._folded_conv3d(xm, wm, bm, stride, padding, dilation, 1)
+    torch.mps.synchronize()
+    assert out.shape == ref.shape and out.dtype == dtype
+    e_fold, e_stock = _rel_rms(out.float().cpu(), ref), _rel_rms(stock.float().cpu(), ref)
+    assert e_fold <= max(e_stock * 1.05, 1e-6), (e_fold, e_stock)
+
+
+@requires_mps
+def test_fold_equals_single_frame_when_T_eq_kT():
+    """At T == kT the fold reduces to the shipped single-frame path, bit for bit."""
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(torch.bfloat16, 3, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    kw = dict(stride=1, padding=(0, 1, 1), dilation=1, groups=1)
+    assert torch.equal(cm._folded_conv3d(xm, wm, bm, **kw), cm._single_frame_conv3d(xm, wm, bm, **kw))
+
+
+def test_fold_chunking_counts_batch():
+    """Frames per chunk split the budget across the gathered chunk and its folded copy, N included."""
+    import _patches.conv_im2col_mps as cm
+    frame = 2 * 4 * 3 * 8 * 8 * 2            # N*C*kT*H*W*elem_bytes
+    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, 2 * frame * 5) == 5
+    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, frame * 5) == 2
+    assert cm._fold_chunk_frames(2, 4, 3, 8, 8, 2, 1) == 1
+
+
+@requires_mps
+def test_fold_chunked_equals_unchunked(monkeypatch):
+    """Chunking changes only conv2d's batch shape: same input, same accuracy, deterministic.
+
+    torch.equal(unchunked, chunked) is unreachable here: stock MPS conv2d is deterministic per
+    shape but not bitwise batch-invariant (batch 18 vs batch 2 differs by 1 bf16 ULP on this
+    M5 Max, in fp32 too), and chunking is precisely what changes the batch. So the conv2d batch
+    sizes are asserted, same-batch chunking is asserted bitwise, and cross-batch noise is capped.
+    """
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    x, w, bias = _fold_inputs(torch.bfloat16, 9, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), bias.to("mps")
+    kw = dict(stride=1, padding=(1, 1, 1), dilation=1, groups=1)
+    ref = F.conv3d(x.float().cpu(), w.float().cpu(), bias.float().cpu(), 1, (1, 1, 1), 1)
+    batches = []
+    real = cm._stock_conv2d
+
+    def spy(*a, **k):
+        batches.append(a[0].shape[0])
+        return real(*a, **k)
+    monkeypatch.setattr(cm, "_stock_conv2d", spy)
+    monkeypatch.delenv("ASFP8_CONV_FOLD_MB", raising=False)
+    a = cm._folded_conv3d(xm, wm, bm, **kw)
+    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "1.5")      # 9 frames (two copies each) still fit: one conv2d
+    same_batch = cm._folded_conv3d(xm, wm, bm, **kw)
+    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "0.01")      # one output frame per conv2d
+    b = cm._folded_conv3d(xm, wm, bm, **kw)
+    again = cm._folded_conv3d(xm, wm, bm, **kw)
+    torch.mps.synchronize()
+    assert batches == [18, 18] + [2] * 18        # 2 batched calls, then 9+9 single-frame calls
+    assert torch.equal(a, same_batch) and torch.equal(b, again)
+    assert _rel_rms(b.float().cpu(), ref) <= max(_rel_rms(a.float().cpu(), ref) * 1.05, 1e-6)
+    assert _rel_rms(b.float().cpu(), a.float().cpu()) <= 5e-5      # 1 ULP of conv2d batch noise
+
+
+@requires_mps
+@pytest.mark.parametrize("T,kT,stride,padding,dilation", _FOLD_CASES[:3])
+def test_fold_preallocated_output_matches(monkeypatch, T, kT, stride, padding, dilation):
+    """Chunks land in one preallocated output: equal to a per-chunk torch.cat, no cat, contiguous."""
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(torch.bfloat16, T, kT)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    monkeypatch.setenv("ASFP8_CONV_FOLD_MB", "0.01")      # one output frame per chunk
+    ys = []
+    real = cm._stock_conv2d
+
+    def spy(*a, **k):
+        ys.append(real(*a, **k))
+        return ys[-1]
+    monkeypatch.setattr(cm, "_stock_conv2d", spy)
+    real_cat = torch.cat
+
+    def no_cat(*a, **k):
+        raise AssertionError("fold must not concatenate chunks")
+    monkeypatch.setattr(torch, "cat", no_cat)
+    out = cm._folded_conv3d(xm, wm, bm, stride, padding, dilation, 1)
+    monkeypatch.setattr(torch, "cat", real_cat)
+    torch.mps.synchronize()
+    N, Co = x.shape[0], w.shape[0]
+    assert len(ys) > 1
+    ref = real_cat([y.reshape(N, y.shape[0] // N, Co, *y.shape[2:]).permute(0, 2, 1, 3, 4) for y in ys], dim=2)
+    assert out.is_contiguous() and out.shape == ref.shape
+    assert torch.equal(out, ref.contiguous())
+
+
+@requires_mps
+def test_fold_failure_latches_once(monkeypatch, capsys):
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setattr(cm, "_fold_failed", False, raising=False)
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        raise RuntimeError("fold broke")
+    monkeypatch.setattr(cm, "_folded_conv3d", boom)
+    x, w, b = _fold_inputs(torch.bfloat16, 5, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    wrapped = cm._make_wrap(lambda *a: "orig", 3, im2col=False, single_frame=False, fold=True)
+    kw = dict(stride=1, padding=(1, 1, 1), dilation=1, groups=1)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
+    assert wrapped(xm, wm, bm, **kw) == "orig"
+    assert wrapped(xm, wm, bm, **kw) == "orig"
+    assert calls == [1]
+    assert capsys.readouterr().out.count(cm.TAG) == 1
+
+
+@requires_mps
+@pytest.mark.parametrize("val", ["off", "0", "false", "none", "no"])
+def test_fold_off_switch(monkeypatch, val):
+    """ASFP8_CONV_FOLD is read per call, so a wrapper built while on still honours a later off."""
+    import _patches.conv_im2col_mps as cm
+    calls = []
+
+    def spy(*a, **k):
+        calls.append(1)
+        return "stock"
+    x, w, b = _fold_inputs(torch.bfloat16, 5, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    kw = dict(stride=1, padding=(1, 1, 1), dilation=1, groups=1)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
+    wrapped = cm._make_wrap(spy, 3, im2col=False, single_frame=False, fold=True)
+    assert isinstance(wrapped(xm, wm, bm, **kw), torch.Tensor)
+    assert calls == []
+    monkeypatch.setenv("ASFP8_CONV_FOLD", val)
+    assert wrapped(xm, wm, bm, **kw) == "stock"
+    assert calls == [1]
+
+
+@requires_mps
+@pytest.mark.parametrize("over", [{"groups": 2}, {"padding": "same"}])
+def test_fold_rejects_groups_and_str_padding(over):
+    import _patches.conv_im2col_mps as cm
+    kw = dict(stride=1, padding=(1, 1, 1), dilation=1, groups=1)
+    kw.update(over)
+    x, w, _ = _fold_inputs(torch.bfloat16, 5, 3)
+    xm, wm = x.to("mps"), w.to("mps")
+    assert cm._fold_ok(xm, wm, kw["stride"], kw["padding"], kw["dilation"], kw["groups"]) is False
+
+
+@requires_mps
+def test_fold_leaves_too_short_input_to_stock(monkeypatch):
+    """T < dilated kT: stock raises its own error, and the fold is neither tried nor latched off."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setattr(cm, "_fold_failed", False, raising=False)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
+    x, w, b = _fold_inputs(torch.bfloat16, 2, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    kw = dict(stride=1, padding=(0, 1, 1), dilation=1, groups=1)
+    assert not cm._fold_ok(xm, wm, **kw)
+    folded = []
+    monkeypatch.setattr(cm, "_folded_conv3d", lambda *a, **k: folded.append(1))
+    stock = F.conv3d
+    seen = []
+
+    def orig(*a):
+        seen.append(1)
+        return stock(*a)
+    wrapped = cm._make_wrap(orig, 3, im2col=False, single_frame=False, fold=True)
+    with pytest.raises(RuntimeError):
+        wrapped(xm, wm, bm, **kw)
+    assert seen == [1] and folded == []
+    assert cm._fold_failed is False
+
+
+@requires_mps
+def test_folded_conv3d_rejects_too_short_input():
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(torch.bfloat16, 2, 3)
+    with pytest.raises(ValueError):
+        cm._folded_conv3d(x.to("mps"), w.to("mps"), b.to("mps"), 1, (0, 1, 1), 1, 1)
+
+
+@requires_mps
+@pytest.mark.parametrize("padding,dilation", [((-1, 1, 1), (2, 1, 1)), ((0, 1, 1), (0, 1, 1))])
+def test_fold_rejects_negative_temporal_padding_and_zero_dilation(padding, dilation):
+    import _patches.conv_im2col_mps as cm
+    x, w, _ = _fold_inputs(torch.bfloat16, 7, 3)
+    assert cm._fold_ok(x.to("mps"), w.to("mps"), 1, padding, dilation, 1) is False
+
+
+@requires_mps
+def test_folded_output_takes_conv_result_dtype(monkeypatch):
+    """Under autocast conv2d returns a lower dtype than x; the folded buffer must follow it."""
+    import _patches.conv_im2col_mps as cm
+    real = cm._stock_conv2d
+    monkeypatch.setattr(cm, "_stock_conv2d", lambda *a: real(*a).to(torch.float16))
+    x, w, b = _fold_inputs(torch.float32, 5, 3)
+    out = cm._folded_conv3d(x.to("mps"), w.to("mps"), b.to("mps"), 1, (0, 1, 1), 1, 1)
+    assert out.dtype == torch.float16

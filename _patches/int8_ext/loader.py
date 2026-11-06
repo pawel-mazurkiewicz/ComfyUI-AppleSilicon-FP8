@@ -16,12 +16,13 @@ from .._extbuild import (  # noqa: F401  (re-exported for the build-lock tests)
     _build_timeout,
     _clear_stale_lock,
     _cpp_load_guarded,
+    build_dir_for,
+    build_root,
+    warn_missing_prereqs,
 )
 
 _mod = None
 _tried = False
-
-_NOSPACE_ROOT = "/tmp/asfp8_build"
 
 
 def _nospace_torch_lib():
@@ -30,8 +31,9 @@ def _nospace_torch_lib():
     real = cpp.TORCH_LIB_PATH
     if " " not in real:
         return real
-    os.makedirs(_NOSPACE_ROOT, exist_ok=True)
-    link = os.path.join(_NOSPACE_ROOT, "torchlib")
+    root = build_root()
+    os.makedirs(root, exist_ok=True)
+    link = os.path.join(root, "torchlib")
     try:
         if os.path.islink(link):
             os.unlink(link)
@@ -67,9 +69,8 @@ def module():
         except Exception as e:
             print(f"[int8_ext] ninja not importable ({e!r}); int8-native disabled.")
             return None
-    if shutil.which("ninja") is None:
-        print("[int8_ext] ninja binary not found on PATH; int8-native disabled "
-              "(pip install ninja into the ComfyUI venv).")
+    if not warn_missing_prereqs("[int8_ext]"):
+        print("[int8_ext] int8-native disabled.", flush=True)
         return None
 
     try:
@@ -81,7 +82,7 @@ def module():
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(here, "int8_gemm.mm")
-    build_dir = os.path.join(_NOSPACE_ROOT, "int8_ext")
+    build_dir = build_dir_for("int8_ext")
     os.makedirs(build_dir, exist_ok=True)
     _clear_stale_lock(build_dir, "[int8_ext]")
 

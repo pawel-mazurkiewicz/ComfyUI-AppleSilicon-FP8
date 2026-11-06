@@ -5,10 +5,13 @@ skipping both comfy's lossy tensorwise pre-quant and the per-step fp32 weight de
 and un-rotation. DEFAULT ON, gated on M5/Metal-4.1 + ninja; ASFP8_INT8_EXT=off disables.
 """
 
+import os
 import sys
+import weakref
 
 import torch
 
+from . import int8_quant_mps
 from ._common import full_precision_requested
 
 TAG = "[AppleSilicon-FP8/int8_kernel]"
@@ -19,6 +22,10 @@ _kernel = None
 _kernel_tried = False
 _self_checked = False
 _self_ok = False
+
+# one slot: q/k/v and gate/up read the same activation, so the 2nd and 3rd calls reuse it
+_ACT_CACHE = None
+_ACT_CACHE_OFF = ("off", "0", "false", "none", "no")
 
 # gelu-erf is absent everywhere (kernel store, pybind, here): Metal has no `erf`
 _ACT = {"none": 0, "silu": 1, "gelu_tanh": 2}
@@ -105,6 +112,62 @@ def _verify():
     return _ensure_kernel() is not None and _self_check()
 
 
+def _drop_act_cache(ref):
+    # identity: a newer entry keyed on another tensor must survive this one dying
+    global _ACT_CACHE
+    if _ACT_CACHE is not None and _ACT_CACHE[0][0] is ref:
+        _ACT_CACHE = None
+
+
+def _act_key(x, convrot, gs):
+    # identity, not _version: inference tensors have none
+    return (weakref.ref(x, _drop_act_cache), x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype,
+            convrot, gs, None if x.is_inference() else x._version)
+
+
+def _rotate_quant(x, convrot, gs):
+    """(int8, row scale) of x.reshape(-1, K), Hadamard-rotated first when convrot.
+
+    Both depend on x alone, so the projections of one input rotate and quantize it once.
+    The slot holds a weakref, never x; a miss overwrites it. ASFP8_INT8_ACT_CACHE=off
+    recomputes every call.
+    """
+    global _ACT_CACHE
+    caching = os.environ.get("ASFP8_INT8_ACT_CACHE", "1").strip().lower() not in _ACT_CACHE_OFF
+    key = _act_key(x, convrot, gs)
+    entry = _ACT_CACHE if caching else None
+    if entry is not None:
+        ck, x8, x_scale = entry
+        # ck[0]() is x: identity, since tensor == is elementwise and ids get recycled
+        if ck[0]() is x and ck[1:] == key[1:]:
+            return x8, x_scale
+
+    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
+
+    if convrot:
+        h = _build_hadamard(gs, device=x.device, dtype=x.dtype)
+        x = _rotate_activation(x, h, gs)
+
+    x8, x_scale = int8_quant_mps.quantize_rowwise(x.reshape(-1, x.shape[-1]))
+    if caching:
+        _ACT_CACHE = (key, x8, x_scale)
+    return x8, x_scale
+
+
+_UNFUSED_MAX_TOKENS = 2048  # the unfused path materialises int32 [M,N] plus a copy
+
+
+def _fused_variant(kernel, out_dtype, scale_numel, n):
+    """Kernel entry that folds the rescale into the GEMM store, or None for the unfused path."""
+    if kernel is None or out_dtype != torch.bfloat16:
+        return None
+    if scale_numel == 1 and hasattr(kernel, "i8_matmul2d_nt_fused"):
+        return "i8_matmul2d_nt_fused"
+    if scale_numel == n and hasattr(kernel, "i8_matmul2d_nt_fused_cs"):
+        return "i8_matmul2d_nt_fused_cs"
+    return None
+
+
 def _int8_linear_kernel(
     x,
     weight,
@@ -141,26 +204,15 @@ def _int8_linear_kernel(
             act,
         )
 
-    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
-
-    if convrot:
-        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, h, convrot_groupsize)
-
+    # rotation preserves shape, so orig_shape is x's shape before it
     orig_shape = x.shape
-    x_2d = x.reshape(-1, x.shape[-1])
-
-    x_8, x_scale = quantize_int8_rowwise(x_2d)
+    x_8, x_scale = _rotate_quant(x, convrot, convrot_groupsize)
     weight_scale = weight_scale.view(-1)
 
     # fused fast path: fold float(C)*row_scale[m] (+bias) into the kernel's store
     # epilogue, which is bit-identical to the chunked path below
-    if (
-        out_dtype == torch.bfloat16
-        and weight_scale.numel() == 1
-        and hasattr(_kernel, "i8_matmul2d_nt_fused")
-    ):
+    variant = _fused_variant(_kernel, out_dtype, weight_scale.numel(), weight.shape[0])
+    if variant == "i8_matmul2d_nt_fused":
         row_scale = (weight_scale.float() * x_scale.reshape(-1).float()).contiguous()
         bias_arg = bias.to(torch.bfloat16) if bias is not None else None
         # the activation is fused in-kernel here; do NOT also call _apply_act
@@ -168,6 +220,19 @@ def _int8_linear_kernel(
             x_8.contiguous(), weight.contiguous(), row_scale, bias_arg, code
         )
         return result.reshape(*orig_shape[:-1], weight.shape[0])
+
+    N = weight.shape[0]
+    if variant == "i8_matmul2d_nt_fused_cs":
+        bias_arg = bias.to(torch.bfloat16) if bias is not None else None
+        result = _kernel.i8_matmul2d_nt_fused_cs(
+            x_8.contiguous(),
+            weight.contiguous(),
+            x_scale.reshape(-1).float().contiguous(),
+            weight_scale.float().contiguous(),
+            bias_arg,
+            code,
+        )
+        return result.reshape(*orig_shape[:-1], N)
 
     # C[M,N] int32 = x_8[M,K] @ weight[N,K]^T  (NT: weight in stored layout)
     result = _kernel.i8_matmul2d_nt(x_8.contiguous(), weight.contiguous())
@@ -194,8 +259,9 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                         convrot=False, convrot_groupsize=256, act="silu"):
     """Fused gated linear: H = act(x@w_gate^T + bias_gate) * (x@w_up^T + bias_up).
 
-    The single-pass kernel needs scalar weight scales; per-channel scales route through
-    _int8_linear_kernel per branch. act in {"silu","gelu_tanh"}, never "none".
+    The single-pass kernel takes scalar or per-output-channel (length N) weight scales;
+    other layouts route through _int8_linear_kernel per branch. act in
+    {"silu","gelu_tanh"}, never "none".
     """
     if act == "none":
         raise ValueError("_int8_swiglu_kernel requires a real gate activation, not 'none'")
@@ -205,10 +271,14 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
             f"gate/up weights must match: {tuple(w_gate.shape)} vs {tuple(w_up.shape)}"
         )
 
+    n_out = w_gate.shape[0]
     scalar_scales = (ws_gate.numel() == 1 and ws_up.numel() == 1)
+    channel_scales = (not scalar_scales and ws_gate.numel() == n_out
+                      and ws_up.numel() == n_out)
+    fn = "i8_matmul2d_nt_swiglu" if scalar_scales else "i8_matmul2d_nt_swiglu_cs"
     fused_ok = (_kernel is not None and x.device.type == "mps" and w_gate.dtype == torch.int8
-                and w_up.dtype == torch.int8 and scalar_scales
-                and hasattr(_kernel, "i8_matmul2d_nt_swiglu"))
+                and w_up.dtype == torch.int8 and (scalar_scales or channel_scales)
+                and hasattr(_kernel, fn))
     if not fused_ok:
         g = _int8_linear_kernel(x, w_gate, ws_gate, bias_gate, torch.bfloat16,
                                 convrot, convrot_groupsize, act=act)  # activation applied here
@@ -216,31 +286,30 @@ def _int8_swiglu_kernel(x, w_gate, w_up, ws_gate, ws_up, bias_gate=None, bias_up
                                 convrot, convrot_groupsize, act="none")
         return g * u
 
-    from comfy_kitchen.backends.eager.quantization import quantize_int8_rowwise
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation
-    if convrot:
-        h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
-        x = _rotate_activation(x, h, convrot_groupsize)
     shp = x.shape
-    x2 = x.reshape(-1, x.shape[-1])
-    x8, xs = quantize_int8_rowwise(x2)
+    x8, xs = _rotate_quant(x, convrot, convrot_groupsize)
     xs = xs.reshape(-1).float()
-    rsg = (ws_gate.view(-1).float() * xs).contiguous()  # scalar * [M] -> [M] (valid: scalar_scales)
-    rsu = (ws_up.view(-1).float() * xs).contiguous()
     bg = bias_gate.to(torch.bfloat16) if bias_gate is not None else None
     bu = bias_up.to(torch.bfloat16) if bias_up is not None else None
-    out = _kernel.i8_matmul2d_nt_swiglu(x8.contiguous(), w_gate.contiguous(),
-            w_up.contiguous(), rsg, rsu, bg, bu, _act_code(act))
+    if scalar_scales:
+        rsg = (ws_gate.view(-1).float() * xs).contiguous()  # scalar * [M] -> [M]
+        rsu = (ws_up.view(-1).float() * xs).contiguous()
+        out = _kernel.i8_matmul2d_nt_swiglu(x8.contiguous(), w_gate.contiguous(),
+                w_up.contiguous(), rsg, rsu, bg, bu, _act_code(act))
+    else:
+        out = _kernel.i8_matmul2d_nt_swiglu_cs(x8.contiguous(), w_gate.contiguous(),
+                w_up.contiguous(), xs.contiguous(), ws_gate.view(-1).float().contiguous(),
+                ws_up.view(-1).float().contiguous(), bg, bu, _act_code(act))
     return out.reshape(*shp[:-1], w_gate.shape[0])
 
 
 def _max_tokens():
-    # past ~2k rows comfy's bf16 dequant GEMM beats the W8A8 path on M5 (it wins below)
+    # W8A8 beat bf16 dequant GEMM at every size measured up to 16k rows on M5 (dev/bench_int8_crossover.py)
     import os
     try:
-        return int(os.environ.get("ASFP8_INT8_KERNEL_MAX_TOKENS", "2048"))
+        return int(os.environ.get("ASFP8_INT8_KERNEL_MAX_TOKENS", "65536"))
     except ValueError:
-        return 2048
+        return 65536
 
 
 def _try_int8_kernel_forward(self, input):
@@ -286,6 +355,10 @@ def _try_int8_kernel_forward(self, input):
         convrot = getattr(params, "convrot", False)
         gs = getattr(params, "convrot_groupsize", 256)
         bias = self.bias
+
+        if (input.numel() > _UNFUSED_MAX_TOKENS * input.shape[-1]
+                and _fused_variant(_kernel, input.dtype, scale.numel(), qdata.shape[0]) is None):
+            return None
 
         return _int8_linear_kernel(input, qdata, scale, bias, input.dtype, convrot, gs)
     except Exception as e:
