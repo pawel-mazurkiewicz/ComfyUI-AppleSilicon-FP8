@@ -3,7 +3,10 @@
 Stock ComfyUI vs ComfyUI with this node, on eight popular image workloads. Each one uses the
 settings, prompt and seed from its official ComfyUI template.
 
-Apple M5 Max, 128 GB, macOS 27.0.1, ComfyUI 0.42.0, PyTorch 2.11, node 1.4.0.
+Apple M5 Max, 128 GB, macOS 27.2, ComfyUI v0.43.0-11-g35060f01, PyTorch 2.11.0, node 1.5.0.
+
+The eight-workload tables, stage table and charts below are the 1.4.0 run (macOS 27.0.1,
+ComfyUI 0.42.0). The 1.5.0 INT8 results are in [INT8 in 1.5.0](#int8-in-150).
 
 - **fp8 Krea 2 and both Ideogram 4 checkpoints fail on stock ComfyUI** on Apple Silicon
   (`Trying to convert Float8_e4m3fn to the MPS backend`). They run with the node.
@@ -33,6 +36,29 @@ Seconds per image with models already loaded. Each row is scaled to its own slow
 | Ideogram 4 | int8, 20 steps, 1024² | fails | 156.7 | only with node |
 | Qwen-Image 2512 | fp8 + Lightning LoRA, 4 steps, 1328² | 19.9 | 18.4 | 1.08× |
 | FLUX.2 Klein 9B | bf16, 4 steps, 1024² | 9.4 | 8.8 | 1.06× |
+
+## INT8 in 1.5.0
+
+Seconds per image with models already loaded, 1024², batch 1, median of four warm runs (two
+interleaved rounds of stock, 1.4.0, 1.5.0). Workflows follow the official templates with a fixed
+prompt and seed; the steps differ from the 1.4.0 table above for Ideogram 4 (28 steps, cfg 7).
+
+| Model | Setup | Stock | 1.4.0 | 1.5.0 | 1.5.0 vs 1.4.0 |
+|---|---|---:|---:|---:|---:|
+| Krea 2 Turbo | int8 ConvRot, 8 steps | 40.8 | 41.8 | 18.2 | 2.30× |
+| Z-Image Turbo | int8, 9 steps | 22.2 | 22.7 | 12.6 | 1.80× |
+| Ideogram 4 | int8 + fp8 uncond, 28 steps | fails | 191.3 | 135.6 | 1.41× |
+| Krea 2 Turbo | fp8, 10 steps | fails | 42.5 | 40.8 | 1.04× |
+| FLUX.2 Klein 9B | bf16, 4 steps | 10.1 | 9.6 | 10.1 | unchanged |
+
+- Stock and 1.4.0 run INT8 at the same speed: at 1024² both stay on the dequant path, because
+  1.4.0 routes only calls up to 2048 tokens to the W8A8 kernel. 1.5.0 raises that to 65536 for
+  fused calls.
+- Krea 2 fp8 and Ideogram 4 fail on stock ComfyUI (`Float8_e4m3fn` on MPS). Krea 2 fp8 output is
+  byte-identical between 1.4.0 and 1.5.0.
+- Klein bf16 is within run-to-run noise (+0.6% and +4.3% in the two rounds).
+- At the old 2048-token cap, 1.5.0 output is byte-identical to 1.4.0 on all three INT8 models.
+  At the new cap the images keep the same composition and differ in fine detail.
 
 ## Where the time goes
 
