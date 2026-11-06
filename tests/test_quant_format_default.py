@@ -35,10 +35,10 @@ def sd(conf=CONVROT, weight=None, scale=True):
 @pytest.fixture
 def fresh():
     """Module state is per-process; give each test its own install/log state."""
-    installed, load_id = m._installed, m._load_id
-    m._installed, m._load_id = False, None
+    installed, logged = m._installed, m._logged
+    m._installed, m._logged = False, False
     yield
-    m._installed, m._load_id = installed, load_id
+    m._installed, m._logged = installed, logged
 
 
 @pytest.fixture
@@ -124,6 +124,14 @@ def test_no_comfy_quant_key_untouched(ops):
     d = sd(conf=None)
     load(ns, d)
     assert "l.comfy_quant" not in seen["sd"]
+
+
+def test_correction_logged_once_across_per_layer_state_dicts(ops, capsys):
+    """torch hands each child module its own filtered dict, so dict identity is no load boundary."""
+    ns, _ = ops
+    for _ in range(3):
+        load(ns, sd())
+    assert capsys.readouterr().out.count("defaulting") == 1
 
 
 def test_install_idempotent(ops):

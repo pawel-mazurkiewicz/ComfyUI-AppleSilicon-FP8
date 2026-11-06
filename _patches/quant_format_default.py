@@ -17,9 +17,8 @@ _OFF = ("off", "0", "false", "none", "no")
 
 _installed = False
 
-# comfy hands the same state_dict to every layer of one load, so its identity is the
-# load boundary for the once-per-load log line
-_load_id = None
+# torch gives each child module its own filtered state_dict, so identity is no load boundary
+_logged = False
 
 
 def _fixed_conf(state_dict, prefix):
@@ -46,12 +45,12 @@ def _fixed_conf(state_dict, prefix):
     return conf
 
 
-def _log_correction(state_dict):
-    global _load_id
-    if id(state_dict) == _load_id:
+def _log_correction():
+    global _logged
+    if _logged:
         return
-    _load_id = id(state_dict)
-    print(f"{TAG} comfy_quant has no \"format\": defaulting this load's int8 + "
+    _logged = True
+    print(f"{TAG} comfy_quant has no \"format\": defaulting int8 + "
           f"weight_scale layers to int8_tensorwise.", flush=True)
 
 
@@ -66,7 +65,7 @@ def _install_into(ops_module) -> bool:
     def _load_quantized_module(module, super_load, state_dict, prefix, *args, **kwargs):
         conf = _fixed_conf(state_dict, prefix)
         if conf is not None:
-            _log_correction(state_dict)
+            _log_correction()
             state_dict[f"{prefix}comfy_quant"] = torch.frombuffer(
                 bytearray(json.dumps(conf).encode()), dtype=torch.uint8)
         return original(module, super_load, state_dict, prefix, *args, **kwargs)
