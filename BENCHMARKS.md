@@ -59,14 +59,15 @@ prompt and seed; the steps differ from the 1.4.0 table above for Ideogram 4 (28 
 - Klein bf16 is within run-to-run noise (+0.6% and +4.3% in the two rounds).
 - At the old 2048-token cap, 1.5.0 output is byte-identical to 1.4.0 on all three INT8 models.
   At the new cap the images keep the same composition and differ in fine detail.
-- Separate measurement, not part of the table above: the fused QK norm/RoPE kernel
-  (`ASFP8_QK_NORM_ROPE`) takes Z-Image Turbo INT8, 9 steps, from 13.13 s to 11.95 s (−9%) in its
-  own interleaved pair (1.5.0 without and with the kernel; two rounds, two warm runs each).
-  The 12.6 s above and the 13.13 s here are the same build measured on different nights.
-  Output is not byte-identical (26 dB PSNR, same composition). The pair was run on the first
-  prototype, which returned a permuted view; the shipped kernel returns eager's contiguous layout
-  (about 0.5 ms more per block downstream in a microbench), so expect a little less. FLUX.2 Klein is not covered and
-  did not change (10.19 vs 10.05 s, within noise).
+- Separate measurement, not part of the table above: the shipped fused QK norm/RoPE kernel
+  (`ASFP8_QK_NORM_ROPE`) on Z-Image Turbo INT8, 1024², 9 steps, goes from 14.65 s to 13.60 s median
+  (−7.2%) in two interleaved before/after rounds, three warm runs each. The rounds ranged from a tie
+  to −13%, so expect about 7% (5–9% across runs). Per attention block, q+k norm+RoPE at the Z-Image
+  shape goes from 6.97 ms to 0.52 ms, about 13×. Absolute times drift between nights, so compare
+  only within an interleaved pair.
+  Output is not bit-identical to eager: it rounds once in fp32 where eager rounds twice, and its
+  error against an fp32 reference is about 0.58× eager's. Images look equivalent, with fine-detail
+  drift. FLUX.2 Klein is not covered.
 
 ## Where the time goes
 
