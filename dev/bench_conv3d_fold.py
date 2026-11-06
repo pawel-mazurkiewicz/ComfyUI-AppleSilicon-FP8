@@ -13,6 +13,7 @@ import torch
 # repo root (parent of dev/) on path so `_patches` imports when run as a script
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from _patches import _caps  # noqa: E402
 from _patches import conv_im2col_mps as cm  # noqa: E402
 
 DT = torch.bfloat16
@@ -29,11 +30,15 @@ def _conv3d(*args):
 def _fold(x, w, b, mb=None):
     if mb is None:
         return cm._folded_conv3d(x, w, b, STRIDE, PADDING, DILATION, 1)
+    prev = os.environ.get("ASFP8_CONV_FOLD_MB")
     os.environ["ASFP8_CONV_FOLD_MB"] = str(mb)
     try:
         return cm._folded_conv3d(x, w, b, STRIDE, PADDING, DILATION, 1)
     finally:
-        os.environ.pop("ASFP8_CONV_FOLD_MB", None)
+        if prev is None:
+            os.environ.pop("ASFP8_CONV_FOLD_MB", None)
+        else:
+            os.environ["ASFP8_CONV_FOLD_MB"] = prev
 
 
 def _cands(x, w, b):
@@ -42,7 +47,7 @@ def _cands(x, w, b):
         ("fold", lambda: _fold(x, w, b)),
         ("fold_1f", lambda: _fold(x, w, b, "0.01")),   # one output frame per conv2d
     ]
-    if cm._supported(x, w, DILATION, 1, DT):
+    if _caps.has_tensor_ops_matmul2d() and cm._supported(x, w, DILATION, 1, DT):
         out.insert(1, ("im2col", lambda: cm.conv_im2col(x, w, b, STRIDE, PADDING, DILATION, 1)))
     return out
 
@@ -73,6 +78,8 @@ def correctness():
     ok = e_fold <= max(e_stock * 1.05, 1e-6)
     print(f"correctness  fold_rel_rms={e_fold:.3g}  stock_rel_rms={e_stock:.3g}  -> "
           f"{'OK' if ok else 'FAIL'}\n")
+    if not ok:
+        raise SystemExit(1)
 
 
 def bench(shape):
