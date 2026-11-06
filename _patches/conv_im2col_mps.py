@@ -527,7 +527,10 @@ def _fold_ok(x, weight, stride, padding, dilation, groups):
             or x.shape[1] != weight.shape[1]):
         return False
     s, p, d = _triple(stride), _triple(padding), _triple(dilation)
-    return len(s) == len(p) == len(d) == 3
+    if not len(s) == len(p) == len(d) == 3:
+        return False
+    # shorter than the dilated kernel: stock raises its own error, not a fold failure
+    return x.shape[2] + 2 * p[0] - d[0] * (weight.shape[2] - 1) - 1 >= 0
 
 
 def _fold_chunk_frames(N, C, kT, H, W, elem_bytes, budget_bytes):
@@ -553,6 +556,8 @@ def _folded_conv3d(x, weight, bias, stride, padding, dilation, groups):
     if p[0]:
         x = F.pad(x, (0, 0, 0, 0, p[0], p[0]))
     T_out = (x.shape[2] - d[0] * (kT - 1) - 1) // s[0] + 1
+    if T_out <= 0:
+        raise ValueError("temporal input shorter than the dilated kernel")
     # contiguous: MPS conv2d gives garbage for a strided-view weight
     wf = weight.reshape(Co, C * kT, kH, kW).contiguous()
     n_chunk = _fold_chunk_frames(N, C, kT, x.shape[3], x.shape[4], x.element_size(), _fold_budget_bytes())

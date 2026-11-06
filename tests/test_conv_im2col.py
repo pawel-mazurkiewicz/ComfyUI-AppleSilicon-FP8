@@ -1028,3 +1028,37 @@ def test_fold_rejects_groups_and_str_padding(over):
     x, w, _ = _fold_inputs(torch.bfloat16, 5, 3)
     xm, wm = x.to("mps"), w.to("mps")
     assert cm._fold_ok(xm, wm, kw["stride"], kw["padding"], kw["dilation"], kw["groups"]) is False
+
+
+@requires_mps
+def test_fold_leaves_too_short_input_to_stock(monkeypatch):
+    """T < dilated kT: stock raises its own error, and the fold is neither tried nor latched off."""
+    import torch.nn.functional as F
+    import _patches.conv_im2col_mps as cm
+    monkeypatch.setattr(cm, "_fold_failed", False, raising=False)
+    monkeypatch.delenv("ASFP8_CONV_FOLD", raising=False)
+    x, w, b = _fold_inputs(torch.bfloat16, 2, 3)
+    xm, wm, bm = x.to("mps"), w.to("mps"), b.to("mps")
+    kw = dict(stride=1, padding=(0, 1, 1), dilation=1, groups=1)
+    assert not cm._fold_ok(xm, wm, **kw)
+    folded = []
+    monkeypatch.setattr(cm, "_folded_conv3d", lambda *a, **k: folded.append(1))
+    stock = F.conv3d
+    seen = []
+
+    def orig(*a):
+        seen.append(1)
+        return stock(*a)
+    wrapped = cm._make_wrap(orig, 3, im2col=False, single_frame=False, fold=True)
+    with pytest.raises(RuntimeError):
+        wrapped(xm, wm, bm, **kw)
+    assert seen == [1] and folded == []
+    assert cm._fold_failed is False
+
+
+@requires_mps
+def test_folded_conv3d_rejects_too_short_input():
+    import _patches.conv_im2col_mps as cm
+    x, w, b = _fold_inputs(torch.bfloat16, 2, 3)
+    with pytest.raises(ValueError):
+        cm._folded_conv3d(x.to("mps"), w.to("mps"), b.to("mps"), 1, (0, 1, 1), 1, 1)
