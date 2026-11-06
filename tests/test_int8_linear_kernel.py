@@ -415,6 +415,8 @@ def test_int8_linear_bit_exact_with_native_quant(monkeypatch):
     assert qmod.verify()
     native, real_native = [], qmod._native
     monkeypatch.setattr(qmod, "_native", lambda x2d: native.append(1) or real_native(x2d))
+    kitchen, real_kitchen = [], qmod._kitchen
+    monkeypatch.setattr(qmod, "_kitchen", lambda x2d: kitchen.append(1) or real_kitchen(x2d))
 
     dev = "mps"
     g = torch.Generator().manual_seed(7)
@@ -453,9 +455,12 @@ def test_int8_linear_bit_exact_with_native_quant(monkeypatch):
         out = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, convrot, 256)
         assert len(native) == n0 + 1, f"SwiGLU did not use the native quant per_channel={pc}"
         monkeypatch.setenv("ASFP8_INT8_NATIVE_QUANT", "off")
+        k0 = len(kitchen)
+        monkeypatch.setattr(patch, "_ACT_CACHE", None)    # else the native quant of `out` is reused
         ref = patch._int8_swiglu_kernel(x, wg, wu, sg, su, None, None, convrot, 256)
         monkeypatch.delenv("ASFP8_INT8_NATIVE_QUANT")
         assert len(native) == n0 + 1
+        assert len(kitchen) == k0 + 1, f"reference did not quantize with the kitchen path per_channel={pc}"
         assert torch.equal(out, ref), f"SwiGLU mismatch per_channel={pc}"
 
 
