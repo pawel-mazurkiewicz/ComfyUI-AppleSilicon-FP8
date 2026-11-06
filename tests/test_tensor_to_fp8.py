@@ -66,6 +66,15 @@ def test_double_still_raises_on_mps():
         t.double()
 
 
+def test_scan_target_ignores_positional_bools():
+    """A positional non_blocking/copy bool is not a target device."""
+    scan = tensor_to_fp8._scan_target
+    assert scan((torch.device("mps"), torch.float8_e4m3fn, False), {}, torch.bfloat16) == \
+        (torch.float8_e4m3fn, torch.device("mps"))
+    assert scan((torch.float8_e4m3fn, True, False), {}, torch.bfloat16) == (torch.float8_e4m3fn, None)
+    assert scan((0,), {}, torch.bfloat16) == (torch.bfloat16, 0)
+
+
 def test_cpu_fp8_shortcut_delegates_to_original():
     """CPU can cast fp8 natively; the patch must not intercept it."""
     t = (torch.randn(8) * 0.5).to(torch.float8_e4m3fn)
