@@ -71,8 +71,7 @@ def module():
         except Exception as e:
             print(f"[fp8_ext] ninja not importable ({e!r}); fp8-native disabled.")
             return None
-    if shutil.which("ninja") is None:
-        warn_missing_prereqs("[fp8_ext]")
+    if not warn_missing_prereqs("[fp8_ext]"):
         print("[fp8_ext] fp8-native disabled.", flush=True)
         return None
 
