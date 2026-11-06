@@ -31,7 +31,10 @@ def _fixed_conf(state_dict, prefix):
     weight = state_dict.get(f"{prefix}weight")
     if getattr(weight, "dtype", None) != torch.int8:
         return None
-    if state_dict.get(f"{prefix}weight_scale") is None:
+    scale = state_dict.get(f"{prefix}weight_scale")
+    if scale is None or weight.dim() != 2:
+        return None
+    if scale.numel() not in (1, weight.shape[0]):    # tensorwise or per-row only
         return None
     try:
         conf = json.loads(raw.numpy().tobytes())

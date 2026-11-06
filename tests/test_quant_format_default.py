@@ -93,6 +93,32 @@ def test_missing_weight_scale_untouched(ops):
     assert seen["sd"]["l.comfy_quant"] is original
 
 
+@pytest.mark.parametrize("scale_shape", [(4, 2), (4, 4, 1), (3,)])
+def test_non_tensorwise_scale_layout_untouched(ops, scale_shape):
+    ns, seen = ops
+    d = sd()
+    d["l.weight_scale"] = torch.ones(*scale_shape)
+    original = d["l.comfy_quant"]
+    load(ns, d)
+    assert seen["sd"]["l.comfy_quant"] is original
+
+
+def test_scalar_scale_gets_format(ops):
+    ns, seen = ops
+    d = sd()
+    d["l.weight_scale"] = torch.ones(())
+    load(ns, d)
+    assert dec(seen["sd"]["l.comfy_quant"])["format"] == "int8_tensorwise"
+
+
+def test_non_2d_weight_untouched(ops):
+    ns, seen = ops
+    d = sd(weight=torch.zeros(4, 4, 4, dtype=torch.int8))
+    original = d["l.comfy_quant"]
+    load(ns, d)
+    assert seen["sd"]["l.comfy_quant"] is original
+
+
 def test_no_comfy_quant_key_untouched(ops):
     ns, seen = ops
     d = sd(conf=None)
