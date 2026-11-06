@@ -692,6 +692,7 @@ def _fresh_install_state(monkeypatch, gate):
     monkeypatch.setattr(cm, "_fold_installed", False)
     monkeypatch.setattr(cm, "_gate", lambda: gate)
     monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True, raising=False)
+    monkeypatch.setattr("sys.platform", "darwin")   # install() is a no-op elsewhere
     return cm
 
 
