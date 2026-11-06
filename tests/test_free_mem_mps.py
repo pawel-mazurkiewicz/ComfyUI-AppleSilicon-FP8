@@ -47,6 +47,20 @@ def test_mps_adds_reusable_pool(env):
     assert env.calls == []
 
 
+def test_release_between_reads_not_double_counted(env, monkeypatch):
+    """The pool is freed right after the driver counter is read: available must already be read."""
+    state = env.state
+
+    def driver():
+        seen = state["driver"]
+        state["driver"] -= 4 * GiB      # 4 GiB go back to the OS ...
+        state["avail"] += 4 * GiB       # ... and show up as available
+        return seen
+    monkeypatch.setattr(torch.mps, "driver_allocated_memory", driver)
+    free_mem_mps.install()
+    assert env.get_free_memory(torch.device("mps"), True) == (18 * GiB, 8 * GiB)
+
+
 def test_pool_never_negative(env):
     env.state.update(driver=5 * GiB, current=9 * GiB)
     free_mem_mps.install()

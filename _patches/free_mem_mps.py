@@ -71,8 +71,9 @@ def install():
         try:
             import comfy.system_memory as sm
 
+            avail = sm.virtual_memory_available()   # first: a later pool release only under-counts
             pool = _reusable_pool()
-            total = sm.virtual_memory_available() + pool
+            total = avail + pool
         except Exception as e:
             _latch_off(e)
             return original(dev, torch_free_too)
