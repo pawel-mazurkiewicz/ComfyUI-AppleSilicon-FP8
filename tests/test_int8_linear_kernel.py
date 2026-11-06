@@ -659,6 +659,17 @@ def test_int8_kernels_pass_metal_validation():
     assert proc.returncode == 0, proc.stderr[-1500:]
 
 
+@requires_int8_ext
+def test_swiglu_rejects_cpu_row_scales():
+    from _patches.int8_ext import loader
+    mod = loader.module()
+    a = torch.randint(-128, 128, (8, 256), dtype=torch.int8).to("mps")
+    b = torch.randint(-128, 128, (16, 256), dtype=torch.int8).to("mps")
+    xs = torch.full((8,), 0.01)
+    with pytest.raises(RuntimeError, match="row scales"):
+        mod.i8_matmul2d_nt_swiglu(a, b, b, xs, xs, None, None, 1)
+
+
 @requires_mps
 def test_metal_compile_failure_is_latched_not_retried(monkeypatch):
     """A Metal library the toolchain rejects on first use is latched off, not recompiled

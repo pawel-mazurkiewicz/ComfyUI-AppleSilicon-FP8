@@ -764,11 +764,12 @@ static torch::Tensor swiglu_dispatch(torch::Tensor a_i8, torch::Tensor bg_i8,
   TORCH_CHECK(a_i8.is_contiguous() && bg_i8.is_contiguous() && bu_i8.is_contiguous(),
               "swiglu: A/Bg/Bu must be contiguous");
   const int64_t Mll = a_i8.size(0), Nll = bg_i8.size(0);
-  TORCH_CHECK(row_scale_gate.is_contiguous() && row_scale_up.is_contiguous()
+  TORCH_CHECK(row_scale_gate.is_mps() && row_scale_up.is_mps()
+              && row_scale_gate.is_contiguous() && row_scale_up.is_contiguous()
               && row_scale_gate.scalar_type() == torch::kFloat
               && row_scale_up.scalar_type() == torch::kFloat
               && row_scale_gate.numel() == Mll && row_scale_up.numel() == Mll,
-              "swiglu: row scales must be contiguous fp32 of length M");
+              "swiglu: row scales must be contiguous fp32 MPS of length M");
   if (has_col) {
     for (const torch::Tensor* cs : {&*col_scale_gate, &*col_scale_up}) {
       TORCH_CHECK(cs->is_mps() && cs->is_contiguous() && cs->scalar_type() == torch::kFloat
